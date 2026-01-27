@@ -34,9 +34,14 @@ db.sqlite3-journal
 /staticfiles
 /static
 
+# Redis
+dump.rdb
+
 # Celery
 celerybeat-schedule
 celerybeat.pid
+celerybeat-schedule-shm
+celerybeat-schedule-wal
 
 # IDEs
 .vscode/
