@@ -1,0 +1,14 @@
+"""
+Users app configuration
+"""
+from django.apps import AppConfig
+
+
+class UsersConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'backend.apps.users'
+    verbose_name = 'Users'
+    
+    def ready(self):
+        """Import signals when app is ready"""
+        import backend.apps.users.signals  # noqa

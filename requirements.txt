@@ -1,0 +1,54 @@
+# Django and REST Framework
+Django==5.0.1
+djangorestframework==3.14.0
+django-cors-headers==4.3.1
+django-filter==23.5
+
+# Database
+mysqlclient==2.2.1  # For MariaDB/MySQL
+
+# Celery and Redis
+celery==5.3.4
+redis==5.0.1
+django-celery-beat==2.6.0
+django-celery-results==2.5.1
+
+# Git integration
+GitPython==3.1.40
+
+# API documentation
+drf-spectacular==0.27.0
+
+# Authentication and permissions
+djangorestframework-simplejwt==5.3.1
+django-guardian==2.4.0
+
+# Utilities
+python-dotenv==1.0.0
+pytz==2023.3
+requests==2.31.0
+pyyaml==6.0.1
+
+# Mock and RPM tools (system dependencies, documented here)
+# - mock
+# - rpm-build
+# - createrepo_c
+# - rpmdevtools
+# Mock Python dependencies (for Ubuntu/Debian systems where mock is installed via .deb)
+backoff==2.2.1
+templated-dictionary==1.2
+rpmautospec-core==0.14
+
+# Development tools
+black==23.12.1
+flake8==7.0.0
+pylint==3.0.3
+pytest==7.4.3
+pytest-django==4.7.0
+pytest-cov==4.1.0
+factory-boy==3.3.0
+faker==22.0.0
+
+# Production server
+gunicorn==21.2.0
+whitenoise==6.6.0

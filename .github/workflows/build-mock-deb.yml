@@ -1,0 +1,134 @@
+name: Build Mock .deb Package
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/build-mock-deb.sh'
+      - '.github/workflows/build-mock-deb.yml'
+  schedule:
+    # Build weekly to get latest Mock version
+    - cron: '0 0 * * 0'
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        ubuntu_version: ['22.04', '24.04', '25.10']
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Build Mock .deb package for Ubuntu ${{ matrix.ubuntu_version }}
+        run: |
+          ./scripts/build-mock-deb.sh ${{ matrix.ubuntu_version }}
+
+      - name: Get package version
+        id: version
+        run: |
+          VERSION=$(ls build/mock-deb-ubuntu-${{ matrix.ubuntu_version }}/output/mock_*.deb | head -1 | sed -n 's/.*mock_\(.*\)_all.deb/\1/p')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package version: $VERSION"
+
+      - name: Create release assets
+        run: |
+          mkdir -p release-assets
+          cp build/mock-deb-ubuntu-${{ matrix.ubuntu_version }}/output/*.deb release-assets/
+          
+          # Create installation instructions
+          cat > release-assets/INSTALL.txt <<'EOF'
+          Mock .deb Package Installation Instructions
+          ============================================
+          
+          This package provides Mock for Ubuntu/Debian systems.
+          
+          Installation:
+          1. Download the .deb file
+          2. Install: sudo dpkg -i mock_*.deb
+          3. Fix dependencies: sudo apt-get install -f
+          4. Add user to mock group: sudo usermod -a -G mock $USER
+          5. Log out and log back in
+          6. Verify: mock --version
+          
+          For ReqPM users:
+          After installation, restart ReqPM services:
+            ./reqpm.sh restart all
+          
+          The warning banner should disappear and builds will work.
+          EOF
+          
+          # Create checksums
+          cd release-assets
+          sha256sum *.deb > SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mock-deb-ubuntu-${{ matrix.ubuntu_version }}
+          path: release-assets/*
+          retention-days: 90
+
+      - name: Create Release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'schedule'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: mock-deb-${{ steps.version.outputs.version }}-ubuntu-${{ matrix.ubuntu_version }}
+          name: Mock .deb Package ${{ steps.version.outputs.version }} (Ubuntu ${{ matrix.ubuntu_version }})
+          body: |
+            Automated build of Mock as a .deb package for Ubuntu ${{ matrix.ubuntu_version }}.
+            
+            This package is built from the official Mock repository and includes:
+            - Mock build system
+            - Mock core configurations
+            - All necessary dependencies
+            
+            ## Installation
+            
+            ```bash
+            # Download the .deb file
+            wget https://github.com/YOUR_USERNAME/ReqPM/releases/download/mock-deb-${{ steps.version.outputs.version }}-ubuntu-${{ matrix.ubuntu_version }}/mock_${{ steps.version.outputs.version }}_all.deb
+            
+            # Install
+            sudo dpkg -i mock_${{ steps.version.outputs.version }}_all.deb
+            sudo apt-get install -f
+            
+            # Add your user to mock group
+            sudo usermod -a -G mock $USER
+            
+            # Log out and log back in, then verify
+            mock --version
+            ```
+            
+            ## Checksums
+            
+            See SHA256SUMS file in release assets.
+            
+            ## Platform
+            
+            Built for: Ubuntu ${{ matrix.ubuntu_version }}
+            Compatible with: Ubuntu ${{ matrix.ubuntu_version }}+ and compatible Debian versions
+          files: |
+            release-assets/*.deb
+            release-assets/SHA256SUMS
+            release-assets/INSTALL.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update latest tag
+        if: github.ref == 'refs/heads/main' && github.event_name != 'schedule'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -f mock-deb-latest
+          git push -f origin mock-deb-latest

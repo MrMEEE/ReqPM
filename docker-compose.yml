@@ -1,0 +1,134 @@
+# Docker Compose for ReqPM
+version: '3.8'
+
+services:
+  # MariaDB database
+  db:
+    image: mariadb:10.11
+    container_name: reqpm_db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpass}
+      MYSQL_DATABASE: ${DB_NAME:-reqpm}
+      MYSQL_USER: ${DB_USER:-reqpm}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-reqpmpass}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    networks:
+      - reqpm_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Celery
+  redis:
+    image: redis:7-alpine
+    container_name: reqpm_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - reqpm_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Django backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reqpm_backend
+    command: gunicorn backend.reqpm.wsgi:application --bind 0.0.0.0:8000 --workers 4
+    volumes:
+      - .:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - git_cache:/app/data/git_cache
+      - builds:/app/data/builds
+      - repositories:/app/data/repositories
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+  # Celery worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reqpm_celery
+    command: celery -A backend.reqpm worker -l info --concurrency=4
+    volumes:
+      - .:/app
+      - git_cache:/app/data/git_cache
+      - builds:/app/data/builds
+      - repositories:/app/data/repositories
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+  # Celery beat (for scheduled tasks)
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reqpm_beat
+    command: celery -A backend.reqpm beat -l info
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+  # Nginx (optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: reqpm_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/app/staticfiles:ro
+      - media_volume:/app/media:ro
+      - repositories:/app/data/repositories:ro
+    depends_on:
+      - backend
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+volumes:
+  mariadb_data:
+  static_volume:
+  media_volume:
+  git_cache:
+  builds:
+  repositories:
+
+networks:
+  reqpm_network:
+    driver: bridge
