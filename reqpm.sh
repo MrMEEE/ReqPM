@@ -102,17 +102,17 @@ start_django() {
         return 0
     fi
     
-    print_status "Starting Django server..."
+    print_status "Starting Django server with Daphne (WebSocket support)..."
     
-    # Activate virtual environment and start Django
+    # Activate virtual environment and start Django with Daphne
     source "$VENV/bin/activate"
     
-    nohup python manage.py runserver 0.0.0.0:8000 > "$DJANGO_LOG" 2>&1 &
+    nohup daphne -b 0.0.0.0 -p 8000 backend.reqpm.asgi:application > "$DJANGO_LOG" 2>&1 &
     echo $! > "$DJANGO_PID"
     
     sleep 2
     if is_running "$DJANGO_PID"; then
-        print_success "Django started (PID: $(cat $DJANGO_PID)) - http://localhost:8000"
+        print_success "Django started with Daphne (PID: $(cat $DJANGO_PID)) - http://localhost:8000"
     else
         print_error "Failed to start Django"
         return 1

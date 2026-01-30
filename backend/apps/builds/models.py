@@ -135,6 +135,11 @@ class BuildQueue(models.Model):
     # Build output
     build_log = models.TextField(blank=True, help_text=_('Build output log'))
     error_message = models.TextField(blank=True, help_text=_('Error message if build failed'))
+    analyzed_errors = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_('Analyzed errors from build log')
+    )
     
     # Build artifacts
     srpm_path = models.CharField(max_length=500, blank=True)
@@ -160,6 +165,35 @@ class BuildQueue(models.Model):
     
     def __str__(self):
         return f"{self.package.name} (RHEL {self.rhel_version}) - {self.status}"
+    
+    def analyze_build_log(self):
+        """
+        Analyze build log for common errors
+        
+        Returns dict with error analysis results
+        """
+        from backend.core.error_analyzer import BuildErrorAnalyzer
+        
+        if not self.build_log:
+            return []
+        
+        analyzer = BuildErrorAnalyzer()
+        errors = analyzer.analyze(self.build_log)
+        
+        # Convert to dict for JSON storage
+        error_list = []
+        for error in errors:
+            error_list.append({
+                'category': error.category,
+                'message': error.message,
+                'suggestion': error.suggestion,
+                'items': error.items
+            })
+        
+        self.analyzed_errors = error_list
+        self.save(update_fields=['analyzed_errors'])
+        
+        return error_list
 
 
 class BuildWorker(models.Model):

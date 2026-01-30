@@ -158,7 +158,7 @@ class SpecFileGenerator:
         Args:
             package_name: Package name
             version: Package version
-            python_version: Python version for spec
+            python_version: Python version for spec (or "default" to use system default)
         
         Returns:
             Basic spec file content
@@ -168,6 +168,10 @@ class SpecFileGenerator:
         rpm_name = self._normalize_package_name(package_name)
         version = version or "0.0.1"
         date = datetime.now().strftime("%a %b %d %Y")
+        
+        # Determine Python version suffix (empty for "default")
+        py_suffix = "" if python_version == "default" else python_version
+        py_macro = "3" if python_version == "default" else python_version.replace(".", "")
         
         spec_content = f"""Name:           {rpm_name}
 Version:        {version}
@@ -179,10 +183,10 @@ URL:            https://pypi.org/project/{package_name}
 Source0:        %{{pypi_source {package_name}}}
 
 BuildArch:      noarch
-BuildRequires:  python{python_version}-devel
-BuildRequires:  python{python_version}-setuptools
-BuildRequires:  python{python_version}-pip
-BuildRequires:  python{python_version}-wheel
+BuildRequires:  python{py_suffix}-devel
+BuildRequires:  python{py_suffix}-setuptools
+BuildRequires:  python{py_suffix}-pip
+BuildRequires:  python{py_suffix}-wheel
 
 %description
 Python package {package_name}
@@ -191,13 +195,13 @@ Python package {package_name}
 %autosetup -n {package_name}-%{{version}}
 
 %build
-%py{python_version}_build
+%py{py_macro}_build
 
 %install
-%py{python_version}_install
+%py{py_macro}_install
 
 %files
-%{{python{python_version}_sitelib}}/*
+%{{python{py_macro}_sitelib}}/*
 
 %changelog
 * {date} {self.packager_name} <{self.packager_email}> - {version}-1

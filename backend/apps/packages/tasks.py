@@ -321,3 +321,70 @@ def check_package_updates_task(project_id: int):
     
     logger.info(f"Found {updates_found} package updates for project {project_id}")
     return updates_found
+
+
+@shared_task(bind=True, name='fetch_package_source_task')
+def fetch_package_source_task(self, package_id: int):
+    """
+    Fetch source files for a package
+    
+    Args:
+        package_id: ID of the package
+    """
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.apps.projects.tasks import log_project
+    from django.conf import settings
+    from pathlib import Path
+    from backend.plugins.builders.mock import MockBuilder
+    
+    try:
+        package = Package.objects.get(id=package_id)
+        
+        # Check if spec file exists
+        spec_revision = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+        
+        if not spec_revision:
+            log_package(package_id, 'error', "No spec file found, generate one first")
+            logger.error(f"No spec file for package {package_id}")
+            return
+        
+        log_project(package.project_id, 'debug', f"Fetching sources for {package.name}...")
+        log_package(package_id, 'info', f"Starting source fetching...")
+        
+        # Prepare directory for sources
+        sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / package.name
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Write spec file temporarily
+        spec_file = sources_dir / f"{package.name}.spec"
+        spec_file.write_text(spec_revision.content)
+        
+        # Initialize builder and fetch sources
+        builder = MockBuilder(settings)
+        
+        log_package(package_id, 'debug', f"Fetching sources from spec file...")
+        fetch_result = builder.fetch_sources(
+            spec_file=str(spec_file),
+            sources_dir=str(sources_dir)
+        )
+        
+        if fetch_result.success:
+            log_project(package.project_id, 'debug', f"Sources fetched for {package.name}")
+            log_package(package_id, 'info', f"Sources successfully fetched")
+            logger.info(f"Sources fetched for package {package_id}")
+        else:
+            log_project(package.project_id, 'error', f"Failed to fetch sources for {package.name}: {fetch_result.error_message}")
+            log_package(package_id, 'error', f"Source fetching failed: {fetch_result.error_message}")
+            logger.error(f"Source fetching failed for package {package_id}: {fetch_result.error_message}")
+        
+        # Log the fetch output
+        if fetch_result.log_output:
+            log_package(package_id, 'debug', f"Fetch log:\n{fetch_result.log_output}")
+        
+    except Package.DoesNotExist:
+        logger.error(f"Package {package_id} not found")
+    except Exception as e:
+        logger.exception(f"Error fetching sources for package {package_id}: {e}")
+        log_package(package_id, 'error', f"Error fetching sources: {str(e)}")

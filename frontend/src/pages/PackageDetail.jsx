@@ -1,6 +1,6 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer } from 'lucide-react';
+import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
 import { useState } from 'react';
 
@@ -105,6 +105,19 @@ export default function PackageDetail() {
       queryClient.invalidateQueries(['package-extras', id]);
       queryClient.invalidateQueries(['package-specs', id]);
       queryClient.invalidateQueries(['package-logs', id]);
+    },
+  });
+
+  const fetchSourceMutation = useMutation({
+    mutationFn: async () => {
+      const response = await packagesAPI.fetchSource(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['package-logs', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -467,7 +480,7 @@ export default function PackageDetail() {
         <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
           <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
             <Hammer className="h-5 w-5" />
-            Builds ({builds.length})
+            Build History ({builds.length})
           </h2>
           <div className="space-y-3">
             {builds.map((build) => (
@@ -475,7 +488,7 @@ export default function PackageDetail() {
                 key={build.id}
                 className="p-4 bg-gray-700/50 rounded border border-gray-600 hover:border-gray-500 transition-colors"
               >
-                <div className="flex items-start justify-between">
+                <div className="flex items-start justify-between mb-3">
                   <div className="flex-1">
                     <div className="flex items-center gap-3 mb-2">
                       <Link
@@ -489,7 +502,7 @@ export default function PackageDetail() {
                           ? 'bg-green-100 text-green-800' 
                           : build.status === 'failed'
                           ? 'bg-red-100 text-red-800'
-                          : build.status === 'running'
+                          : build.status === 'building'
                           ? 'bg-blue-100 text-blue-800'
                           : 'bg-gray-600 text-gray-300'
                       }`}>
@@ -499,35 +512,64 @@ export default function PackageDetail() {
                         RHEL {build.rhel_version}
                       </span>
                     </div>
-                    {build.rpm_file && (
-                      <div className="text-sm text-gray-400 mb-1">
-                        <span className="font-medium">RPM:</span> {build.rpm_file.split('/').pop()}
+                    
+                    {/* Error Analysis */}
+                    {build.analyzed_errors && build.analyzed_errors.length > 0 && (
+                      <div className="mb-3 space-y-2">
+                        {build.analyzed_errors.map((error, idx) => (
+                          <div key={idx} className="bg-yellow-900/20 border border-yellow-700/50 rounded p-2">
+                            <div className="text-xs font-medium text-yellow-300 mb-1">
+                              ⚠️ {error.category}
+                            </div>
+                            {error.items && error.items.length > 0 && (
+                              <div className="text-xs text-gray-400 mb-1">
+                                {error.items.slice(0, 3).map((item, i) => (
+                                  <div key={i} className="font-mono">• {item}</div>
+                                ))}
+                                {error.items.length > 3 && (
+                                  <div className="text-gray-500">... and {error.items.length - 3} more</div>
+                                )}
+                              </div>
+                            )}
+                            {error.suggestion && (
+                              <div className="text-xs text-indigo-300">
+                                💡 {error.suggestion}
+                              </div>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     )}
-                    {build.srpm_file && (
+                    
+                    {build.rpm_path && (
                       <div className="text-sm text-gray-400 mb-1">
-                        <span className="font-medium">SRPM:</span> {build.srpm_file.split('/').pop()}
+                        <span className="font-medium">RPM:</span> {build.rpm_path.split('/').pop()}
                       </div>
                     )}
-                    {build.built_at && (
+                    {build.srpm_path && (
+                      <div className="text-sm text-gray-400 mb-1">
+                        <span className="font-medium">SRPM:</span> {build.srpm_path.split('/').pop()}
+                      </div>
+                    )}
+                    {build.completed_at && (
                       <div className="text-xs text-gray-500 mt-2">
-                        Built: {new Date(build.built_at).toLocaleString()}
+                        Completed: {new Date(build.completed_at).toLocaleString()}
                       </div>
                     )}
                   </div>
                   <div className="flex gap-2">
-                    {build.rpm_file && (
+                    {build.rpm_path && (
                       <a
-                        href={build.rpm_file}
+                        href={build.rpm_path}
                         download
                         className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded transition-colors"
                       >
                         Download RPM
                       </a>
                     )}
-                    {build.srpm_file && (
+                    {build.srpm_path && (
                       <a
-                        href={build.srpm_file}
+                        href={build.srpm_path}
                         download
                         className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded transition-colors"
                       >
@@ -600,13 +642,24 @@ export default function PackageDetail() {
       <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-white">Package Logs</h2>
-          <button
-            onClick={handleRegenerateSpec}
-            disabled={regenerating}
-            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
-          >
-            {regenerating ? 'Regenerating...' : 'Regenerate Spec'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => fetchSourceMutation.mutate()}
+              disabled={fetchSourceMutation.isPending || !specFiles || specFiles.length === 0}
+              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors flex items-center gap-1"
+              title={!specFiles || specFiles.length === 0 ? "Generate spec file first" : "Fetch source files"}
+            >
+              <Download className="h-3 w-3" />
+              {fetchSourceMutation.isPending ? 'Fetching...' : 'Fetch Source'}
+            </button>
+            <button
+              onClick={handleRegenerateSpec}
+              disabled={regenerating}
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
+            >
+              {regenerating ? 'Regenerating...' : 'Regenerate Spec'}
+            </button>
+          </div>
         </div>
         
         {logs && logs.length > 0 ? (

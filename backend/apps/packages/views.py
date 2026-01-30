@@ -108,6 +108,25 @@ class PackageViewSet(viewsets.ModelViewSet):
             'package_id': package.id
         })
     
+    @action(detail=True, methods=['post'])
+    def fetch_source(self, request, pk=None):
+        """
+        Fetch source files for a package
+        
+        POST /api/packages/{id}/fetch_source/
+        """
+        from backend.apps.packages.tasks import fetch_package_source_task
+        
+        package = self.get_object()
+        
+        # Trigger source fetching
+        fetch_package_source_task.delay(package.id)
+        
+        return Response({
+            'detail': 'Source fetching triggered',
+            'package_id': package.id
+        })
+    
     @action(detail=True, methods=['get'])
     def dependencies(self, request, pk=None):
         """
@@ -124,27 +143,30 @@ class PackageViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def builds(self, request, pk=None):
         """
-        Get package build history
+        Get package build history from build queue
         
         GET /api/packages/{id}/builds/
         Query params:
         - rhel_version: Filter by RHEL version
-        - status: Filter by status
+        - status: Filter by status (completed, failed, etc.)
         """
+        from backend.apps.builds.models import BuildQueue
+        from backend.apps.builds.serializers import BuildQueueSerializer
+        
         package = self.get_object()
-        builds = package.builds.all()
+        queue_items = BuildQueue.objects.filter(package=package)
         
         # Filter by query params
         rhel_version = request.query_params.get('rhel_version')
         if rhel_version:
-            builds = builds.filter(rhel_version=rhel_version)
+            queue_items = queue_items.filter(rhel_version=rhel_version)
         
         status_filter = request.query_params.get('status')
         if status_filter:
-            builds = builds.filter(status=status_filter)
+            queue_items = queue_items.filter(status=status_filter)
         
-        builds = builds.order_by('-built_at')
-        serializer = PackageBuildSerializer(builds, many=True)
+        queue_items = queue_items.select_related('build_job', 'package').order_by('-completed_at')
+        serializer = BuildQueueSerializer(queue_items, many=True)
         
         return Response(serializer.data)
     

@@ -1,8 +1,9 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Boxes, Play, XCircle, CheckCircle, Clock, Loader, Download, AlertCircle, Package as PackageIcon, ChevronDown, ChevronRight, FileText, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Boxes, Play, XCircle, CheckCircle, Clock, Loader, Download, AlertCircle, Package as PackageIcon, ChevronDown, ChevronRight, FileText, RefreshCw, AlertTriangle, Eye } from 'lucide-react';
 import { useState } from 'react';
 import { buildsAPI } from '../lib/api';
+import LiveBuildLog from '../components/LiveBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -31,11 +32,12 @@ export default function BuildDetail() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [expandedLogs, setExpandedLogs] = useState({});
+  const [liveLogQueueItem, setLiveLogQueueItem] = useState(null);
 
   const toggleLog = (itemId) => {
-    setExpandedLogs(prev => ({
+    setExpandedLogs((prev) => ({
       ...prev,
-      [itemId]: !prev[itemId]
+      [itemId]: !prev[itemId],
     }));
   };
 
@@ -102,6 +104,19 @@ export default function BuildDetail() {
     },
   });
 
+  const fetchAllSourcesMutation = useMutation({
+    mutationFn: async () => {
+      const response = await buildsAPI.fetchAllSources(id);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      alert(`Source fetching triggered for ${data.package_count} packages. Check project logs for progress.`);
+    },
+    onError: (error) => {
+      alert(`Failed to fetch sources: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-96">
@@ -149,6 +164,15 @@ export default function BuildDetail() {
         </div>
         <div className="flex items-center gap-3">
           <StatusBadge status={build.status} />
+          <button
+            onClick={() => fetchAllSourcesMutation.mutate()}
+            disabled={fetchAllSourcesMutation.isPending}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
+            title="Fetch source files for all packages"
+          >
+            <Download className="h-4 w-4" />
+            Fetch All Sources
+          </button>
           {build.status === 'running' && (
             <button
               onClick={() => cancelMutation.mutate()}
@@ -351,7 +375,7 @@ export default function BuildDetail() {
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        {(item.build_log || item.error_message) && (
+                        {(item.build_log || item.error_message || item.analyzed_errors?.length > 0) && (
                           <button
                             onClick={() => toggleLog(item.id)}
                             className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1 text-sm"
@@ -367,22 +391,68 @@ export default function BuildDetail() {
                         )}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        {(item.status === 'failed' || item.status === 'cancelled') && (
-                          <button
-                            onClick={() => retryQueueItemMutation.mutate(item.id)}
-                            disabled={retryQueueItemMutation.isPending}
-                            className="text-indigo-400 hover:text-indigo-300 disabled:text-gray-500 disabled:cursor-not-allowed flex items-center gap-1 text-sm"
-                          >
-                            <RefreshCw className={`h-4 w-4 ${retryQueueItemMutation.isPending ? 'animate-spin' : ''}`} />
-                            Rebuild
-                          </button>
-                        )}
+                        <div className="flex gap-2">
+                          {item.status === 'building' && (
+                            <button
+                              onClick={() => setLiveLogQueueItem(item.id)}
+                              className="text-green-400 hover:text-green-300 flex items-center gap-1 text-sm"
+                            >
+                              <Eye className="h-4 w-4" />
+                              Live Log
+                            </button>
+                          )}
+                          {(item.status === 'failed' || item.status === 'cancelled') && (
+                            <button
+                              onClick={() => retryQueueItemMutation.mutate(item.id)}
+                              disabled={retryQueueItemMutation.isPending}
+                              className="text-indigo-400 hover:text-indigo-300 disabled:text-gray-500 disabled:cursor-not-allowed flex items-center gap-1 text-sm"
+                            >
+                              <RefreshCw className={`h-4 w-4 ${retryQueueItemMutation.isPending ? 'animate-spin' : ''}`} />
+                              Rebuild
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
-                    {expandedLogs[item.id] && (item.build_log || item.error_message) && (
+                    {expandedLogs[item.id] && (item.build_log || item.error_message || item.analyzed_errors?.length > 0) && (
                       <tr key={`${item.id}-log`}>
                         <td colSpan="7" className="px-6 py-4 bg-gray-900">
                           <div className="space-y-4">
+                            {item.analyzed_errors && item.analyzed_errors.length > 0 && (
+                              <div>
+                                <h4 className="text-sm font-semibold text-yellow-400 mb-3 flex items-center gap-2">
+                                  <AlertTriangle className="h-4 w-4" />
+                                  Error Analysis:
+                                </h4>
+                                <div className="space-y-3">
+                                  {item.analyzed_errors.map((error, idx) => (
+                                    <div key={idx} className="bg-yellow-900/20 border border-yellow-700/50 rounded p-3">
+                                      <div className="text-sm font-medium text-yellow-300 mb-1">
+                                        {error.category}
+                                      </div>
+                                      <div className="text-xs text-gray-300 mb-2">
+                                        {error.message}
+                                      </div>
+                                      {error.items && error.items.length > 0 && (
+                                        <div className="bg-gray-800/50 rounded p-2 mb-2">
+                                          <ul className="text-xs text-gray-400 space-y-1">
+                                            {error.items.map((item, i) => (
+                                              <li key={i} className="font-mono">• {item}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                      {error.suggestion && (
+                                        <div className="text-xs text-indigo-300 flex items-start gap-2">
+                                          <span className="text-indigo-400">💡</span>
+                                          <span>{error.suggestion}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                             {item.error_message && (
                               <div>
                                 <h4 className="text-sm font-semibold text-red-400 mb-2">Error Message:</h4>
@@ -409,6 +479,18 @@ export default function BuildDetail() {
             </table>
           </div>
         </div>
+      )}
+      
+      {/* Live Build Log Modal */}
+      {liveLogQueueItem && (
+        <LiveBuildLog
+          queueItemId={liveLogQueueItem}
+          onClose={() => {
+            setLiveLogQueueItem(null);
+            // Refresh queue after closing live log
+            queryClient.invalidateQueries(['build-queue', id]);
+          }}
+        />
       )}
     </div>
   );

@@ -1,8 +1,8 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GitBranch, Package, AlertCircle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer } from 'lucide-react';
+import { ArrowLeft, GitBranch, Package, AlertCircle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
-import { projectsAPI, buildsAPI } from '../lib/api';
+import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
 import ConfirmDialog from '../components/ConfirmDialog';
 
@@ -101,8 +101,25 @@ export default function ProjectDetail() {
     },
   });
 
+  const fetchSourceMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.fetchSource(packageId);
+      return response.data;
+    },
+    onSuccess: () => {
+      // Show logs so user can see progress
+      setShowLogs(true);
+    },
+    onError: (error) => {
+      alert(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const handleFetchSource = (packageId) => {
+    fetchSourceMutation.mutate(packageId);
+  };
+
   const handleRegenerateSpecs = () => {
-    setShowRegenerateConfirm(false);
     regenerateSpecsMutation.mutate();
   };
 
@@ -229,7 +246,7 @@ export default function ProjectDetail() {
 
       {/* Live Logs */}
       {showLogs && (
-        <LogViewer projectId={id} />
+        <LiveLogs projectId={id} />
       )}
 
       {/* Project Info */}
@@ -389,38 +406,72 @@ export default function ProjectDetail() {
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
                       Status
                     </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Actions
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-700">
                   {packagesData.packages.map((pkg) => (
                     <tr
                       key={pkg.id}
-                      className="hover:bg-gray-700/50 cursor-pointer"
-                      onClick={() => navigate(`/packages/${pkg.id}`)}
+                      className="hover:bg-gray-700/50"
                     >
-                      <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-200">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-200 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         {pkg.name}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         {pkg.version || '-'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         <span className="px-2 py-1 bg-gray-700 text-gray-300 text-xs rounded">
                           {pkg.package_type}
                         </span>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         {pkg.build_order ?? '-'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         {pkg.spec_files > 0 ? (
                           <span className="text-green-400">{pkg.spec_files}</span>
                         ) : (
                           <span className="text-gray-500">0</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                      <td 
+                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                        onClick={() => navigate(`/packages/${pkg.id}`)}
+                      >
                         {pkg.status || 'pending'}
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleFetchSource(pkg.id);
+                          }}
+                          disabled={pkg.spec_files === 0}
+                          className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                          title={pkg.spec_files === 0 ? "Generate spec file first" : "Fetch source files"}
+                        >
+                          <Download className="h-3 w-3" />
+                          Fetch
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -515,12 +566,13 @@ export default function ProjectDetail() {
       {/* Regenerate Specs Confirmation */}
       {showRegenerateConfirm && (
         <ConfirmDialog
+          isOpen={true}
+          onClose={() => setShowRegenerateConfirm(false)}
           title="Regenerate Spec Files"
           message={`This will regenerate spec files for all ${packagesData?.count || 0} packages in this project. This action cannot be undone. Continue?`}
           confirmText="Regenerate"
           cancelText="Cancel"
           onConfirm={handleRegenerateSpecs}
-          onCancel={() => setShowRegenerateConfirm(false)}
           variant="warning"
         />
       )}
@@ -776,6 +828,7 @@ function LiveLogs({ projectId }) {
   const [logs, setLogs] = useState([]);
   const [lastTimestamp, setLastTimestamp] = useState(null);
   const logsEndRef = useRef(null);
+  const logsContainerRef = useRef(null);
 
   useEffect(() => {
     // Initial fetch
@@ -802,9 +855,9 @@ function LiveLogs({ projectId }) {
   }, [projectId, lastTimestamp]);
 
   useEffect(() => {
-    // Auto-scroll to bottom when new logs arrive
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    // Auto-scroll to bottom within the container only
+    if (logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
     }
   }, [logs]);
 
@@ -844,7 +897,10 @@ function LiveLogs({ projectId }) {
         <Clock className="h-5 w-5 animate-pulse" />
         Live Logs
       </h2>
-      <div className="bg-gray-900 rounded border border-gray-700 p-4 h-96 overflow-y-auto font-mono text-sm">
+      <div 
+        ref={logsContainerRef}
+        className="bg-gray-900 rounded border border-gray-700 p-4 h-96 overflow-y-auto font-mono text-sm"
+      >
         {logs.length === 0 ? (
           <div className="text-gray-500 text-center py-8">
             Waiting for logs...
@@ -862,7 +918,6 @@ function LiveLogs({ projectId }) {
                 <span className={getLevelColor(log.level)}>{log.message}</span>
               </div>
             ))}
-            <div ref={logsEndRef} />
           </>
         )}
       </div>

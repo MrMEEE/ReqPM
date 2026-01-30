@@ -20,14 +20,14 @@ class BuildQueueSerializer(serializers.ModelSerializer):
             'dependencies_met', 'started_at', 'completed_at',
             'blocked_by', 'blocked_by_packages', 'created_at',
             'retry_count', 'celery_task_id', 'build_log', 'error_message',
-            'srpm_path', 'rpm_path'
+            'analyzed_errors', 'srpm_path', 'rpm_path'
         ]
         read_only_fields = [
             'id', 'package', 'status', 'dependencies_met',
             'started_at', 'completed_at',
             'blocked_by', 'blocked_by_packages', 'created_at',
             'retry_count', 'celery_task_id', 'build_log', 'error_message',
-            'srpm_path', 'rpm_path'
+            'analyzed_errors', 'srpm_path', 'rpm_path'
         ]
     
     def get_blocked_by_packages(self, obj):

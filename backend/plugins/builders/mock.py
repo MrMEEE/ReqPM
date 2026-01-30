@@ -149,6 +149,164 @@ class MockBuilder(BaseBuilder):
             logger.error(f"Error running mock command: {e}")
             return -1, "", str(e)
     
+    def fetch_sources(
+        self,
+        spec_file: str,
+        sources_dir: str,
+        **kwargs
+    ) -> BuildResult:
+        """
+        Fetch source files from URLs defined in spec file
+        
+        Parses the spec file for Source/Patch directives and downloads them.
+        Based on awx-rpm-v2 getsources script but using Python instead of spectool.
+        
+        Args:
+            spec_file: Path to the spec file
+            sources_dir: Directory where sources should be downloaded
+        
+        Returns:
+            BuildResult with success status and log output
+        """
+        import re
+        import requests
+        from urllib.parse import urlparse
+        
+        start_time = time.time()
+        log_lines = []
+        
+        # Ensure sources directory exists
+        Path(sources_dir).mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Parsing spec file for sources: {spec_file}")
+        log_lines.append(f"Parsing spec file: {spec_file}")
+        
+        try:
+            # Read spec file and extract Source/Patch URLs
+            with open(spec_file, 'r') as f:
+                spec_content = f.read()
+            
+            # Extract package name and version from spec
+            name_match = re.search(r'^Name:\s+(.+)$', spec_content, re.MULTILINE)
+            version_match = re.search(r'^Version:\s+(.+)$', spec_content, re.MULTILINE)
+            
+            package_name = name_match.group(1).strip() if name_match else None
+            package_version = version_match.group(1).strip() if version_match else None
+            
+            # Remove python3- prefix for PyPI lookups
+            pypi_name = package_name.replace('python3-', '').replace('python-', '') if package_name else None
+            
+            log_lines.append(f"Package: {package_name}, Version: {package_version}, PyPI name: {pypi_name}")
+            
+            # Find all Source and Patch directives
+            # Format: Source0: https://example.com/file.tar.gz
+            # or: Source0: %{pypi_source package}
+            # or: Patch0: some-patch.patch
+            source_pattern = re.compile(r'^(Source|Patch)(\d+):\s+(.+)$', re.MULTILINE | re.IGNORECASE)
+            sources = source_pattern.findall(spec_content)
+            
+            if not sources:
+                log_lines.append("No Source/Patch directives found in spec file")
+                logger.info("No sources to download")
+                return BuildResult(
+                    success=True,
+                    log_output="\n".join(log_lines),
+                    build_duration=int(time.time() - start_time)
+                )
+            
+            log_lines.append(f"Found {len(sources)} source/patch directive(s)")
+            
+            # Download each source
+            downloaded = 0
+            for source_type, source_num, source_url in sources:
+                source_url = source_url.strip()
+                original_url = source_url
+                
+                # Expand %{pypi_source} macro
+                # Format: %{pypi_source package} or %{pypi_source package version}
+                if '%{pypi_source' in source_url and pypi_name and package_version:
+                    # Extract package name from macro if specified
+                    macro_match = re.match(r'%\{pypi_source\s+(\w+)(?:\s+[\d.]+)?\}', source_url)
+                    if macro_match:
+                        macro_package = macro_match.group(1)
+                    else:
+                        macro_package = pypi_name
+                    
+                    # Construct PyPI download URL
+                    # Format: https://pypi.io/packages/source/{first_letter}/{package}/{package}-{version}.tar.gz
+                    first_letter = macro_package[0].lower()
+                    source_url = f"https://pypi.io/packages/source/{first_letter}/{macro_package}/{macro_package}-{package_version}.tar.gz"
+                    log_lines.append(f"Expanded macro: {original_url} -> {source_url}")
+                
+                # Skip if it's a local file (doesn't start with http/https/ftp)
+                if not source_url.startswith(('http://', 'https://', 'ftp://')):
+                    log_lines.append(f"Skipping {source_type}{source_num}: {source_url} (local file or unexpanded macro)")
+                    continue
+                
+                # Extract filename from URL
+                parsed_url = urlparse(source_url)
+                filename = Path(parsed_url.path).name
+                
+                if not filename:
+                    log_lines.append(f"Warning: Could not extract filename from {source_url}")
+                    continue
+                
+                output_path = Path(sources_dir) / filename
+                
+                # Skip if already downloaded
+                if output_path.exists():
+                    log_lines.append(f"Already exists: {filename}")
+                    downloaded += 1
+                    continue
+                
+                log_lines.append(f"Downloading {source_type}{source_num}: {source_url}")
+                logger.info(f"Downloading {source_url} -> {output_path}")
+                
+                try:
+                    # Download with requests
+                    response = requests.get(source_url, timeout=300, stream=True)
+                    response.raise_for_status()
+                    
+                    # Write to file
+                    with open(output_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    file_size = output_path.stat().st_size
+                    log_lines.append(f"Downloaded: {filename} ({file_size} bytes)")
+                    downloaded += 1
+                    
+                except requests.RequestException as e:
+                    error_msg = f"Failed to download {source_url}: {str(e)}"
+                    log_lines.append(f"ERROR: {error_msg}")
+                    logger.error(error_msg)
+                    return BuildResult(
+                        success=False,
+                        error_message=error_msg,
+                        log_output="\n".join(log_lines),
+                        build_duration=int(time.time() - start_time)
+                    )
+            
+            log_lines.append(f"Successfully processed {downloaded} source(s)")
+            logger.info(f"Source fetching complete: {downloaded} files")
+            
+            return BuildResult(
+                success=True,
+                log_output="\n".join(log_lines),
+                build_duration=int(time.time() - start_time)
+            )
+            
+        except Exception as e:
+            error_msg = f"Source fetch exception: {str(e)}"
+            log_lines.append(f"ERROR: {error_msg}")
+            logger.error(error_msg)
+            return BuildResult(
+                success=False,
+                error_message=error_msg,
+                log_output="\n".join(log_lines),
+                build_duration=int(time.time() - start_time)
+            )
+    
     def build_srpm(
         self,
         spec_file: str,

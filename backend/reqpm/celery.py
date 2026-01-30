@@ -52,6 +52,10 @@ app.conf.beat_schedule = {
         'task': 'backend.apps.repositories.tasks.sync_all_repositories_task',
         'schedule': crontab(minute='*/30'),  # Every 30 minutes
     },
+    'monitor-pending-builds': {
+        'task': 'backend.apps.builds.tasks.monitor_pending_builds',
+        'schedule': 60.0,  # Every 60 seconds
+    },
 }
 
 

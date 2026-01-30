@@ -22,6 +22,7 @@ ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 # Application definition
 INSTALLED_APPS = [
+    'daphne',  # Must be first for channels
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
@@ -37,6 +38,7 @@ INSTALLED_APPS = [
     'django_celery_beat',
     'django_celery_results',
     'guardian',
+    'channels',
     
     # ReqPM apps
     'backend.apps.core',
@@ -79,6 +81,17 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'backend.reqpm.wsgi.application'
+ASGI_APPLICATION = 'backend.reqpm.asgi.application'
+
+# Channels configuration
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [(os.getenv('REDIS_HOST', 'localhost'), int(os.getenv('REDIS_PORT', 6379)))],
+        },
+    },
+}
 
 # Database configuration
 DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite')

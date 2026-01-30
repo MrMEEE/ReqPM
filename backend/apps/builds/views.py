@@ -188,16 +188,53 @@ class BuildJobViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Reset failed queue items to pending
+        # Get failed queue items
         failed_items = build_job.queue_items.filter(status='failed')
         failed_count = failed_items.count()
         
+        # Reset failed queue items to pending
+        # The monitor_pending_builds task will automatically pick them up
         failed_items.update(
             status='pending',
             error_message='',
+            build_log='',
+            analyzed_errors=[],
             started_at=None,
             completed_at=None
         )
+        
+        # Reset build job status
+        build_job.status = 'pending'
+        build_job.error_message = ''
+        build_job.save()
+        
+        return Response({
+            'detail': f'Retrying {failed_count} failed builds',
+            'retried_count': failed_count
+        })
+    
+    @action(detail=True, methods=['post'])
+    def fetch_all_sources(self, request, pk=None):
+        """
+        Fetch sources for all packages in this build job
+        
+        POST /api/build-jobs/{id}/fetch_all_sources/
+        """
+        from backend.apps.packages.tasks import fetch_package_source_task
+        
+        build_job = self.get_object()
+        
+        # Get all unique packages from queue items
+        package_ids = build_job.queue_items.values_list('package_id', flat=True).distinct()
+        
+        # Trigger source fetching for each package
+        for package_id in package_ids:
+            fetch_package_source_task.delay(package_id)
+        
+        return Response({
+            'detail': f'Source fetching triggered for {len(package_ids)} packages',
+            'package_count': len(package_ids)
+        })
         
         # Reset build job status
         build_job.status = 'pending'
@@ -263,6 +300,7 @@ class BuildQueueViewSet(viewsets.ReadOnlyModelViewSet):
         queue_item.status = 'pending'
         queue_item.error_message = ''
         queue_item.build_log = ''
+        queue_item.analyzed_errors = []
         queue_item.srpm_path = ''
         queue_item.rpm_path = ''
         queue_item.started_at = None
