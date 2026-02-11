@@ -119,7 +119,19 @@ sudo chmod 2775 /var/cache/mock
 
 This allows Mock to cache downloaded packages between builds.
 
-### 7. Update ReqPM Configuration
+### 7. Setup GPG Keys (Recommended)
+
+ReqPM includes automatic GPG key management to prevent build failures:
+
+```bash
+./scripts/setup-gpg-keys.sh
+```
+
+This will download and install the latest GPG keys from the distribution-gpg-keys repository. Keys are automatically updated before builds if older than 7 days.
+
+See [GPG_KEY_MANAGEMENT.md](GPG_KEY_MANAGEMENT.md) for details.
+
+### 8. Update ReqPM Configuration
 
 The default ReqPM configuration should work, but you can customize Mock settings in your `.env` file if needed:
 
@@ -129,9 +141,13 @@ MOCK_CONFIG_DIR=/etc/mock
 
 # Optional: Override default Mock cache directory
 MOCK_CACHE_DIR=/var/cache/mock
+
+# Optional: Configure GPG key management
+AUTO_UPDATE_GPG_KEYS=true
+GPG_KEYS_MAX_AGE_DAYS=7
 ```
 
-### 8. Restart ReqPM Services
+### 9. Restart ReqPM Services
 
 After Mock is installed and configured, restart ReqPM to pick up the changes:
 

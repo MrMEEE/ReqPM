@@ -244,6 +244,11 @@ REQPM = {
     # Build concurrency
     'MAX_CONCURRENT_BUILDS': int(os.getenv('MAX_CONCURRENT_BUILDS', '4')),
     
+    # GPG key management
+    'GPG_KEYS_CACHE_DIR': os.getenv('GPG_KEYS_CACHE_DIR', str(BASE_DIR / 'data' / 'gpg_keys_cache')),
+    'AUTO_UPDATE_GPG_KEYS': os.getenv('AUTO_UPDATE_GPG_KEYS', 'true').lower() in ('true', '1', 'yes'),
+    'GPG_KEYS_MAX_AGE_DAYS': int(os.getenv('GPG_KEYS_MAX_AGE_DAYS', '7')),
+    
     # Git settings
     'GIT_DEFAULT_BRANCH': os.getenv('GIT_DEFAULT_BRANCH', 'main'),
     'GIT_TIMEOUT': int(os.getenv('GIT_TIMEOUT', '300')),

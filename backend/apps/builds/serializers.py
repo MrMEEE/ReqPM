@@ -37,6 +37,35 @@ class BuildQueueSerializer(serializers.ModelSerializer):
         return []
 
 
+class BuildQueueListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for BuildQueue list (excludes logs)"""
+    
+    package = PackageListSerializer(read_only=True)
+    blocked_by_packages = serializers.SerializerMethodField()
+    has_log = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = BuildQueue
+        fields = [
+            'id', 'package', 'rhel_version', 'architecture', 'status',
+            'dependencies_met', 'started_at', 'completed_at',
+            'blocked_by', 'blocked_by_packages', 'created_at',
+            'retry_count', 'celery_task_id', 'has_log',
+            'error_message', 'analyzed_errors', 'srpm_path', 'rpm_path'
+        ]
+        read_only_fields = fields
+    
+    def get_blocked_by_packages(self, obj):
+        """Get names of packages blocking this build"""
+        if obj.blocked_by.exists():
+            return [p.name for p in obj.blocked_by.all()]
+        return []
+    
+    def get_has_log(self, obj):
+        """Check if build has a log without loading the entire log"""
+        return bool(obj.build_log)
+
+
 class BuildWorkerSerializer(serializers.ModelSerializer):
     """Serializer for BuildWorker model"""
     
@@ -54,7 +83,9 @@ class BuildJobListSerializer(serializers.ModelSerializer):
     
     project_name = serializers.CharField(source='project.name', read_only=True)
     triggered_by = UserSerializer(read_only=True)
-    progress = serializers.IntegerField(source='progress_percentage', read_only=True)
+    progress = serializers.SerializerMethodField()
+    completed_packages = serializers.SerializerMethodField()
+    failed_packages = serializers.SerializerMethodField()
     
     class Meta:
         model = BuildJob
@@ -69,6 +100,22 @@ class BuildJobListSerializer(serializers.ModelSerializer):
             'total_packages', 'completed_packages', 'failed_packages',
             'triggered_by', 'created_at', 'started_at', 'completed_at'
         ]
+    
+    def get_completed_packages(self, obj):
+        """Calculate completed packages count in real-time"""
+        return obj.queue_items.filter(status='completed').count()
+    
+    def get_failed_packages(self, obj):
+        """Calculate failed packages count in real-time"""
+        return obj.queue_items.filter(status='failed').count()
+    
+    def get_progress(self, obj):
+        """Calculate progress percentage in real-time"""
+        if obj.total_packages == 0:
+            return 0
+        completed = self.get_completed_packages(obj)
+        failed = self.get_failed_packages(obj)
+        return int((completed + failed) / obj.total_packages * 100)
 
 
 class BuildJobDetailSerializer(serializers.ModelSerializer):
@@ -78,7 +125,9 @@ class BuildJobDetailSerializer(serializers.ModelSerializer):
     triggered_by = UserSerializer(read_only=True)
     queue = BuildQueueSerializer(source='queue_items', many=True, read_only=True)
     queue_stats = serializers.SerializerMethodField()
-    progress = serializers.IntegerField(source='progress_percentage', read_only=True)
+    progress = serializers.SerializerMethodField()
+    completed_packages = serializers.SerializerMethodField()
+    failed_packages = serializers.SerializerMethodField()
     
     class Meta:
         model = BuildJob
@@ -95,6 +144,22 @@ class BuildJobDetailSerializer(serializers.ModelSerializer):
             'triggered_by', 'queue', 'queue_stats',
             'created_at', 'started_at', 'completed_at'
         ]
+    
+    def get_completed_packages(self, obj):
+        """Calculate completed packages count in real-time"""
+        return obj.queue_items.filter(status='completed').count()
+    
+    def get_failed_packages(self, obj):
+        """Calculate failed packages count in real-time"""
+        return obj.queue_items.filter(status='failed').count()
+    
+    def get_progress(self, obj):
+        """Calculate progress percentage in real-time"""
+        if obj.total_packages == 0:
+            return 0
+        completed = self.get_completed_packages(obj)
+        failed = self.get_failed_packages(obj)
+        return int((completed + failed) / obj.total_packages * 100)
     
     def get_queue_stats(self, obj):
         """Get statistics about build queue"""

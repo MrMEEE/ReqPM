@@ -28,23 +28,31 @@ class BuildConcurrencyLimiter:
         self.lock_timeout = 7200  # 2 hours max per build
     
     @contextmanager
-    def acquire(self, build_id, timeout=10):
+    def acquire(self, build_id, timeout=None):
         """
-        Acquire a build slot with timeout
+        Acquire a build slot, waiting indefinitely if needed
         
         Args:
             build_id: Unique identifier for this build
-            timeout: How long to wait for a slot (seconds)
+            timeout: How long to wait for a slot (seconds). None = wait forever
         
         Yields:
-            True if acquired, raises exception on timeout
+            True if acquired, raises exception on timeout (if timeout is set)
         """
         acquired = False
         start_time = time.time()
         
         try:
             # Try to acquire a slot
-            while time.time() - start_time < timeout:
+            while True:
+                # Check timeout if set
+                if timeout is not None and time.time() - start_time >= timeout:
+                    raise TimeoutError(
+                        f"Could not acquire build slot after {timeout}s. "
+                        f"Max concurrent builds: {self.max_concurrent}. "
+                        f"Consider increasing MAX_CONCURRENT_BUILDS setting."
+                    )
+                
                 # Get current number of active builds
                 active_count = self.redis_client.scard(self.semaphore_key)
                 
@@ -59,14 +67,7 @@ class BuildConcurrencyLimiter:
                         return
                 
                 # Wait a bit before retrying
-                time.sleep(0.5)
-            
-            # Timeout reached
-            raise TimeoutError(
-                f"Could not acquire build slot after {timeout}s. "
-                f"Max concurrent builds: {self.max_concurrent}. "
-                f"Consider increasing MAX_CONCURRENT_BUILDS setting."
-            )
+                time.sleep(5)
         
         finally:
             # Release the slot

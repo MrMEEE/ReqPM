@@ -56,6 +56,14 @@ app.conf.beat_schedule = {
         'task': 'backend.apps.builds.tasks.monitor_pending_builds',
         'schedule': 60.0,  # Every 60 seconds
     },
+    'cleanup-stuck-builds': {
+        'task': 'backend.apps.builds.tasks.cleanup_stuck_builds',
+        'schedule': 120.0,  # Every 2 minutes
+    },
+    'update-gpg-keys': {
+        'task': 'backend.apps.builds.tasks.update_gpg_keys_task',
+        'schedule': crontab(minute='0', hour='*/12'),  # Every 12 hours
+    },
 }
 
 

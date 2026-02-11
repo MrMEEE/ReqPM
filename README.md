@@ -97,6 +97,24 @@ For detailed setup instructions, see:
 - RHEL/Fedora: **[docs/MOCK_SETUP.md](docs/MOCK_SETUP.md)**
 - Ubuntu/Debian: **[docs/MOCK_SETUP_UBUNTU.md](docs/MOCK_SETUP_UBUNTU.md)**
 
+### Setting Up GPG Keys (Recommended)
+
+ReqPM includes automatic GPG key management to prevent build failures due to outdated keys:
+
+```bash
+# Initialize GPG keys
+./scripts/setup-gpg-keys.sh
+```
+
+This will:
+- Download the latest GPG keys from [distribution-gpg-keys](https://github.com/rpm-software-management/distribution-gpg-keys)
+- Install them to `/usr/share/distribution-gpg-keys/`
+- Enable automatic updates (every 12 hours)
+
+**Note**: GPG keys are automatically updated before builds if older than 7 days, so this step is optional but recommended to avoid delays during first builds.
+
+See **[docs/GPG_KEY_MANAGEMENT.md](docs/GPG_KEY_MANAGEMENT.md)** for details.
+
 ### Running the Application
 
 Use the provided control script to manage all services:

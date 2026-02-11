@@ -1,15 +1,17 @@
+import React, { useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Boxes, Play, XCircle, CheckCircle, Clock, Loader, Download, AlertCircle, Package as PackageIcon, ChevronDown, ChevronRight, FileText, RefreshCw, AlertTriangle, Eye } from 'lucide-react';
-import { useState } from 'react';
 import { buildsAPI } from '../lib/api';
+import { useToast } from '../contexts/ToastContext';
+import { useWebSocket } from '../hooks/useWebSocket';
 import LiveBuildLog from '../components/LiveBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
     pending: { color: 'bg-yellow-100 text-yellow-800', icon: Clock, label: 'Pending' },
     preparing: { color: 'bg-blue-100 text-blue-800', icon: Loader, label: 'Preparing' },
-    queued: { color: 'bg-indigo-100 text-indigo-800', icon: Clock, label: 'Queued' },
+    building: { color: 'bg-blue-100 text-blue-800', icon: Loader, label: 'Building' },
     running: { color: 'bg-blue-100 text-blue-800', icon: Play, label: 'Running' },
     completed: { color: 'bg-green-100 text-green-800', icon: CheckCircle, label: 'Completed' },
     failed: { color: 'bg-red-100 text-red-800', icon: XCircle, label: 'Failed' },
@@ -31,6 +33,7 @@ export default function BuildDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [expandedLogs, setExpandedLogs] = useState({});
   const [liveLogQueueItem, setLiveLogQueueItem] = useState(null);
 
@@ -42,19 +45,18 @@ export default function BuildDetail() {
   };
 
   const { data: build, isLoading, error } = useQuery({
-    queryKey: ['build', id],
+    queryKey: ['buildJob', id],
     queryFn: async () => {
       const response = await buildsAPI.get(id);
       return response.data;
     },
-    refetchInterval: (data) => {
-      // Auto-refresh if build is in progress
-      if (data && ['pending', 'preparing', 'queued', 'running'].includes(data.status)) {
-        return 5000; // 5 seconds
-      }
-      return false;
-    },
+    // Disable polling since we're using WebSocket
+    refetchInterval: false,
   });
+
+  // Enable WebSocket for real-time updates when build is active
+  const wsEnabled = build && !['completed', 'failed', 'cancelled'].includes(build.status);
+  useWebSocket(id, wsEnabled);
 
   const { data: queue } = useQuery({
     queryKey: ['build-queue', id],
@@ -63,12 +65,8 @@ export default function BuildDetail() {
       return response.data;
     },
     enabled: !!build,
-    refetchInterval: (data) => {
-      if (build && ['pending', 'preparing', 'queued', 'running'].includes(build.status)) {
-        return 5000;
-      }
-      return false;
-    },
+    // Disable polling since we're using WebSocket
+    refetchInterval: false,
   });
 
   const cancelMutation = useMutation({
@@ -77,7 +75,7 @@ export default function BuildDetail() {
       return response.data;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries(['build', id]);
+      queryClient.invalidateQueries(['buildJob', id]);
       queryClient.invalidateQueries(['build-queue', id]);
     },
   });
@@ -87,9 +85,28 @@ export default function BuildDetail() {
       const response = await buildsAPI.retry(id);
       return response.data;
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries(['build', id]);
+    onSuccess: (data) => {
+      toast.success(data.detail || 'Build retry triggered successfully');
+      queryClient.invalidateQueries(['buildJob', id]);
       queryClient.invalidateQueries(['build-queue', id]);
+    },
+    onError: (error) => {
+      toast.error(error.response?.data?.detail || error.message);
+    },
+  });
+
+  const retryFailedMutation = useMutation({
+    mutationFn: async () => {
+      const response = await buildsAPI.retry(id, true);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data.detail || 'Failed builds retry triggered successfully');
+      queryClient.invalidateQueries(['buildJob', id]);
+      queryClient.invalidateQueries(['build-queue', id]);
+    },
+    onError: (error) => {
+      toast.error(error.response?.data?.detail || error.message);
     },
   });
 
@@ -99,7 +116,7 @@ export default function BuildDetail() {
       return response.data;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries(['build', id]);
+      queryClient.invalidateQueries(['buildJob', id]);
       queryClient.invalidateQueries(['build-queue', id]);
     },
   });
@@ -110,10 +127,10 @@ export default function BuildDetail() {
       return response.data;
     },
     onSuccess: (data) => {
-      alert(`Source fetching triggered for ${data.package_count} packages. Check project logs for progress.`);
+      toast.success(`Source fetching triggered for ${data.package_count} packages. Check project logs for progress.`);
     },
     onError: (error) => {
-      alert(`Failed to fetch sources: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to fetch sources: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -183,15 +200,27 @@ export default function BuildDetail() {
               Cancel
             </button>
           )}
-          {build.status === 'failed' && (
-            <button
-              onClick={() => retryMutation.mutate()}
-              disabled={retryMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
-            >
-              <Play className="h-4 w-4" />
-              Retry
-            </button>
+          {!['preparing', 'running'].includes(build.status) && (
+            <>
+              <button
+                onClick={() => retryMutation.mutate()}
+                disabled={retryMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
+              >
+                <Play className="h-4 w-4" />
+                Retry All
+              </button>
+              {build.failed_packages > 0 && (
+                <button
+                  onClick={() => retryFailedMutation.mutate()}
+                  disabled={retryFailedMutation.isPending}
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  Retry Failed
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -322,8 +351,8 @@ export default function BuildDetail() {
               </thead>
               <tbody className="divide-y divide-gray-700">
                 {queue.map((item) => (
-                  <>
-                    <tr key={item.id} className="hover:bg-gray-700/30 transition-colors">
+                  <React.Fragment key={item.id}>
+                    <tr className="hover:bg-gray-700/30 transition-colors">
                       <td className="px-6 py-4 whitespace-nowrap">
                         <Link
                           to={`/packages/${item.package.id}`}
@@ -401,7 +430,7 @@ export default function BuildDetail() {
                               Live Log
                             </button>
                           )}
-                          {(item.status === 'failed' || item.status === 'cancelled') && (
+                          {(item.status === 'failed' || item.status === 'cancelled' || item.status === 'completed') && (
                             <button
                               onClick={() => retryQueueItemMutation.mutate(item.id)}
                               disabled={retryQueueItemMutation.isPending}
@@ -473,7 +502,7 @@ export default function BuildDetail() {
                         </td>
                       </tr>
                     )}
-                  </>
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>

@@ -207,3 +207,66 @@ class BuildLogConsumer(AsyncWebsocketConsumer):
     async def build_update(self, event):
         """Receive build update from group"""
         await self.send(text_data=json.dumps(event['data']))
+
+
+class BuildJobConsumer(AsyncWebsocketConsumer):
+    """
+    WebSocket consumer for real-time build job updates
+    
+    URL: /ws/builds/{build_job_id}/
+    """
+    
+    async def connect(self):
+        self.build_job_id = self.scope['url_route']['kwargs']['build_job_id']
+        self.room_group_name = f'build_job_{self.build_job_id}'
+        
+        # Join room group
+        await self.channel_layer.group_add(
+            self.room_group_name,
+            self.channel_name
+        )
+        
+        await self.accept()
+        
+        # Send initial build job data
+        build_data = await self.get_build_job_data()
+        if build_data:
+            await self.send(text_data=json.dumps({
+                'type': 'build_update',
+                'data': build_data
+            }))
+    
+    async def disconnect(self, close_code):
+        # Leave room group
+        await self.channel_layer.group_discard(
+            self.room_group_name,
+            self.channel_name
+        )
+    
+    # Receive message from room group
+    async def build_update(self, event):
+        """Send build update to WebSocket"""
+        await self.send(text_data=json.dumps({
+            'type': 'build_update',
+            'data': event['data']
+        }))
+    
+    async def queue_update(self, event):
+        """Send queue item update to WebSocket"""
+        await self.send(text_data=json.dumps({
+            'type': 'queue_update',
+            'data': event['data']
+        }))
+    
+    @database_sync_to_async
+    def get_build_job_data(self):
+        """Get BuildJob data with queue items"""
+        from backend.apps.builds.models import BuildJob
+        from backend.apps.builds.serializers import BuildJobDetailSerializer
+        
+        try:
+            build_job = BuildJob.objects.get(id=self.build_job_id)
+            serializer = BuildJobDetailSerializer(build_job)
+            return serializer.data
+        except BuildJob.DoesNotExist:
+            return None

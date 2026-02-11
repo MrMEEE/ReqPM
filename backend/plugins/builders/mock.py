@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from .base import BaseBuilder, BuildResult
+from backend.core.gpg_key_manager import get_gpg_key_manager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,9 @@ class MockBuilder(BaseBuilder):
         reqpm_config = getattr(config, 'REQPM', {})
         self.mock_config_dir = reqpm_config.get('MOCK_CONFIG_DIR', '/etc/mock')
         self.cache_dir = reqpm_config.get('MOCK_CACHE_DIR', '/var/cache/mock')
+        self.gpg_keys_cache_dir = reqpm_config.get('GPG_KEYS_CACHE_DIR', '/var/cache/reqpm/distribution-gpg-keys')
+        self.auto_update_gpg_keys = reqpm_config.get('AUTO_UPDATE_GPG_KEYS', True)
+        self._gpg_keys_checked = False  # Track if we've checked keys in this session
     
     @property
     def name(self) -> str:
@@ -87,6 +91,53 @@ class MockBuilder(BaseBuilder):
         except Exception as e:
             logger.error(f"Mock not available: {e}")
             return False
+    
+    def _ensure_gpg_keys_updated(self) -> bool:
+        """
+        Ensure GPG keys are up to date before building
+        
+        This prevents build failures due to outdated or missing GPG keys.
+        Updates are performed automatically if enabled and keys are stale.
+        
+        Returns:
+            True if keys are ready, False if update failed
+        """
+        # Only check once per builder instance to avoid redundant updates
+        if self._gpg_keys_checked:
+            return True
+        
+        if not self.auto_update_gpg_keys:
+            logger.debug("Automatic GPG key updates are disabled")
+            self._gpg_keys_checked = True
+            return True
+        
+        try:
+            logger.info("Checking GPG keys status...")
+            manager = get_gpg_key_manager(cache_dir=self.gpg_keys_cache_dir)
+            
+            # Check if update is needed (max age: 7 days)
+            if manager.is_update_needed(max_age_days=7):
+                logger.info("GPG keys are stale or missing, updating...")
+                success, message = manager.update_keys(force=False)
+                
+                if success:
+                    logger.info(f"GPG keys updated successfully: {message}")
+                else:
+                    logger.warning(f"Failed to update GPG keys: {message}")
+                    # Don't fail the build, just warn
+                    # Existing keys might still work
+            else:
+                logger.debug("GPG keys are up to date")
+            
+            # Mark as checked
+            self._gpg_keys_checked = True
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error checking GPG keys: {e}")
+            # Don't fail the build
+            self._gpg_keys_checked = True
+            return True
     
     def get_available_targets(self) -> List[str]:
         """Get list of available Mock configurations"""
@@ -396,6 +447,10 @@ class MockBuilder(BaseBuilder):
         Uses --no-clean to reuse the bootstrap chroot (which is shared).
         """
         start_time = time.time()
+        
+        # Ensure GPG keys are up to date before building
+        # This prevents GPG key mismatch errors in RHEL builds
+        self._ensure_gpg_keys_updated()
         
         # Prepare output directory
         Path(output_dir).mkdir(parents=True, exist_ok=True)
