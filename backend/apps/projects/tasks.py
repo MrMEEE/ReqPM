@@ -173,6 +173,9 @@ def analyze_requirements_task(self, project_id: int):
             # Parse requirements
             requirements = parser.parse_string(requirements_content)
             if requirements:
+                # Tag requirements with their source file
+                for req in requirements:
+                    req.source_file = req_file
                 all_requirements.extend(requirements)
                 processed_files.append(req_file)
                 log_project(project_id, 'info', f"Found {len(requirements)} packages in {req_file}")
@@ -199,9 +202,17 @@ def analyze_requirements_task(self, project_id: int):
                 name=req.name,
                 defaults={
                     'version': req.specs[0][1] if req.specs else '',
-                    'package_type': 'dependency'
+                    'package_type': 'dependency',
+                    'requirements_file': getattr(req, 'source_file', ''),
+                    'is_direct_dependency': True,
                 }
             )
+            
+            # Update existing packages to mark as direct dependency
+            if not created:
+                package.is_direct_dependency = True
+                package.requirements_file = getattr(req, 'source_file', '')
+                package.save()
             
             if created:
                 created_count += 1
@@ -255,10 +266,11 @@ def resolve_dependencies_task(self, project_id: int):
         
         # Build dependency tree
         dependency_tree = {}
+        new_packages = []  # Track newly created packages for spec generation
         
         for package in packages:
             # Get package info from PyPI
-            pkg_info = pypi_client.get_package_info(package.name, package.version or None)
+            pkg_info = pypi_client.get_package_info(package.python_name or package.name, package.version or None)
             
             if pkg_info:
                 # Store runtime dependencies
@@ -268,14 +280,29 @@ def resolve_dependencies_task(self, project_id: int):
                     if dep_name:
                         deps.append(dep_name)
                         
+                        # Get version from PyPI for transitive dependencies
+                        dep_info = pypi_client.get_package_info(dep_name)
+                        dep_version = dep_info.version if dep_info else None
+                        
                         # Create or get dependency package
                         dep_package, created = Package.objects.get_or_create(
                             project=project,
                             name=dep_name,
                             defaults={
-                                'package_type': 'dependency'
+                                'python_name': dep_name,
+                                'version': dep_version or '',
+                                'package_type': 'dependency',
+                                'is_direct_dependency': False,
                             }
                         )
+                        
+                        if created:
+                            new_packages.append(dep_package.id)
+                        
+                        # Update version if not set
+                        if not dep_package.version and dep_version:
+                            dep_package.version = dep_version
+                            dep_package.save()
                         
                         # Create dependency link
                         PackageDependency.objects.get_or_create(
@@ -297,34 +324,21 @@ def resolve_dependencies_task(self, project_id: int):
                     name=pkg_name
                 ).update(build_order=level_index)
         
-        log_project(project_id, 'info', f"Dependency resolution complete: {len(build_levels)} build levels")
+        # Generate specs for newly created transitive dependencies
+        if new_packages:
+            log_project(project_id, 'info', f"Generating specs for {len(new_packages)} new transitive dependencies")
+            from backend.apps.packages.tasks import generate_spec_file_task
+            for pkg_id in new_packages:
+                generate_spec_file_task.delay(pkg_id, force=True)
+        
+        log_project(project_id, 'info', f"Dependency resolution complete: {len(build_levels)} build levels, {len(new_packages)} new packages")
         logger.info(f"Resolved dependencies for project {project_id}: {len(build_levels)} build levels")
-        
-        # Automatically create a build job after dependency resolution
-        log_project(project_id, 'info', "Creating build job...")
-        from backend.apps.builds.models import BuildJob
-        from backend.apps.builds.tasks import start_build_job_task
-        
-        build_job = BuildJob.objects.create(
-            project=project,
-            build_version=project.git_tag or project.git_branch or 'latest',
-            git_ref=project.git_branch or project.git_tag or 'main',
-            git_commit=project.git_commit or '',
-            rhel_versions=['rhel8', 'rhel9'],  # Default to both RHEL versions
-            status='preparing',
-            total_packages=packages.count()
-        )
-        
-        log_project(project_id, 'info', f"Build job #{build_job.id} created, starting build queue...")
-        logger.info(f"Created build job {build_job.id} for project {project_id}")
-        
-        # Start the build job
-        start_build_job_task.delay(build_job.id)
     
     except Exception as e:
         log_project(project_id, 'error', f"Dependency resolution failed: {str(e)}")
         logger.error(f"Error resolving dependencies for project {project_id}: {e}")
         raise self.retry(exc=e, countdown=60)
+
 
 
 @shared_task

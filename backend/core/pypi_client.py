@@ -130,6 +130,18 @@ class PyPIClient:
             logger.error(f"Error getting versions for {package_name}: {e}")
             return []
     
+    def get_package_versions(self, package_name: str) -> List[str]:
+        """
+        Alias for get_all_versions for API consistency
+        
+        Args:
+            package_name: Name of the package
+        
+        Returns:
+            List of version strings
+        """
+        return self.get_all_versions(package_name)
+    
     def get_latest_version(self, package_name: str) -> Optional[str]:
         """
         Get latest version of a package

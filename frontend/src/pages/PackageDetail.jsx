@@ -559,22 +559,48 @@ export default function PackageDetail() {
                   </div>
                   <div className="flex gap-2">
                     {build.rpm_path && (
-                      <a
-                        href={build.rpm_path}
-                        download
+                      <button
+                        onClick={async () => {
+                          try {
+                            const response = await packagesAPI.downloadRpm(pkg.id);
+                            const url = window.URL.createObjectURL(response.data);
+                            const link = document.createElement('a');
+                            link.href = url;
+                            link.download = build.rpm_path.split('/').pop();
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                            window.URL.revokeObjectURL(url);
+                          } catch (error) {
+                            console.error('Download failed:', error);
+                          }
+                        }}
                         className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded transition-colors"
                       >
                         Download RPM
-                      </a>
+                      </button>
                     )}
                     {build.srpm_path && (
-                      <a
-                        href={build.srpm_path}
-                        download
+                      <button
+                        onClick={async () => {
+                          try {
+                            const response = await packagesAPI.downloadSrpm(pkg.id);
+                            const url = window.URL.createObjectURL(response.data);
+                            const link = document.createElement('a');
+                            link.href = url;
+                            link.download = build.srpm_path.split('/').pop();
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                            window.URL.revokeObjectURL(url);
+                          } catch (error) {
+                            console.error('Download failed:', error);
+                          }
+                        }}
                         className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded transition-colors"
                       >
                         Download SRPM
-                      </a>
+                      </button>
                     )}
                   </div>
                 </div>

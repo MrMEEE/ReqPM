@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { List, Search, Filter, CheckCircle, XCircle, Clock, Loader, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react';
+import { List, Search, Filter, CheckCircle, XCircle, Clock, Loader, AlertCircle, ChevronDown, ChevronUp, Terminal } from 'lucide-react';
 import { tasksAPI } from '../lib/api';
+import LiveTaskLog from '../components/LiveTaskLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -29,6 +30,7 @@ export default function Tasks() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
   const [expandedTask, setExpandedTask] = useState(null);
+  const [liveLogTask, setLiveLogTask] = useState(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['tasks', currentPage, statusFilter, search],
@@ -163,16 +165,25 @@ export default function Tasks() {
                       )}
                     </div>
                   </div>
-                  <button
-                    onClick={() => toggleExpand(task.id)}
-                    className="p-2 hover:bg-gray-600 rounded transition-colors"
-                  >
-                    {expandedTask === task.id ? (
-                      <ChevronUp className="h-5 w-5 text-gray-400" />
-                    ) : (
-                      <ChevronDown className="h-5 w-5 text-gray-400" />
-                    )}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setLiveLogTask(task)}
+                      className="p-2 hover:bg-gray-600 rounded transition-colors text-blue-400 hover:text-blue-300"
+                      title="View live log"
+                    >
+                      <Terminal className="h-5 w-5" />
+                    </button>
+                    <button
+                      onClick={() => toggleExpand(task.id)}
+                      className="p-2 hover:bg-gray-600 rounded transition-colors"
+                    >
+                      {expandedTask === task.id ? (
+                        <ChevronUp className="h-5 w-5 text-gray-400" />
+                      ) : (
+                        <ChevronDown className="h-5 w-5 text-gray-400" />
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {expandedTask === task.id && (
@@ -256,6 +267,15 @@ export default function Tasks() {
           </div>
         )}
       </div>
+
+      {/* Live Task Log Modal */}
+      {liveLogTask && (
+        <LiveTaskLog
+          taskId={liveLogTask.task_id}
+          taskName={liveLogTask.task_name}
+          onClose={() => setLiveLogTask(null)}
+        />
+      )}
     </div>
   );
 }

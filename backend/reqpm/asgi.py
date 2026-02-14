@@ -18,7 +18,13 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'backend.reqpm.settings')
 
 django_asgi_app = get_asgi_application()
 
-from backend.apps.builds.routing import websocket_urlpatterns
+from backend.apps.builds.routing import websocket_urlpatterns as builds_ws_urls
+from backend.apps.projects.routing import websocket_urlpatterns as projects_ws_urls
+from backend.apps.packages.routing import websocket_urlpatterns as packages_ws_urls
+from backend.apps.tasks.routing import websocket_urlpatterns as tasks_ws_urls
+
+# Combine all WebSocket URL patterns
+websocket_urlpatterns = builds_ws_urls + projects_ws_urls + packages_ws_urls + tasks_ws_urls
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,

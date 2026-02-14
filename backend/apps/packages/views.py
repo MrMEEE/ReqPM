@@ -1,6 +1,8 @@
 """
 ViewSets for Packages app
 """
+import os
+from django.http import FileResponse, Http404
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -240,6 +242,146 @@ class PackageViewSet(viewsets.ModelViewSet):
         serializer = PackageLogSerializer(logs, many=True)
         return Response(serializer.data)
     
+    @action(detail=True, methods=['post'])
+    def build_package(self, request, pk=None):
+        """
+        Build a single package
+        
+        POST /api/packages/{id}/build_package/
+        """
+        from backend.apps.packages.tasks import build_single_package_task
+        
+        package = self.get_object()
+        
+        # Validate package has spec file
+        if not package.spec_revisions.exists():
+            return Response(
+                {'detail': 'Package must have a spec file before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate package has source
+        if not package.source_fetched:
+            return Response(
+                {'detail': 'Package source must be fetched before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check dependencies are built
+        unbuilt_deps = []
+        for dep in package.dependencies.all():
+            dep_package = dep.depends_on
+            if dep_package and dep_package.build_status not in ['completed', 'not_required']:
+                unbuilt_deps.append(dep_package.name)
+        
+        if unbuilt_deps:
+            # Set to waiting_for_deps instead of rejecting
+            package.build_status = 'waiting_for_deps'
+            package.build_error_message = ''
+            package.build_log = ''
+            package.save()
+            
+            from backend.apps.packages.tasks import send_package_update
+            send_package_update(package.id)
+            
+            return Response({
+                'detail': f'Package queued, waiting for dependencies: {", ".join(unbuilt_deps)}',
+                'package_id': package.id,
+                'status': 'waiting_for_deps',
+                'unbuilt_dependencies': unbuilt_deps
+            })
+        
+        # All deps ready, trigger build immediately
+        build_single_package_task.delay(package.id)
+        
+        return Response({
+            'detail': 'Package build triggered',
+            'package_id': package.id
+        })
+    
+    @action(detail=True, methods=['post'])
+    def cancel_build(self, request, pk=None):
+        """
+        Cancel a waiting/pending build
+        
+        POST /api/packages/{id}/cancel_build/
+        """
+        package = self.get_object()
+        
+        if package.build_status not in ['waiting_for_deps', 'pending']:
+            return Response(
+                {'detail': f'Cannot cancel build in state: {package.build_status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        package.build_status = 'not_built'
+        package.build_started_at = None
+        package.build_completed_at = None
+        package.build_error_message = ''
+        package.build_log = ''
+        package.save()
+        
+        from backend.apps.packages.tasks import send_package_update
+        send_package_update(package.id)
+        
+        return Response({
+            'detail': 'Build cancelled',
+            'package_id': package.id
+        })
+    
+    @action(detail=True, methods=['post'])
+    def rebuild_package(self, request, pk=None):
+        """
+        Rebuild a package (same as build but no dependency checks)
+        
+        POST /api/packages/{id}/rebuild_package/
+        """
+        from backend.apps.packages.tasks import build_single_package_task
+        
+        package = self.get_object()
+        
+        # Validate package has spec file
+        if not package.spec_revisions.exists():
+            return Response(
+                {'detail': 'Package must have a spec file before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate package has source
+        if not package.source_fetched:
+            return Response(
+                {'detail': 'Package source must be fetched before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Trigger build (no dependency check for rebuild)
+        build_single_package_task.delay(package.id)
+        
+        return Response({
+            'detail': 'Package rebuild triggered',
+            'package_id': package.id
+        })
+    
+    @action(detail=True, methods=['get'])
+    def build_status(self, request, pk=None):
+        """
+        Get package build status
+        
+        GET /api/packages/{id}/build_status/
+        """
+        package = self.get_object()
+        
+        return Response({
+            'package_id': package.id,
+            'package_name': package.name,
+            'build_status': package.build_status,
+            'build_started_at': package.build_started_at,
+            'build_completed_at': package.build_completed_at,
+            'build_error_message': package.build_error_message,
+            'srpm_path': package.srpm_path,
+            'rpm_path': package.rpm_path,
+        })
+    
     @action(detail=True, methods=['get'])
     def extras(self, request, pk=None):
         """
@@ -291,16 +433,135 @@ class PackageViewSet(viewsets.ModelViewSet):
         
         serializer = PackageExtraSerializer(extra, data=request.data, partial=True)
         if serializer.is_valid():
+            old_enabled = extra.enabled
             serializer.save()
             
-            # Trigger spec file regeneration if extras changed
-            if 'enabled' in request.data:
+            # Trigger spec file regeneration and dependency recalculation if extras changed
+            if 'enabled' in request.data and old_enabled != extra.enabled:
                 from backend.apps.packages.tasks import generate_spec_file_task
+                from backend.apps.projects.tasks import resolve_dependencies_task
+                
+                # Regenerate spec file with new extras
                 generate_spec_file_task.delay(package.id, force=True)
+                
+                # Recalculate dependencies for the entire project since extras affect deps
+                resolve_dependencies_task.delay(package.project.id)
             
             return Response(serializer.data)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['get'], url_path='versions')
+    def get_versions(self, request, pk=None):
+        """
+        Get available versions for a package from PyPI
+        
+        GET /api/packages/{id}/versions/
+        """
+        package = self.get_object()
+        
+        try:
+            from backend.core.pypi_client import PyPIClient
+            
+            pypi_client = PyPIClient()
+            # Use python_name if available, otherwise fall back to name
+            package_name = package.python_name or package.name
+            versions = pypi_client.get_package_versions(package_name)
+            
+            if versions:
+                return Response({
+                    'package': package_name,
+                    'versions': versions,
+                    'current_version': package.version
+                })
+            else:
+                return Response(
+                    {'error': f'No versions found for {package_name}'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        except Exception as e:
+            logger.exception(f"Error fetching versions for {package.python_name or package.name}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['patch'], url_path='change-version')
+    def change_version(self, request, pk=None):
+        """
+        Change the version of a package
+        
+        PATCH /api/packages/{id}/change-version/
+        Body: { "version": "1.2.3" }
+        """
+        package = self.get_object()
+        new_version = request.data.get('version')
+        
+        if not new_version:
+            return Response(
+                {'error': 'Version is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        old_version = package.version
+        
+        # Update version
+        package.version = new_version
+        package.save()
+        
+        # Trigger spec file regeneration with new version
+        from backend.apps.packages.tasks import generate_spec_file_task
+        from backend.apps.projects.tasks import resolve_dependencies_task
+        
+        generate_spec_file_task.delay(package.id, force=True)
+        
+        # Recalculate dependencies only for this package
+        resolve_dependencies_task.delay(package.project.id)
+        
+        logger.info(f"Changed version of {package.name} from {old_version} to {new_version}")
+        
+        return Response({
+            'message': f'Version changed from {old_version} to {new_version}',
+            'package': PackageListSerializer(package).data
+        })
+    
+    @action(detail=True, methods=['get'], url_path='download-rpm')
+    def download_rpm(self, request, pk=None):
+        """
+        Download the RPM file for this package
+        
+        GET /api/packages/{id}/download-rpm/
+        """
+        package = self.get_object()
+        
+        if not package.rpm_path:
+            raise Http404("RPM file not available for this package")
+        
+        if not os.path.exists(package.rpm_path):
+            raise Http404("RPM file not found on server")
+        
+        response = FileResponse(open(package.rpm_path, 'rb'), as_attachment=True)
+        response['Content-Disposition'] = f'attachment; filename="{os.path.basename(package.rpm_path)}"'
+        return response
+    
+    @action(detail=True, methods=['get'], url_path='download-srpm')
+    def download_srpm(self, request, pk=None):
+        """
+        Download the SRPM file for this package
+        
+        GET /api/packages/{id}/download-srpm/
+        """
+        package = self.get_object()
+        
+        if not package.srpm_path:
+            raise Http404("SRPM file not available for this package")
+        
+        if not os.path.exists(package.srpm_path):
+            raise Http404("SRPM file not found on server")
+        
+        response = FileResponse(open(package.srpm_path, 'rb'), as_attachment=True)
+        response['Content-Disposition'] = f'attachment; filename="{os.path.basename(package.srpm_path)}"'
+        return response
 
 
 class PackageBuildViewSet(viewsets.ReadOnlyModelViewSet):
@@ -329,3 +590,41 @@ class PackageBuildViewSet(viewsets.ReadOnlyModelViewSet):
         ) | PackageBuild.objects.filter(
             package__project__collaborators__user=user
         ).distinct()
+    
+    @action(detail=True, methods=['get'], url_path='download-rpm')
+    def download_rpm(self, request, pk=None):
+        """
+        Download the RPM file for this build
+        
+        GET /api/builds/{id}/download-rpm/
+        """
+        build = self.get_object()
+        
+        if not build.rpm_path:
+            raise Http404("RPM file not available for this build")
+        
+        if not os.path.exists(build.rpm_path):
+            raise Http404("RPM file not found on server")
+        
+        response = FileResponse(open(build.rpm_path, 'rb'), as_attachment=True)
+        response['Content-Disposition'] = f'attachment; filename="{os.path.basename(build.rpm_path)}"'
+        return response
+    
+    @action(detail=True, methods=['get'], url_path='download-srpm')
+    def download_srpm(self, request, pk=None):
+        """
+        Download the SRPM file for this build
+        
+        GET /api/builds/{id}/download-srpm/
+        """
+        build = self.get_object()
+        
+        if not build.srpm_path:
+            raise Http404("SRPM file not available for this build")
+        
+        if not os.path.exists(build.srpm_path):
+            raise Http404("SRPM file not found on server")
+        
+        response = FileResponse(open(build.srpm_path, 'rb'), as_attachment=True)
+        response['Content-Disposition'] = f'attachment; filename="{os.path.basename(build.srpm_path)}"'
+        return response

@@ -181,6 +181,7 @@ class BuildJobCreateSerializer(serializers.Serializer):
     def validate_project(self, value):
         """Validate that project exists and user has access"""
         from backend.apps.projects.models import Project
+        from backend.apps.packages.models import Package
         
         try:
             project = Project.objects.get(id=value)
@@ -197,6 +198,29 @@ class BuildJobCreateSerializer(serializers.Serializer):
         if not project.rhel_versions:
             raise serializers.ValidationError(
                 "Project must have RHEL versions configured before building"
+            )
+        
+        # Check if all packages have sources fetched
+        packages_without_sources = []
+        packages = Package.objects.filter(project=project)
+        
+        for pkg in packages:
+            # Skip packages without specs (they won't be built)
+            if pkg.spec_revisions.count() == 0:
+                continue
+            
+            if not pkg.source_fetched:
+                packages_without_sources.append(pkg.name)
+        
+        if packages_without_sources:
+            count = len(packages_without_sources)
+            sample = ', '.join(packages_without_sources[:5])
+            if count > 5:
+                sample += f' and {count - 5} more'
+            raise serializers.ValidationError(
+                f"{count} package(s) have not fetched their sources yet. "
+                f"Please fetch sources for: {sample}. "
+                f"Use 'Fetch All Sources' button or fetch individually."
             )
         
         return value

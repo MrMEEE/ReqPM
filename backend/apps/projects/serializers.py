@@ -28,7 +28,7 @@ class ProjectBuildConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectBuildConfig
         fields = [
-            'id', 'name', 'description', 'rhel_versions',
+            'id', 'name', 'description', 'rhel_version',
             'build_options', 'is_default',
             'created_by', 'created_at', 'updated_at'
         ]
@@ -64,7 +64,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'description', 'git_url', 'branch', 'tag',
             'status', 'owner', 'build_version', 'python_version',
-            'rhel_versions', 'package_count', 'created_at', 'updated_at', 'last_build_at'
+            'rhel_version', 'package_count', 'created_at', 'updated_at', 'last_build_at'
         ]
         read_only_fields = [
             'id', 'status', 'owner', 'package_count',
@@ -93,7 +93,7 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'description', 'git_url', 'branch', 'tag',
             'git_commit', 'requirements_files', 'build_version', 'python_version',
-            'rhel_versions',
+            'rhel_version',
             'status', 'status_message', 'owner',
             'git_ssh_key', 'git_api_token',
             'spec_repo_url', 'spec_repo_ssh_key', 'spec_repo_api_token',
@@ -134,7 +134,7 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
         model = Project
         fields = [
             'name', 'description', 'git_url', 'branch', 'tag',
-            'requirements_files', 'build_version', 'rhel_versions',
+            'requirements_files', 'build_version', 'rhel_version', 'python_version',
             'git_ssh_key', 'git_api_token'
         ]
         extra_kwargs = {
@@ -142,7 +142,8 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
             'git_api_token': {'write_only': True, 'required': False},
             'requirements_files': {'required': False, 'default': list},
             'build_version': {'required': False},
-            'rhel_versions': {'required': False}
+            'rhel_version': {'required': False, 'default': '9'},
+            'python_version': {'required': False, 'default': 'default'}
         }
     
     def create(self, validated_data):
@@ -174,7 +175,7 @@ class ProjectUpdateSerializer(serializers.ModelSerializer):
         model = Project
         fields = [
             'name', 'description', 'branch', 'tag',
-            'requirements_files', 'build_version', 'python_version', 'rhel_versions',
+            'requirements_files', 'build_version', 'python_version', 'rhel_version',
             'parallel_builds', 'build_repositories',
             'git_ssh_key', 'git_api_token',
             'spec_repo_url', 'spec_repo_ssh_key', 'spec_repo_api_token'

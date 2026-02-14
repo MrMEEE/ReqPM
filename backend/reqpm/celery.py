@@ -3,7 +3,7 @@ Celery configuration for ReqPM project.
 """
 import os
 from celery import Celery
-from celery.signals import setup_logging
+from celery.signals import setup_logging, worker_ready
 from celery.schedules import crontab
 
 # Set the default Django settings module for the 'celery' program.
@@ -22,6 +22,39 @@ def config_loggers(*args, **kwargs):
     from logging.config import dictConfig
     from django.conf import settings
     dictConfig(settings.LOGGING)
+
+
+@worker_ready.connect
+def reset_orphaned_builds(**kwargs):
+    """
+    On worker startup, reset any packages stuck in pending/building.
+    These are orphans from a previous worker that crashed or was restarted.
+    Also clear the Redis concurrency semaphore so slots aren't permanently lost.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        import django
+        django.setup()
+        from backend.apps.packages.models import Package
+        stuck = Package.objects.filter(build_status__in=['pending', 'building', 'waiting_for_deps'])
+        count = stuck.count()
+        if count:
+            ids = list(stuck.values_list('id', flat=True))
+            stuck.update(
+                build_status='not_built',
+                build_started_at=None,
+                build_completed_at=None,
+                build_error_message='',
+                build_log='',
+            )
+            logger.warning(f"Reset {count} orphaned builds on worker startup: {ids}")
+
+        from backend.apps.builds.concurrency import limiter
+        limiter.clear_all()
+        logger.info("Cleared concurrency semaphore on worker startup")
+    except Exception as e:
+        logger.error(f"Failed to reset orphaned builds: {e}")
 
 
 # Load task modules from all registered Django apps.
@@ -52,17 +85,9 @@ app.conf.beat_schedule = {
         'task': 'backend.apps.repositories.tasks.sync_all_repositories_task',
         'schedule': crontab(minute='*/30'),  # Every 30 minutes
     },
-    'monitor-pending-builds': {
-        'task': 'backend.apps.builds.tasks.monitor_pending_builds',
+    'monitor-pending-work': {
+        'task': 'backend.apps.builds.tasks.monitor_pending_work',
         'schedule': 60.0,  # Every 60 seconds
-    },
-    'cleanup-stuck-builds': {
-        'task': 'backend.apps.builds.tasks.cleanup_stuck_builds',
-        'schedule': 120.0,  # Every 2 minutes
-    },
-    'update-gpg-keys': {
-        'task': 'backend.apps.builds.tasks.update_gpg_keys_task',
-        'schedule': crontab(minute='0', hour='*/12'),  # Every 12 hours
     },
 }
 

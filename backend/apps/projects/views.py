@@ -1,12 +1,16 @@
 """
 ViewSets for Projects app
 """
+import logging
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
+from django.db import models
+
+logger = logging.getLogger(__name__)
 
 from backend.apps.projects.models import (
     Project, ProjectBranch, ProjectBuildConfig, ProjectCollaborator
@@ -288,47 +292,144 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def packages(self, request, pk=None):
         """
-        Get packages for a project with pagination
+        Get packages for a project - returns direct and transitive dependencies separately
         
-        GET /api/projects/{id}/packages/?page=1&page_size=10
+        GET /api/projects/{id}/packages/
         """
-        from backend.apps.packages.models import Package, SpecFileRevision
-        from django.core.paginator import Paginator
+        from backend.apps.packages.models import Package
+        from backend.apps.packages.serializers import PackageListSerializer
         
         project = self.get_object()
-        packages = Package.objects.filter(project=project).order_by('name')
         
-        # Get pagination parameters
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 10))
+        # Get direct and transitive dependencies separately
+        direct_packages = Package.objects.filter(
+            project=project, 
+            is_direct_dependency=True
+        ).prefetch_related('dependencies', 'dependents', 'dependents__package', 'extras').order_by('name')
         
-        # Paginate
-        paginator = Paginator(packages, page_size)
-        page_obj = paginator.get_page(page)
+        transitive_packages = Package.objects.filter(
+            project=project, 
+            is_direct_dependency=False
+        ).prefetch_related('dependencies', 'dependents', 'dependents__package', 'extras').order_by('name')
         
-        # Get spec file counts for current page
-        package_data = []
-        for pkg in page_obj:
-            spec_count = SpecFileRevision.objects.filter(package=pkg).count()
-            package_data.append({
-                'id': pkg.id,
-                'name': pkg.name,
-                'version': pkg.version,
-                'package_type': pkg.package_type,
-                'build_order': pkg.build_order,
-                'status': pkg.status,
-                'spec_files': spec_count,
-                'created_at': pkg.created_at.isoformat()
-            })
+        # Serialize both lists
+        direct_serializer = PackageListSerializer(direct_packages, many=True)
+        transitive_serializer = PackageListSerializer(transitive_packages, many=True)
+        
+        # Combine for total count and backward compatibility
+        all_packages = list(direct_serializer.data) + list(transitive_serializer.data)
         
         return Response({
-            'packages': package_data,
-            'count': paginator.count,
-            'page': page,
-            'page_size': page_size,
-            'total_pages': paginator.num_pages,
-            'has_next': page_obj.has_next(),
-            'has_previous': page_obj.has_previous()
+            'packages': all_packages,
+            'direct_dependencies': direct_serializer.data,
+            'transitive_dependencies': transitive_serializer.data,
+            'count': len(all_packages),
+            'direct_count': len(direct_serializer.data),
+            'transitive_count': len(transitive_serializer.data),
+        })
+    
+    @action(detail=True, methods=['post'], url_path='fetch-all-sources')
+    def fetch_all_sources(self, request, pk=None):
+        """
+        Trigger source fetching for all packages with spec files
+        
+        POST /api/projects/{id}/fetch-all-sources/
+        """
+        from backend.apps.packages.models import Package, SpecFileRevision
+        from backend.apps.packages.tasks import fetch_package_source_task
+        
+        project = self.get_object()
+        
+        # Get all packages that have spec files
+        # Use Exists subquery instead of annotate+filter to avoid
+        # 'Cannot combine a unique query with a non-unique query' error
+        packages_with_specs = Package.objects.filter(
+            project=project,
+            id__in=SpecFileRevision.objects.values('package_id').distinct()
+        )
+        
+        count = packages_with_specs.count()
+        
+        # Trigger source fetching for each package
+        for package in packages_with_specs:
+            fetch_package_source_task.delay(package.id)
+        
+        logger.info(f"Triggered source fetching for {count} packages in project {project.id}")
+        
+        return Response({
+            'message': f'Started fetching sources for {count} packages',
+            'count': count
+        })
+    
+    @action(detail=True, methods=['post'], url_path='build-all-packages')
+    def build_all_packages(self, request, pk=None):
+        """
+        Build all packages in the project
+        
+        POST /api/projects/{id}/build-all-packages/
+        
+        Triggers builds for all packages that have specs and sources.
+        Only builds packages that haven't been successfully built yet.
+        Builds will be triggered in dependency order (dependencies first).
+        """
+        from backend.apps.packages.tasks import build_single_package_task
+        from backend.apps.packages.models import SpecFileRevision
+        from backend.apps.projects.tasks import log_project
+        
+        project = self.get_object()
+        
+        # Get all packages with specs (source_fetched is a @property, filter in Python)
+        packages_with_specs = project.packages.filter(
+            id__in=SpecFileRevision.objects.values('package_id').distinct()
+        )
+        # Filter for packages that have their sources fetched and are not already successfully built
+        packages = [p for p in packages_with_specs if p.source_fetched and p.build_status != 'completed']
+        
+        if not packages:
+            return Response(
+                {'detail': 'No packages need building (all packages are either missing specs/sources or already built)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Sort packages by dependency order (build dependencies first)
+        # We'll use a simple topological sort based on dependencies
+        package_list = packages
+        build_order = []
+        remaining = set(package_list)
+        
+        while remaining:
+            # Find packages with no unbuilt dependencies in remaining set
+            ready = []
+            for pkg in remaining:
+                deps = set(pkg.dependencies.filter(
+                    depends_on__in=remaining
+                ).values_list('depends_on_id', flat=True))
+                
+                if not deps:
+                    ready.append(pkg)
+            
+            if not ready:
+                # Circular dependency or no progress - add all remaining
+                build_order.extend(remaining)
+                break
+            
+            build_order.extend(ready)
+            for pkg in ready:
+                remaining.remove(pkg)
+        
+        count = len(build_order)
+        
+        # Trigger builds
+        for package in build_order:
+            build_single_package_task.delay(package.id)
+        
+        log_project(project.id, 'info', f"Triggered builds for {count} packages")
+        logger.info(f"Triggered builds for {count} packages in project {project.id}")
+        
+        return Response({
+            'message': f'Started building {count} packages',
+            'count': count,
+            'packages': [pkg.name for pkg in build_order]
         })
     
     @action(detail=False, methods=['post'])

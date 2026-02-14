@@ -1,10 +1,11 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GitBranch, Package, AlertCircle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download } from 'lucide-react';
+import { ArrowLeft, GitBranch, Package, AlertCircle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download, X, Terminal, FileCode } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
 import ConfirmDialog from '../components/ConfirmDialog';
+import LivePackageBuildLog from '../components/LivePackageBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -26,6 +27,72 @@ const StatusBadge = ({ status }) => {
   );
 };
 
+const VersionDropdown = ({ packageId, currentVersion, onVersionChange }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [versions, setVersions] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const handleClick = async () => {
+    if (!isOpen && versions.length === 0) {
+      setLoading(true);
+      try {
+        const response = await packagesAPI.getVersions(packageId);
+        setVersions(response.data.versions || []);
+      } catch (error) {
+        console.error('Failed to fetch versions:', error);
+        alert('Failed to fetch versions');
+      } finally {
+        setLoading(false);
+      }
+    }
+    setIsOpen(!isOpen);
+  };
+
+  const handleVersionSelect = (version) => {
+    setIsOpen(false);
+    if (version !== currentVersion) {
+      onVersionChange(packageId, version);
+    }
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={handleClick}
+        className="text-blue-400 hover:text-blue-300 underline text-sm"
+        disabled={loading}
+      >
+        {loading ? 'Loading...' : currentVersion}
+      </button>
+      {isOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+          <div className="absolute z-20 mt-1 w-32 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col">
+            {versions.length === 0 ? (
+              <div className="px-3 py-2 text-sm text-gray-400">No versions</div>
+            ) : (
+              versions.map((version) => (
+                <button
+                  key={version}
+                  onClick={() => handleVersionSelect(version)}
+                  className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-600 ${
+                    version === currentVersion ? 'bg-gray-600 text-white' : 'text-gray-200'
+                  }`}
+                >
+                  {version}
+                </button>
+              ))
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
 export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -34,8 +101,13 @@ export default function ProjectDetail() {
   const [showLogs, setShowLogs] = useState(false);
   const [showEditConfig, setShowEditConfig] = useState(false);
   const [showRegenerateConfirm, setShowRegenerateConfirm] = useState(false);
-  const [packagesPage, setPackagesPage] = useState(1);
-  const [packagesPageSize] = useState(10);
+  const [showBuildLog, setShowBuildLog] = useState(false);
+  const [selectedPackageLog, setSelectedPackageLog] = useState(null);
+  const [directPage, setDirectPage] = useState(1);
+  const [transitivePage, setTransitivePage] = useState(1);
+  const [pageSize] = useState(20);
+  const [wsConnected, setWsConnected] = useState(false);
+  const wsRef = useRef(null);
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: ['project', id],
@@ -44,19 +116,103 @@ export default function ProjectDetail() {
       return response.data;
     },
     refetchInterval: (data) => {
-      // Auto-refresh every 3 seconds if project is processing
+      // Auto-refresh every 3 seconds if project is processing (fallback if WebSocket fails)
       const status = data?.status;
-      return ['pending', 'cloning', 'analyzing'].includes(status) ? 3000 : false;
+      return ['pending', 'cloning', 'analyzing'].includes(status) && !wsConnected ? 3000 : false;
     },
   });
 
   const { data: packagesData } = useQuery({
-    queryKey: ['project-packages', id, packagesPage, packagesPageSize],
+    queryKey: ['project-packages', id],
     queryFn: async () => {
-      const response = await projectsAPI.packages(id, packagesPage, packagesPageSize);
+      const response = await projectsAPI.packages(id);
       return response.data;
     },
     enabled: !!project,
+  });
+
+  // WebSocket connection for real-time updates
+  useEffect(() => {
+    if (!id) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/projects/${id}/`;
+    
+    const connectWebSocket = () => {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('WebSocket connected for project', id);
+        setWsConnected(true);
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        console.log('WebSocket message:', data);
+
+        if (data.type === 'package_update') {
+          // Update the package in cache across all arrays
+          queryClient.setQueryData(['project-packages', id], (oldData) => {
+            if (!oldData) return oldData;
+            
+            const updatePackage = (pkg) => 
+              pkg.id === data.package.id ? { ...pkg, ...data.package } : pkg;
+            
+            return {
+              ...oldData,
+              packages: oldData.packages?.map(updatePackage),
+              direct_dependencies: oldData.direct_dependencies?.map(updatePackage),
+              transitive_dependencies: oldData.transitive_dependencies?.map(updatePackage),
+            };
+          });
+        } else if (data.type === 'initial_data' || data.type === 'refresh') {
+          // Optionally update with full data
+          if (data.project) {
+            queryClient.setQueryData(['project', id], (oldData) => ({
+              ...oldData,
+              ...data.project
+            }));
+          }
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        setWsConnected(false);
+      };
+
+      ws.onclose = () => {
+        console.log('WebSocket closed for project', id);
+        setWsConnected(false);
+        // Attempt to reconnect after 3 seconds
+        setTimeout(connectWebSocket, 3000);
+      };
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [id, queryClient]);
+
+
+  const resolveDependenciesMutation = useMutation({
+    mutationFn: async () => {
+      const response = await projectsAPI.resolveDependencies(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['project', id]);
+      queryClient.invalidateQueries(['project-packages', id]);
+      setShowLogs(true);
+    },
+    onError: (error) => {
+      alert(`Failed to resolve dependencies: ${error.response?.data?.detail || error.message}`);
+    },
   });
 
   const retryMutation = useMutation({
@@ -119,6 +275,201 @@ export default function ProjectDetail() {
     fetchSourceMutation.mutate(packageId);
   };
 
+  const generateSpecMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.generateSpec(packageId, { force: true });
+      return response.data;
+    },
+    onSuccess: (data) => {
+      console.log('Spec generation triggered:', data);
+      queryClient.invalidateQueries(['project-packages', id]);
+      // Refresh the package data after a short delay to show updated spec_files_count
+      setTimeout(() => {
+        queryClient.invalidateQueries(['project-packages', id]);
+      }, 2000);
+    },
+    onError: (error) => {
+      console.error('Spec generation error:', error);
+      alert(`Failed to generate spec: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const handleGenerateSpec = (packageId) => {
+    console.log('Generating spec for package:', packageId);
+    generateSpecMutation.mutate(packageId);
+  };
+
+  const toggleExtraMutation = useMutation({
+    mutationFn: async ({ packageId, extraId, enabled }) => {
+      const response = await packagesAPI.updateExtra(packageId, extraId, { enabled });
+      return response.data;
+    },
+    onSuccess: (data, variables) => {
+      // Update the package in cache
+      queryClient.setQueryData(['project-packages', id], (oldData) => {
+        if (!oldData || !oldData.packages) return oldData;
+        
+        const updatedPackages = oldData.packages.map(pkg => {
+          if (pkg.id === variables.packageId) {
+            return {
+              ...pkg,
+              extras: pkg.extras.map(extra =>
+                extra.id === variables.extraId ? { ...extra, enabled: variables.enabled } : extra
+              )
+            };
+          }
+          return pkg;
+        });
+        
+        // Update direct_dependencies
+        const updatedDirect = oldData.direct_dependencies?.map(pkg => {
+          if (pkg.id === variables.packageId) {
+            return {
+              ...pkg,
+              extras: pkg.extras.map(extra =>
+                extra.id === variables.extraId ? { ...extra, enabled: variables.enabled } : extra
+              )
+            };
+          }
+          return pkg;
+        });
+        
+        // Update transitive_dependencies
+        const updatedTransitive = oldData.transitive_dependencies?.map(pkg => {
+          if (pkg.id === variables.packageId) {
+            return {
+              ...pkg,
+              extras: pkg.extras.map(extra =>
+                extra.id === variables.extraId ? { ...extra, enabled: variables.enabled } : extra
+              )
+            };
+          }
+          return pkg;
+        });
+        
+        return {
+          ...oldData,
+          packages: updatedPackages,
+          direct_dependencies: updatedDirect,
+          transitive_dependencies: updatedTransitive
+        };
+      });
+    },
+    onError: (error) => {
+      alert(`Failed to toggle extra: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
+  const handleToggleExtra = (packageId, extraId, currentEnabled) => {
+    toggleExtraMutation.mutate({ packageId, extraId, enabled: !currentEnabled });
+  };
+
+  const changeVersionMutation = useMutation({
+    mutationFn: async ({ packageId, version }) => {
+      const response = await packagesAPI.changeVersion(packageId, version);
+      return response.data;
+    },
+    onSuccess: () => {
+      // Refetch packages after version change
+      queryClient.invalidateQueries(['project-packages', id]);
+      queryClient.invalidateQueries(['project', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to change version: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
+  const fetchAllSourcesMutation = useMutation({
+    mutationFn: async () => {
+      const response = await projectsAPI.fetchAllSources(id);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      alert(`Started fetching sources for ${data.count} packages`);
+      // Refetch packages to update source status
+      queryClient.invalidateQueries(['project-packages', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to fetch sources: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
+  const handleFetchAllSources = () => {
+    fetchAllSourcesMutation.mutate();
+  };
+
+  const buildPackageMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.buildPackage(packageId);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      setShowLogs(true);
+      queryClient.invalidateQueries(['project-packages', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to build package: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const rebuildPackageMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.rebuildPackage(packageId);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries(['project-packages', id]);
+      setShowLogs(true);
+    },
+    onError: (error) => {
+      alert(`Failed to rebuild package: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const cancelBuildMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.cancelBuild(packageId);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries(['project-packages', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to cancel build: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const buildAllPackagesMutation = useMutation({
+    mutationFn: async () => {
+      const response = await projectsAPI.buildAllPackages(id);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      alert(`Started building ${data.count} packages`);
+      setShowLogs(true);
+      queryClient.invalidateQueries(['project-packages', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to build packages: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const handleBuildPackage = (packageId) => {
+    buildPackageMutation.mutate(packageId);
+  };
+
+  const handleRebuildPackage = (packageId) => {
+    rebuildPackageMutation.mutate(packageId);
+  };
+
+  const handleCancelBuild = (packageId) => {
+    cancelBuildMutation.mutate(packageId);
+  };
+
+  const handleBuildAllPackages = () => {
+    buildAllPackagesMutation.mutate();
+  };
+
   const handleRegenerateSpecs = () => {
     regenerateSpecsMutation.mutate();
   };
@@ -138,6 +489,11 @@ export default function ProjectDetail() {
       setShowLogs(true);
     }
   }, [project?.status]);
+
+  const handleViewBuildLog = (pkg) => {
+    setSelectedPackageLog(pkg);
+    setShowBuildLog(true);
+  };
 
   if (isLoading) {
     return (
@@ -175,27 +531,24 @@ export default function ProjectDetail() {
               <p className="text-gray-600 mt-1">{project.description}</p>
             )}
           </div>
+          {wsConnected && (
+            <div className="flex items-center gap-1.5 text-xs text-green-600">
+              <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+              Live
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-3">
           {project.status === 'ready' && (
             <>
               <button
-                onClick={handleStartBuild}
-                disabled={createBuildMutation.isPending || !project.rhel_versions || project.rhel_versions.length === 0}
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors"
-                title="Start a new build"
+                onClick={() => resolveDependenciesMutation.mutate()}
+                disabled={resolveDependenciesMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                title="Recalculate package dependencies"
               >
-                {createBuildMutation.isPending ? (
-                  <>
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                    Starting...
-                  </>
-                ) : (
-                  <>
-                    <Hammer className="h-4 w-4" />
-                    Start Build
-                  </>
-                )}
+                <RefreshCw className={`h-4 w-4 ${resolveDependenciesMutation.isPending ? 'animate-spin' : ''}`} />
+                Recalculate Dependencies
               </button>
               <button
                 onClick={() => setShowRegenerateConfirm(true)}
@@ -205,6 +558,24 @@ export default function ProjectDetail() {
               >
                 <RefreshCw className={`h-4 w-4 ${regenerateSpecsMutation.isPending ? 'animate-spin' : ''}`} />
                 Regenerate Specs
+              </button>
+              <button
+                onClick={handleFetchAllSources}
+                disabled={fetchAllSourcesMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 disabled:opacity-50 transition-colors"
+                title="Fetch source files for all packages with spec files"
+              >
+                <Download className={`h-4 w-4 ${fetchAllSourcesMutation.isPending ? 'animate-spin' : ''}`} />
+                Fetch All Sources
+              </button>
+              <button
+                onClick={handleBuildAllPackages}
+                disabled={buildAllPackagesMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 transition-colors"
+                title="Build all packages with specs and sources"
+              >
+                <Hammer className={`h-4 w-4 ${buildAllPackagesMutation.isPending ? 'animate-spin' : ''}`} />
+                Build All Packages
               </button>
             </>
           )}
@@ -371,7 +742,7 @@ export default function ProjectDetail() {
         </div>
       </div>
 
-      {/* Packages */}
+      {/* Packages - Split into Direct and Transitive Dependencies */}
       <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
         <div className="p-6 border-b border-gray-700">
           <div className="flex items-center justify-between">
@@ -382,135 +753,711 @@ export default function ProjectDetail() {
           </div>
         </div>
         
-        {packagesData && packagesData.packages.length > 0 ? (
-          <>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-700">
-                <thead className="bg-gray-900">
-                  <tr>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Package Name
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Version
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Type
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Build Order
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Spec Files
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Status
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      Actions
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700">
-                  {packagesData.packages.map((pkg) => (
-                    <tr
-                      key={pkg.id}
-                      className="hover:bg-gray-700/50"
-                    >
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-200 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        {pkg.name}
-                      </td>
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        {pkg.version || '-'}
-                      </td>
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        <span className="px-2 py-1 bg-gray-700 text-gray-300 text-xs rounded">
-                          {pkg.package_type}
-                        </span>
-                      </td>
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        {pkg.build_order ?? '-'}
-                      </td>
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        {pkg.spec_files > 0 ? (
-                          <span className="text-green-400">{pkg.spec_files}</span>
-                        ) : (
-                          <span className="text-gray-500">0</span>
-                        )}
-                      </td>
-                      <td 
-                        className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
-                        onClick={() => navigate(`/packages/${pkg.id}`)}
-                      >
-                        {pkg.status || 'pending'}
-                      </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleFetchSource(pkg.id);
-                          }}
-                          disabled={pkg.spec_files === 0}
-                          className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                          title={pkg.spec_files === 0 ? "Generate spec file first" : "Fetch source files"}
-                        >
-                          <Download className="h-3 w-3" />
-                          Fetch
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            
-            {/* Pagination */}
-            {packagesData.total_pages > 1 && (
-              <div className="px-6 py-4 bg-gray-900 border-t border-gray-700 flex items-center justify-between">
-                <div className="text-sm text-gray-400">
-                  Showing {((packagesData.page - 1) * packagesData.page_size) + 1} to{' '}
-                  {Math.min(packagesData.page * packagesData.page_size, packagesData.count)} of{' '}
-                  {packagesData.count} packages
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setPackagesPage(p => Math.max(1, p - 1))}
-                    disabled={!packagesData.has_previous}
-                    className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                    Previous
-                  </button>
-                  <span className="text-sm text-gray-400">
-                    Page {packagesData.page} of {packagesData.total_pages}
+        {packagesData && packagesData.packages && packagesData.packages.length > 0 ? (
+          <div className="space-y-6 p-6">
+            {/* Direct Dependencies */}
+            {packagesData.direct_dependencies && packagesData.direct_dependencies.length > 0 && (() => {
+              const startIdx = (directPage - 1) * pageSize;
+              const endIdx = startIdx + pageSize;
+              const paginatedDirect = packagesData.direct_dependencies.slice(startIdx, endIdx);
+              const totalPages = Math.ceil(packagesData.direct_dependencies.length / pageSize);
+              
+              return (
+              <div>
+                <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
+                  📋 Direct Dependencies ({packagesData.direct_count || packagesData.direct_dependencies.length})
+                  <span className="text-xs text-gray-400 font-normal">
+                    Packages from requirements files
                   </span>
-                  <button
-                    onClick={() => setPackagesPage(p => Math.min(packagesData.total_pages, p + 1))}
-                    disabled={!packagesData.has_next}
-                    className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                  >
-                    Next
-                    <ChevronRight className="h-4 w-4" />
-                  </button>
+                </h3>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-700">
+                    <thead className="bg-gray-900">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Package Name
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Version
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Requirements File
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Extras
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build Order
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Status
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Source
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build Status
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          RPM/SRPM
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Actions
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-700">
+                      {paginatedDirect.map((pkg) => (
+                        <tr
+                          key={pkg.id}
+                          className="hover:bg-gray-700/50"
+                        >
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-200 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            {pkg.name}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <VersionDropdown
+                              packageId={pkg.id}
+                              currentVersion={pkg.version || '-'}
+                              onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                            />
+                          </td>
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            <span className="px-2 py-1 bg-blue-900/30 text-blue-300 text-xs rounded">
+                              {pkg.requirements_file || 'requirements.txt'}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-sm text-gray-300">
+                            {pkg.extras && pkg.extras.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {pkg.extras.map((extra) => (
+                                  <button
+                                    key={extra.id}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleToggleExtra(pkg.id, extra.id, extra.enabled);
+                                    }}
+                                    className={`px-2 py-1 text-xs rounded cursor-pointer transition-colors ${
+                                      extra.enabled
+                                        ? 'bg-green-900/30 text-green-300 hover:bg-green-900/50'
+                                        : 'bg-red-900/30 text-red-300 hover:bg-red-900/50'
+                                    }`}
+                                    title={extra.enabled ? `Click to disable extra: ${extra.name}` : `Click to enable extra: ${extra.name}`}
+                                  >
+                                    {extra.name}
+                                  </button>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-gray-500">-</span>
+                            )}
+                          </td>
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            {pkg.build_order ?? '-'}
+                          </td>
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            <StatusBadge status={pkg.status} />
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            {pkg.source_fetched ? (
+                              <a
+                                href={`file://${pkg.source_path}`}
+                                className="text-green-400 hover:text-green-300 underline"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                Downloaded
+                              </a>
+                            ) : (
+                              <span className="text-gray-500">Not fetched</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm">
+                            {pkg.build_status === 'completed' && (
+                              <span className="px-2 py-1 bg-green-900/30 text-green-300 text-xs rounded">
+                                Built
+                              </span>
+                            )}
+                            {pkg.build_status === 'failed' && (
+                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.build_error_message}>
+                                Failed
+                              </span>
+                            )}
+                            {pkg.build_status === 'building' && (
+                              <span className="px-2 py-1 bg-blue-900/30 text-blue-300 text-xs rounded flex items-center gap-1">
+                                <RefreshCw className="h-3 w-3 animate-spin" />
+                                Building
+                              </span>
+                            )}
+                            {pkg.build_status === 'waiting_for_deps' && (
+                              <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
+                                <Clock className="h-3 w-3" />
+                                Waiting for deps
+                              </span>
+                            )}
+                            {pkg.build_status === 'pending' && (
+                              <span className="px-2 py-1 bg-yellow-900/30 text-yellow-300 text-xs rounded">
+                                Pending
+                              </span>
+                            )}
+                            {pkg.build_status === 'not_built' && (
+                              <span className="px-2 py-1 bg-gray-700 text-gray-400 text-xs rounded">
+                                Not Built
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <div className="flex flex-col gap-1">
+                              {pkg.rpm_path && (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      const response = await packagesAPI.downloadRpm(pkg.id);
+                                      const url = window.URL.createObjectURL(response.data);
+                                      const link = document.createElement('a');
+                                      link.href = url;
+                                      link.download = pkg.rpm_path.split('/').pop();
+                                      document.body.appendChild(link);
+                                      link.click();
+                                      document.body.removeChild(link);
+                                      window.URL.revokeObjectURL(url);
+                                    } catch (error) {
+                                      console.error('Download failed:', error);
+                                    }
+                                  }}
+                                  className="text-blue-400 hover:text-blue-300 underline text-xs bg-transparent border-none cursor-pointer text-left"
+                                >
+                                  RPM
+                                </button>
+                              )}
+                              {pkg.srpm_path && (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      const response = await packagesAPI.downloadSrpm(pkg.id);
+                                      const url = window.URL.createObjectURL(response.data);
+                                      const link = document.createElement('a');
+                                      link.href = url;
+                                      link.download = pkg.srpm_path.split('/').pop();
+                                      document.body.appendChild(link);
+                                      link.click();
+                                      document.body.removeChild(link);
+                                      window.URL.revokeObjectURL(url);
+                                    } catch (error) {
+                                      console.error('Download failed:', error);
+                                    }
+                                  }}
+                                  className="text-blue-400 hover:text-blue-300 underline text-xs bg-transparent border-none cursor-pointer text-left"
+                                >
+                                  SRPM
+                                </button>
+                              )}
+                              {!pkg.rpm_path && !pkg.srpm_path && (
+                                <span className="text-gray-500 text-xs">-</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              {['building', 'pending'].includes(pkg.build_status) && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleViewBuildLog(pkg);
+                                  }}
+                                  className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-1 animate-pulse"
+                                  title="View live build log"
+                                >
+                                  <Terminal className="h-3 w-3" />
+                                  Live Log
+                                </button>
+                              )}
+                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed') && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleViewBuildLog(pkg);
+                                  }}
+                                  className="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-600 flex items-center gap-1"
+                                  title="View build log"
+                                >
+                                  <Terminal className="h-3 w-3" />
+                                  Log
+                                </button>
+                              )}
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleGenerateSpec(pkg.id);
+                                }}
+                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 flex items-center gap-1"
+                                title="Generate SPEC file for this package"
+                              >
+                                <FileCode className="h-3 w-3" />
+                                Gen Spec
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleFetchSource(pkg.id);
+                                }}
+                                disabled={!pkg.spec_files_count || pkg.spec_files_count === 0}
+                                className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : "Fetch source files"}
+                              >
+                                <Download className="h-3 w-3" />
+                                Fetch
+                              </button>
+                              {pkg.build_status === 'waiting_for_deps' ? (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleCancelBuild(pkg.id);
+                                  }}
+                                  className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
+                                  title="Cancel waiting build"
+                                >
+                                  <X className="h-3 w-3" />
+                                  Cancel
+                                </button>
+                              ) : pkg.build_status === 'not_built' || pkg.build_status === 'pending' ? (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleBuildPackage(pkg.id);
+                                  }}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                  title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
+                                >
+                                  <Hammer className="h-3 w-3" />
+                                  Build
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRebuildPackage(pkg.id);
+                                  }}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                  title="Rebuild package"
+                                >
+                                  <RefreshCw className="h-3 w-3" />
+                                  Rebuild
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
+                {/* Direct Dependencies Pagination */}
+                {totalPages > 1 && (
+                  <div className="mt-4 flex items-center justify-between">
+                    <div className="text-sm text-gray-400">
+                      Showing {startIdx + 1} to {Math.min(endIdx, packagesData.direct_dependencies.length)} of {packagesData.direct_dependencies.length} direct dependencies
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setDirectPage(p => Math.max(1, p - 1))}
+                        disabled={directPage === 1}
+                        className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        Previous
+                      </button>
+                      <span className="text-sm text-gray-400">
+                        Page {directPage} of {totalPages}
+                      </span>
+                      <button
+                        onClick={() => setDirectPage(p => Math.min(totalPages, p + 1))}
+                        disabled={directPage === totalPages}
+                        className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                      >
+                        Next
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
-          </>
+              );
+            })()}
+
+            {/* Transitive Dependencies */}
+            {packagesData.transitive_dependencies && packagesData.transitive_dependencies.length > 0 && (() => {
+              const startIdx = (transitivePage - 1) * pageSize;
+              const endIdx = startIdx + pageSize;
+              const paginatedTransitive = packagesData.transitive_dependencies.slice(startIdx, endIdx);
+              const totalPages = Math.ceil(packagesData.transitive_dependencies.length / pageSize);
+              
+              return (
+              <div>
+                <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
+                  🔗 Transitive Dependencies ({packagesData.transitive_count || packagesData.transitive_dependencies.length})
+                  <span className="text-xs text-gray-400 font-normal">
+                    Dependencies of dependencies
+                  </span>
+                </h3>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-700">
+                    <thead className="bg-gray-900">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Package Name
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Version
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Depended By
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Extras
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build Order
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Status
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Source
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build Status
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          RPM/SRPM
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Actions
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-700">
+                      {paginatedTransitive.map((pkg) => (
+                        <tr
+                          key={pkg.id}
+                          className="hover:bg-gray-700/50"
+                        >
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-200 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            {pkg.name}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <VersionDropdown
+                              packageId={pkg.id}
+                              currentVersion={pkg.version || '-'}
+                              onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                            />
+                          </td>
+                          <td 
+                            className="px-4 py-3 text-sm text-gray-300 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            {pkg.dependent_packages && pkg.dependent_packages.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {pkg.dependent_packages.slice(0, 3).map((dep, idx) => (
+                                  <span key={idx} className="px-2 py-1 bg-purple-900/30 text-purple-300 text-xs rounded">
+                                    {dep}
+                                  </span>
+                                ))}
+                                {pkg.dependent_packages.length > 3 && (
+                                  <span className="px-2 py-1 bg-gray-700 text-gray-400 text-xs rounded">
+                                    +{pkg.dependent_packages.length - 3} more
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-gray-500">-</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-sm text-gray-300">
+                            {pkg.extras && pkg.extras.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {pkg.extras.map((extra) => (
+                                  <button
+                                    key={extra.id}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleToggleExtra(pkg.id, extra.id, extra.enabled);
+                                    }}
+                                    className={`px-2 py-1 text-xs rounded cursor-pointer transition-colors ${
+                                      extra.enabled
+                                        ? 'bg-green-900/30 text-green-300 hover:bg-green-900/50'
+                                        : 'bg-red-900/30 text-red-300 hover:bg-red-900/50'
+                                    }`}
+                                    title={extra.enabled ? `Click to disable extra: ${extra.name}` : `Click to enable extra: ${extra.name}`}
+                                  >
+                                    {extra.name}
+                                  </button>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-gray-500">-</span>
+                            )}
+                          </td>
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm text-gray-300 cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            {pkg.build_order ?? '-'}
+                          </td>
+                          <td 
+                            className="px-4 py-3 whitespace-nowrap text-sm cursor-pointer"
+                            onClick={() => navigate(`/packages/${pkg.id}`)}
+                          >
+                            <StatusBadge status={pkg.status} />
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            {pkg.source_fetched ? (
+                              <a
+                                href={`file://${pkg.source_path}`}
+                                className="text-green-400 hover:text-green-300 underline"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                Downloaded
+                              </a>
+                            ) : (
+                              <span className="text-gray-500">Not fetched</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm">
+                            {pkg.build_status === 'completed' && (
+                              <span className="px-2 py-1 bg-green-900/30 text-green-300 text-xs rounded">
+                                Built
+                              </span>
+                            )}
+                            {pkg.build_status === 'failed' && (
+                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.build_error_message}>
+                                Failed
+                              </span>
+                            )}
+                            {pkg.build_status === 'building' && (
+                              <span className="px-2 py-1 bg-blue-900/30 text-blue-300 text-xs rounded flex items-center gap-1">
+                                <RefreshCw className="h-3 w-3 animate-spin" />
+                                Building
+                              </span>
+                            )}
+                            {pkg.build_status === 'waiting_for_deps' && (
+                              <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
+                                <Clock className="h-3 w-3" />
+                                Waiting for deps
+                              </span>
+                            )}
+                            {pkg.build_status === 'pending' && (
+                              <span className="px-2 py-1 bg-yellow-900/30 text-yellow-300 text-xs rounded">
+                                Pending
+                              </span>
+                            )}
+                            {pkg.build_status === 'not_built' && (
+                              <span className="px-2 py-1 bg-gray-700 text-gray-400 text-xs rounded">
+                                Not Built
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <div className="flex flex-col gap-1">
+                              {pkg.rpm_path && (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      const response = await packagesAPI.downloadRpm(pkg.id);
+                                      const url = window.URL.createObjectURL(response.data);
+                                      const link = document.createElement('a');
+                                      link.href = url;
+                                      link.download = pkg.rpm_path.split('/').pop();
+                                      document.body.appendChild(link);
+                                      link.click();
+                                      document.body.removeChild(link);
+                                      window.URL.revokeObjectURL(url);
+                                    } catch (error) {
+                                      console.error('Download failed:', error);
+                                    }
+                                  }}
+                                  className="text-blue-400 hover:text-blue-300 underline text-xs bg-transparent border-none cursor-pointer text-left"
+                                >
+                                  RPM
+                                </button>
+                              )}
+                              {pkg.srpm_path && (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      const response = await packagesAPI.downloadSrpm(pkg.id);
+                                      const url = window.URL.createObjectURL(response.data);
+                                      const link = document.createElement('a');
+                                      link.href = url;
+                                      link.download = pkg.srpm_path.split('/').pop();
+                                      document.body.appendChild(link);
+                                      link.click();
+                                      document.body.removeChild(link);
+                                      window.URL.revokeObjectURL(url);
+                                    } catch (error) {
+                                      console.error('Download failed:', error);
+                                    }
+                                  }}
+                                  className="text-blue-400 hover:text-blue-300 underline text-xs bg-transparent border-none cursor-pointer text-left"
+                                >
+                                  SRPM
+                                </button>
+                              )}
+                              {!pkg.rpm_path && !pkg.srpm_path && (
+                                <span className="text-gray-500 text-xs">-</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              {['building', 'pending'].includes(pkg.build_status) && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleViewBuildLog(pkg);
+                                  }}
+                                  className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-1 animate-pulse"
+                                  title="View live build log"
+                                >
+                                  <Terminal className="h-3 w-3" />
+                                  Live Log
+                                </button>
+                              )}
+                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed') && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleViewBuildLog(pkg);
+                                  }}
+                                  className="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-600 flex items-center gap-1"
+                                  title="View build log"
+                                >
+                                  <Terminal className="h-3 w-3" />
+                                  Log
+                                </button>
+                              )}
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleGenerateSpec(pkg.id);
+                                }}
+                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 flex items-center gap-1"
+                                title="Generate SPEC file for this package"
+                              >
+                                <FileCode className="h-3 w-3" />
+                                Gen Spec
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleFetchSource(pkg.id);
+                                }}
+                                disabled={!pkg.spec_files_count || pkg.spec_files_count === 0}
+                                className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : "Fetch source files"}
+                              >
+                                <Download className="h-3 w-3" />
+                                Fetch
+                              </button>
+                              {pkg.build_status === 'waiting_for_deps' ? (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleCancelBuild(pkg.id);
+                                  }}
+                                  className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
+                                  title="Cancel waiting build"
+                                >
+                                  <X className="h-3 w-3" />
+                                  Cancel
+                                </button>
+                              ) : pkg.build_status === 'not_built' || pkg.build_status === 'pending' ? (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleBuildPackage(pkg.id);
+                                  }}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                  title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
+                                >
+                                  <Hammer className="h-3 w-3" />
+                                  Build
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRebuildPackage(pkg.id);
+                                  }}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                  title="Rebuild package"
+                                >
+                                  <RefreshCw className="h-3 w-3" />
+                                  Rebuild
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {/* Transitive Dependencies Pagination */}
+                {totalPages > 1 && (
+                  <div className="mt-4 flex items-center justify-between">
+                    <div className="text-sm text-gray-400">
+                      Showing {startIdx + 1} to {Math.min(endIdx, packagesData.transitive_dependencies.length)} of {packagesData.transitive_dependencies.length} transitive dependencies
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setTransitivePage(p => Math.max(1, p - 1))}
+                        disabled={transitivePage === 1}
+                        className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        Previous
+                      </button>
+                      <span className="text-sm text-gray-400">
+                        Page {transitivePage} of {totalPages}
+                      </span>
+                      <button
+                        onClick={() => setTransitivePage(p => Math.min(totalPages, p + 1))}
+                        disabled={transitivePage === totalPages}
+                        className="px-3 py-1 bg-gray-800 text-gray-300 rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                      >
+                        Next
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              );
+            })()}
+          </div>
         ) : (
           <div className="p-12 text-gray-400 text-center">
             No packages found yet. They will appear after the project is analyzed.
@@ -569,11 +1516,23 @@ export default function ProjectDetail() {
           isOpen={true}
           onClose={() => setShowRegenerateConfirm(false)}
           title="Regenerate Spec Files"
-          message={`This will regenerate spec files for all ${packagesData?.count || 0} packages in this project. This action cannot be undone. Continue?`}
+          message={`This will regenerate spec files for all ${packagesData?.count || 0} packages in this project. WARNING: Any manually changed package versions will be reset to the versions specified in the requirements files. This action cannot be undone. Continue?`}
           confirmText="Regenerate"
           cancelText="Cancel"
           onConfirm={handleRegenerateSpecs}
           variant="warning"
+        />
+      )}
+
+      {/* Build Log Modal - WebSocket-based live streaming */}
+      {showBuildLog && selectedPackageLog && (
+        <LivePackageBuildLog
+          packageId={selectedPackageLog.id}
+          packageName={selectedPackageLog.name}
+          onClose={() => {
+            setShowBuildLog(false);
+            setSelectedPackageLog(null);
+          }}
         />
       )}
     </div>

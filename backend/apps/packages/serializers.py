@@ -18,10 +18,9 @@ class PackageDependencySerializer(serializers.ModelSerializer):
         model = PackageDependency
         fields = [
             'id', 'depends_on', 'depends_on_name', 'depends_on_version',
-            'dependency_type', 'version_constraint', 'is_optional',
-            'created_at'
+            'dependency_type', 'version_constraint'
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id']
 
 
 class PackageBuildSerializer(serializers.ModelSerializer):
@@ -57,28 +56,57 @@ class PackageListSerializer(serializers.ModelSerializer):
     
     project_name = serializers.CharField(source='project.name', read_only=True)
     dependency_count = serializers.SerializerMethodField()
-    build_count = serializers.SerializerMethodField()
+    spec_files_count = serializers.SerializerMethodField()
+    dependent_packages = serializers.SerializerMethodField()
+    extras = serializers.SerializerMethodField()
+    source_fetched = serializers.BooleanField(read_only=True)
+    source_path = serializers.CharField(read_only=True)
+    has_build_log = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
         fields = [
             'id', 'name', 'version', 'package_type',
-            'status', 'build_order', 'project', 'project_name',
-            'dependency_count', 'build_count',
-            'created_at', 'updated_at'
+            'status', 'project', 'project_name',
+            'dependency_count', 'spec_files_count', 'requirements_file',
+            'is_direct_dependency', 'dependent_packages', 'extras',
+            'source_fetched', 'source_path',
+            'build_status', 'build_started_at', 'build_completed_at',
+            'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
+            'has_build_log',
+            'created_at', 'updated_at', 'last_built_at'
         ]
         read_only_fields = [
-            'id', 'project_name', 'dependency_count', 'build_count',
-            'created_at', 'updated_at'
+            'id', 'project_name', 'dependency_count', 'spec_files_count',
+            'dependent_packages', 'extras', 'source_fetched', 'source_path',
+            'build_status', 'build_started_at', 'build_completed_at',
+            'srpm_path', 'rpm_path', 'created_at', 'updated_at', 'last_built_at'
         ]
     
+    def get_has_build_log(self, obj):
+        """Check if a build log exists (without sending the full log)"""
+        return bool(obj.build_log)
+
     def get_dependency_count(self, obj):
         """Get count of dependencies"""
         return obj.dependencies.count()
     
-    def get_build_count(self, obj):
-        """Get count of builds"""
-        return obj.builds.count()
+    def get_spec_files_count(self, obj):
+        """Get count of spec file revisions"""
+        return obj.spec_revisions.count()
+    
+    def get_dependent_packages(self, obj):
+        """Get list of packages that depend on this package"""
+        # Get all dependencies where this package is depended upon
+        dependents = obj.dependents.select_related('package').values_list('package__name', flat=True)
+        return list(dependents)
+    
+    def get_extras(self, obj):
+        """Get list of extras with their enabled status"""
+        return [
+            {'id': extra.id, 'name': extra.name, 'enabled': extra.enabled}
+            for extra in obj.extras.all()
+        ]
 
 
 class PackageExtraSerializer(serializers.ModelSerializer):

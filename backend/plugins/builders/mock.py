@@ -277,17 +277,24 @@ class MockBuilder(BaseBuilder):
                 # Format: %{pypi_source package} or %{pypi_source package version}
                 if '%{pypi_source' in source_url and pypi_name and package_version:
                     # Extract package name from macro if specified
-                    macro_match = re.match(r'%\{pypi_source\s+(\w+)(?:\s+[\d.]+)?\}', source_url)
+                    macro_match = re.match(r'%\{pypi_source\s+([\w\-\.]+)(?:\s+[\d.]+)?\}', source_url)
                     if macro_match:
                         macro_package = macro_match.group(1)
                     else:
                         macro_package = pypi_name
                     
-                    # Construct PyPI download URL
-                    # Format: https://pypi.io/packages/source/{first_letter}/{package}/{package}-{version}.tar.gz
-                    first_letter = macro_package[0].lower()
-                    source_url = f"https://pypi.io/packages/source/{first_letter}/{macro_package}/{macro_package}-{package_version}.tar.gz"
-                    log_lines.append(f"Expanded macro: {original_url} -> {source_url}")
+                    # Use PyPI JSON API to get the real download URL
+                    source_url = self._resolve_pypi_source_url(
+                        macro_package, package_version, log_lines
+                    )
+                    
+                    if not source_url:
+                        # Fallback: try the conventional URL pattern
+                        first_letter = macro_package[0].lower()
+                        source_url = f"https://pypi.io/packages/source/{first_letter}/{macro_package}/{macro_package}-{package_version}.tar.gz"
+                        log_lines.append(f"PyPI API fallback, trying conventional URL: {source_url}")
+                    else:
+                        log_lines.append(f"Resolved via PyPI API: {original_url} -> {source_url}")
                 
                 # Skip if it's a local file (doesn't start with http/https/ftp)
                 if not source_url.startswith(('http://', 'https://', 'ftp://')):
@@ -358,6 +365,78 @@ class MockBuilder(BaseBuilder):
                 build_duration=int(time.time() - start_time)
             )
     
+    def _resolve_pypi_source_url(self, package_name: str, version: str, log_lines: list) -> Optional[str]:
+        """
+        Query the PyPI JSON API to find the real download URL for a package.
+        
+        Prefers sdist (.tar.gz, .zip), falls back to wheel (.whl) if no sdist available.
+        
+        Args:
+            package_name: PyPI package name (without python3- prefix)
+            version: Package version
+            log_lines: List to append log messages to
+            
+        Returns:
+            The download URL string, or None if not found
+        """
+        import json
+        import urllib.request
+        import urllib.error
+        
+        # Try the exact version first, then try without version
+        urls_to_try = [
+            f"https://pypi.org/pypi/{package_name}/{version}/json",
+            f"https://pypi.org/pypi/{package_name}/json",
+        ]
+        
+        for api_url in urls_to_try:
+            try:
+                log_lines.append(f"Querying PyPI API: {api_url}")
+                req = urllib.request.Request(api_url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode())
+                
+                # Get URLs for the specific version
+                urls = data.get('urls', [])
+                
+                # If we got the non-versioned API, look in releases for the specific version
+                if not urls and 'releases' in data:
+                    urls = data['releases'].get(version, [])
+                
+                if not urls:
+                    log_lines.append(f"No download URLs found for {package_name} {version}")
+                    continue
+                
+                # Prefer sdist (source distribution)
+                for url_info in urls:
+                    if url_info.get('packagetype') == 'sdist':
+                        source_url = url_info.get('url')
+                        log_lines.append(f"Found sdist: {url_info.get('filename')}")
+                        return source_url
+                
+                # Fallback: any .tar.gz or .zip file
+                for url_info in urls:
+                    filename = url_info.get('filename', '')
+                    if filename.endswith(('.tar.gz', '.tar.bz2', '.zip')):
+                        source_url = url_info.get('url')
+                        log_lines.append(f"Found archive: {filename}")
+                        return source_url
+                
+                # Last resort: use any available download (wheel)
+                if urls:
+                    source_url = urls[0].get('url')
+                    log_lines.append(f"Using wheel as fallback: {urls[0].get('filename')}")
+                    return source_url
+                    
+            except urllib.error.HTTPError as e:
+                log_lines.append(f"PyPI API returned {e.code} for {api_url}")
+                continue
+            except Exception as e:
+                log_lines.append(f"PyPI API error: {str(e)}")
+                continue
+        
+        return None
+
     def build_srpm(
         self,
         spec_file: str,
@@ -468,7 +547,6 @@ class MockBuilder(BaseBuilder):
             '--enable-network',
             '--resultdir', output_dir,
             '--no-clean',  # Reuse bootstrap chroot
-            '--no-cleanup-after',  # Keep for debugging
             '--rpmbuild-opts=--nocheck',  # Skip tests
             '--rebuild', srpm_path,
         ]
@@ -522,6 +600,21 @@ class MockBuilder(BaseBuilder):
         
         # Combine stdout/stderr with detailed logs
         log_output = f"=== Mock Command Output ===\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\n{detailed_log}"
+        
+        # Clean up both the build chroot and its bootstrap chroot to free disk space
+        logger.info(f"Cleaning up build chroot: {target} (uniqueext={unique_ext})")
+        for scrub_target in ('chroot', 'bootstrap'):
+            cleanup_args = [
+                '-r', target,
+                '--arch', arch,
+                '--uniqueext', unique_ext,
+                f'--scrub={scrub_target}',
+            ]
+            rc, _, _ = self._run_mock_command(cleanup_args, timeout=300)
+            if rc == 0:
+                logger.info(f"Cleaned up {scrub_target} for {unique_ext}")
+            else:
+                logger.warning(f"Failed to clean up {scrub_target} for {unique_ext}")
         
         if returncode == 0:
             # Find built RPMs (exclude SRPM)

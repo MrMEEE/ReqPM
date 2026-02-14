@@ -57,6 +57,15 @@ class Package(models.Model):
         blank=True,
         help_text=_('Original requirement specification, e.g., "package>=1.0,<2.0"')
     )
+    requirements_file = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text=_('Requirements file this package was defined in (for direct dependencies)')
+    )
+    is_direct_dependency = models.BooleanField(
+        default=False,
+        help_text=_('True if package is directly listed in requirements files, False if indirect dependency')
+    )
     
     # Status
     status = models.CharField(
@@ -66,16 +75,40 @@ class Package(models.Model):
     )
     status_message = models.TextField(blank=True)
     
-    # Build order (dependency level)
+    # Deprecated - keeping for backward compatibility during migration
     build_order = models.IntegerField(
         default=0,
-        help_text=_('Build order based on dependency tree, 0 = no dependencies')
+        blank=True,
+        null=True,
+        help_text=_('DEPRECATED: Build order no longer used, builds happen on-demand')
     )
     
     # Spec file information
     spec_file_content = models.TextField(blank=True)
     spec_file_path = models.CharField(max_length=500, blank=True)
     spec_file_modified = models.BooleanField(default=False)
+    
+    # Build information (stored directly on package)
+    build_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('not_built', 'Not Built'),
+            ('waiting_for_deps', 'Waiting for Dependencies'),
+            ('pending', 'Pending'),
+            ('building', 'Building'),
+            ('completed', 'Completed'),
+            ('failed', 'Failed'),
+        ],
+        default='not_built',
+        help_text=_('Current build status for this package')
+    )
+    build_started_at = models.DateTimeField(null=True, blank=True)
+    build_completed_at = models.DateTimeField(null=True, blank=True)
+    build_log = models.TextField(blank=True)
+    build_error_message = models.TextField(blank=True)
+    analyzed_errors = models.JSONField(default=list, blank=True, help_text=_('Parsed build error analysis'))
+    srpm_path = models.CharField(max_length=500, blank=True, null=True)
+    rpm_path = models.CharField(max_length=500, blank=True, null=True)
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -85,12 +118,13 @@ class Package(models.Model):
     class Meta:
         db_table = 'packages'
         unique_together = ['project', 'name', 'version']
-        ordering = ['build_order', 'name']
+        ordering = ['name']
         indexes = [
             models.Index(fields=['project', 'status']),
             models.Index(fields=['status']),
-            models.Index(fields=['build_order']),
             models.Index(fields=['package_type']),
+            models.Index(fields=['project', 'build_status']),
+            models.Index(fields=['build_status']),
         ]
     
     def __str__(self):
@@ -105,6 +139,33 @@ class Package(models.Model):
     def nvr(self):
         """Get Name-Version-Release string"""
         return f"{self.name}-{self.version}-{self.release}"
+    
+    @property
+    def source_fetched(self):
+        """Check if source file has been downloaded"""
+        from pathlib import Path
+        sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / self.name
+        if not sources_dir.exists():
+            return False
+        # Check for any archive file in the sources directory
+        archive_extensions = ('.tar.gz', '.tar.bz2', '.zip', '.whl', '.tar.xz')
+        for f in sources_dir.iterdir():
+            if f.is_file() and any(f.name.endswith(ext) for ext in archive_extensions):
+                return True
+        return False
+    
+    @property
+    def source_path(self):
+        """Get the path to the source file"""
+        from pathlib import Path
+        sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / self.name
+        if sources_dir.exists():
+            # Find the actual source file
+            archive_extensions = ('.tar.gz', '.tar.bz2', '.zip', '.whl', '.tar.xz')
+            for f in sources_dir.iterdir():
+                if f.is_file() and any(f.name.endswith(ext) for ext in archive_extensions):
+                    return str(f)
+        return str(sources_dir / f"{self.name}-{self.version}.tar.gz")
 
 
 class PackageDependency(models.Model):

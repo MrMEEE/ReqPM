@@ -111,10 +111,7 @@ class BuildJobViewSet(viewsets.ModelViewSet):
             queue = queue.filter(rhel_version=rhel_version)
         
         queue = queue.select_related('package').order_by('package__build_order', 'package__name')
-        
-        # Use lightweight serializer that excludes build_log for performance
-        from backend.apps.builds.serializers import BuildQueueListSerializer
-        serializer = BuildQueueListSerializer(queue, many=True)
+        serializer = BuildQueueSerializer(queue, many=True)
         
         return Response(serializer.data)
     
@@ -179,47 +176,25 @@ class BuildJobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
         """
-        Retry all builds in a job (or only failed/cancelled ones)
+        Retry failed builds in a job
         
-        POST /api/build-jobs/{id}/retry/?failed_only=true
-        
-        Query Parameters:
-            failed_only: If true, only retry failed/cancelled builds (default: false)
+        POST /api/build-jobs/{id}/retry/
         """
         build_job = self.get_object()
         
-        # Don't allow retry if currently running
-        if build_job.status in ['preparing', 'running']:
+        if build_job.status != 'failed':
             return Response(
-                {'detail': f'Cannot retry build with status: {build_job.status}'},
+                {'detail': 'Can only retry failed builds'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if only retrying failed items
-        failed_only = request.query_params.get('failed_only', 'false').lower() == 'true'
+        # Get failed queue items
+        failed_items = build_job.queue_items.filter(status='failed')
+        failed_count = failed_items.count()
         
-        # Get items to retry
-        if failed_only:
-            # Only retry failed/cancelled items
-            retry_items = build_job.queue_items.filter(status__in=['failed', 'cancelled'])
-        elif build_job.status in ['completed', 'pending']:
-            # For completed/pending builds, retry all items that aren't already queued/building
-            retry_items = build_job.queue_items.exclude(status__in=['queued', 'building'])
-        else:
-            # For failed builds, retry only failed/cancelled items
-            retry_items = build_job.queue_items.filter(status__in=['failed', 'cancelled'])
-        
-        retry_count = retry_items.count()
-        
-        if retry_count == 0:
-            return Response(
-                {'detail': 'No builds to retry'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Reset queue items to pending
+        # Reset failed queue items to pending
         # The monitor_pending_builds task will automatically pick them up
-        retry_items.update(
+        failed_items.update(
             status='pending',
             error_message='',
             build_log='',
@@ -234,8 +209,8 @@ class BuildJobViewSet(viewsets.ModelViewSet):
         build_job.save()
         
         return Response({
-            'detail': f'Retrying {retry_count} builds',
-            'retried_count': retry_count
+            'detail': f'Retrying {failed_count} failed builds',
+            'retried_count': failed_count
         })
     
     @action(detail=True, methods=['post'])

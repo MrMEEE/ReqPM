@@ -139,6 +139,35 @@ class SpecFileGenerator:
             spec_content
         )
         
+        # Replace old setup.py build commands with modern pyproject-based commands
+        # Old: /usr/bin/python3 setup.py build
+        # New: %pyproject_wheel
+        spec_content = re.sub(
+            r'/usr/bin/python3\s+setup\.py\s+build\s+[^\n]*',
+            '%pyproject_wheel',
+            spec_content
+        )
+        
+        # Replace old setup.py install commands with modern pyproject-based commands
+        # Old: /usr/bin/python3 setup.py install
+        # New: %pyproject_install
+        spec_content = re.sub(
+            r'/usr/bin/python3\s+setup\.py\s+install\s+[^\n]*',
+            '%pyproject_install',
+            spec_content
+        )
+        
+        # Ensure pyproject macros BuildRequires are present if using pyproject macros
+        if '%pyproject_wheel' in spec_content or '%pyproject_install' in spec_content:
+            if 'BuildRequires:  pyproject-rpm-macros' not in spec_content:
+                # Add after other BuildRequires
+                spec_content = re.sub(
+                    r'(BuildRequires:.*python.*-devel)',
+                    r'\1\nBuildRequires:  pyproject-rpm-macros',
+                    spec_content,
+                    count=1
+                )
+        
         # Add packager information if not present
         if '%changelog' in spec_content and 'ReqPM' not in spec_content:
             date = datetime.now().strftime("%a %b %d %Y")
@@ -154,6 +183,7 @@ class SpecFileGenerator:
     def _generate_fallback_spec(self, package_name: str, version: Optional[str] = None, python_version: str = "3.11") -> str:
         """
         Generate a basic fallback spec file if pyp2spec fails
+        Uses modern pyproject.toml build system
         
         Args:
             package_name: Package name
@@ -184,9 +214,7 @@ Source0:        %{{pypi_source {package_name}}}
 
 BuildArch:      noarch
 BuildRequires:  python{py_suffix}-devel
-BuildRequires:  python{py_suffix}-setuptools
-BuildRequires:  python{py_suffix}-pip
-BuildRequires:  python{py_suffix}-wheel
+BuildRequires:  pyproject-rpm-macros
 
 %description
 Python package {package_name}
@@ -194,14 +222,17 @@ Python package {package_name}
 %prep
 %autosetup -n {package_name}-%{{version}}
 
+%generate_buildrequires
+%pyproject_buildrequires
+
 %build
-%py{py_macro}_build
+%pyproject_wheel
 
 %install
-%py{py_macro}_install
+%pyproject_install
+%pyproject_save_files {package_name.replace('-', '_')}
 
-%files
-%{{python{py_macro}_sitelib}}/*
+%files -f %{{pyproject_files}}
 
 %changelog
 * {date} {self.packager_name} <{self.packager_email}> - {version}-1

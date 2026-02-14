@@ -44,9 +44,17 @@ class Project(models.Model):
         default='default',
         help_text=_('Python version to use for spec generation (e.g., "3.11", "3.12", or "default")')
     )
+    rhel_version = models.CharField(
+        max_length=10,
+        default='9',
+        help_text=_('RHEL version to build for (e.g., "8", "9")')
+    )
+    # Deprecated - keeping for backward compatibility during migration
     rhel_versions = models.JSONField(
         default=list,
-        help_text=_('List of RHEL versions to build for, e.g., ["8", "9"]')
+        blank=True,
+        null=True,
+        help_text=_('DEPRECATED: Use rhel_version instead')
     )
     
     # Status

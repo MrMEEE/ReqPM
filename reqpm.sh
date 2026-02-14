@@ -130,7 +130,7 @@ start_celery() {
     
     source "$VENV/bin/activate"
     
-    nohup celery -A backend.reqpm worker -l info --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
+    nohup celery -A backend.reqpm worker -l info --concurrency=4 --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
     
     sleep 2
     if is_running "$CELERY_PID"; then
