@@ -24,6 +24,17 @@ class Package(models.Model):
         BUILT = 'built', _('Built')
         FAILED = 'failed', _('Failed')
         SKIPPED = 'skipped', _('Skipped')
+
+    class BuildSystem(models.TextChoices):
+        UNKNOWN = 'unknown', _('Unknown')
+        SETUPTOOLS = 'setuptools', _('Setuptools (setup.py)')
+        POETRY = 'poetry', _('Poetry Core')
+        FLIT = 'flit', _('Flit Core')
+        HATCHLING = 'hatchling', _('Hatchling')
+        PDM = 'pdm', _('PDM Backend')
+        MESON = 'meson', _('Meson Python')
+        SCIKIT_BUILD = 'scikit-build', _('Scikit-Build Core')
+        OTHER_PYPROJECT = 'other-pyproject', _('Other (pyproject.toml)')
     
     project = models.ForeignKey(
         Project,
@@ -94,10 +105,12 @@ class Package(models.Model):
         choices=[
             ('not_built', 'Not Built'),
             ('waiting_for_deps', 'Waiting for Dependencies'),
+            ('dep_build_pending', 'Dependency Build Pending'),
             ('pending', 'Pending'),
             ('building', 'Building'),
             ('completed', 'Completed'),
             ('failed', 'Failed'),
+            ('missing_packages', 'Missing Packages'),
         ],
         default='not_built',
         help_text=_('Current build status for this package')
@@ -107,6 +120,13 @@ class Package(models.Model):
     build_log = models.TextField(blank=True)
     build_error_message = models.TextField(blank=True)
     analyzed_errors = models.JSONField(default=list, blank=True, help_text=_('Parsed build error analysis'))
+    build_system = models.CharField(
+        max_length=30,
+        choices=BuildSystem.choices,
+        default=BuildSystem.UNKNOWN,
+        blank=True,
+        help_text=_('Build system used by this package (auto-detected or manually set)')
+    )
     srpm_path = models.CharField(max_length=500, blank=True, null=True)
     rpm_path = models.CharField(max_length=500, blank=True, null=True)
     

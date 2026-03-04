@@ -71,6 +71,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'dependency_count', 'spec_files_count', 'requirements_file',
             'is_direct_dependency', 'dependent_packages', 'extras',
             'source_fetched', 'source_path',
+            'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
             'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
             'has_build_log',
@@ -133,6 +134,7 @@ class PackageDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'version', 'package_type',
             'status', 'build_order', 'description', 'license', 'homepage',
+            'build_system',
             'project', 'project_name', 'dependencies', 'builds',
             'spec_files', 'extras', 'latest_spec',
             'created_at', 'updated_at'

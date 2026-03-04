@@ -46,6 +46,7 @@ class SpecFileGenerator:
         package_name: str,
         version: Optional[str] = None,
         python_version: str = "default",
+        build_system: str = "unknown",
         **kwargs
     ) -> str:
         """
@@ -56,6 +57,7 @@ class SpecFileGenerator:
             package_name: Name of the Python package
             version: Specific version (None for latest)
             python_version: Python version (e.g., "3.11", "3.12", or "default" to omit -p flag)
+            build_system: Detected/stored build system (e.g., 'setuptools', 'poetry', 'hatchling')
             **kwargs: Additional arguments (ignored for compatibility)
         
         Returns:
@@ -107,7 +109,7 @@ class SpecFileGenerator:
             logger.info(f"Successfully generated spec for {package_name}")
             
             # Post-process the spec file
-            spec_content = self._post_process_spec(spec_content, package_name, version)
+            spec_content = self._post_process_spec(spec_content, package_name, version, build_system)
             
             return spec_content
             
@@ -118,7 +120,7 @@ class SpecFileGenerator:
             logger.error(f"Error generating spec for {package_name}: {e}")
             return self._generate_fallback_spec(package_name, version, python_version)
     
-    def _post_process_spec(self, spec_content: str, package_name: str, version: Optional[str]) -> str:
+    def _post_process_spec(self, spec_content: str, package_name: str, version: Optional[str], build_system: str = 'unknown') -> str:
         """
         Post-process the generated spec file
         
@@ -126,10 +128,67 @@ class SpecFileGenerator:
             spec_content: Generated spec content
             package_name: Package name
             version: Package version
+            build_system: Detected/stored build system
         
         Returns:
             Post-processed spec content
         """
+        # Decide whether to enforce pyproject macros.
+        # Only keep legacy setup.py paths for packages explicitly identified as setuptools.
+        use_pyproject = (build_system != 'setuptools')
+
+        if use_pyproject:
+            # Replace the old %py3_build / %py3_install macros (these expand to
+            # "python3 setup.py build/install" at RPM build time and will fail
+            # for any package that doesn't ship a setup.py).
+            spec_content = re.sub(r'%py3_build\b', '%pyproject_wheel', spec_content)
+            spec_content = re.sub(r'%py3_install\b', '%pyproject_install', spec_content)
+            spec_content = re.sub(r'%python_build\b', '%pyproject_wheel', spec_content)
+            spec_content = re.sub(r'%python_install\b', '%pyproject_install', spec_content)
+
+        # Always replace literal python3 setup.py invocations regardless of
+        # build_system — if the spec literally calls python3 setup.py build but
+        # the package has no setup.py we want the safer macro.
+        spec_content = re.sub(
+            r'/usr/bin/python3\s+setup\.py\s+build[^\n]*',
+            '%pyproject_wheel',
+            spec_content
+        )
+        spec_content = re.sub(
+            r'/usr/bin/python3\s+setup\.py\s+install[^\n]*',
+            '%pyproject_install',
+            spec_content
+        )
+        
+        # Ensure pyproject macros BuildRequires are present if using pyproject macros
+        if '%pyproject_wheel' in spec_content or '%pyproject_install' in spec_content:
+            if 'BuildRequires:  pyproject-rpm-macros' not in spec_content and 'BuildRequires: pyproject-rpm-macros' not in spec_content:
+                # Add after other BuildRequires
+                spec_content = re.sub(
+                    r'(BuildRequires:.*python.*-devel)',
+                    r'\1\nBuildRequires:  pyproject-rpm-macros',
+                    spec_content,
+                    count=1
+                )
+
+            # Ensure %generate_buildrequires section with %pyproject_buildrequires exists
+            if '%generate_buildrequires' not in spec_content:
+                spec_content = re.sub(
+                    r'^(%build)',
+                    '%generate_buildrequires\n%pyproject_buildrequires\n\n\\1',
+                    spec_content,
+                    flags=re.MULTILINE,
+                    count=1
+                )
+            elif '%pyproject_buildrequires' not in spec_content:
+                spec_content = re.sub(
+                    r'^(%generate_buildrequires)',
+                    '\\1\n%pyproject_buildrequires',
+                    spec_content,
+                    flags=re.MULTILINE,
+                    count=1
+                )
+
         # Fix rich boolean dependencies from pyp2rpm
         # Convert: (python3dist(pkg) >= 1 with python3dist(pkg) < 3~~)
         # To: python3dist(pkg) >= 1
@@ -138,35 +197,6 @@ class SpecFileGenerator:
             r'python3dist(\1) \2',
             spec_content
         )
-        
-        # Replace old setup.py build commands with modern pyproject-based commands
-        # Old: /usr/bin/python3 setup.py build
-        # New: %pyproject_wheel
-        spec_content = re.sub(
-            r'/usr/bin/python3\s+setup\.py\s+build\s+[^\n]*',
-            '%pyproject_wheel',
-            spec_content
-        )
-        
-        # Replace old setup.py install commands with modern pyproject-based commands
-        # Old: /usr/bin/python3 setup.py install
-        # New: %pyproject_install
-        spec_content = re.sub(
-            r'/usr/bin/python3\s+setup\.py\s+install\s+[^\n]*',
-            '%pyproject_install',
-            spec_content
-        )
-        
-        # Ensure pyproject macros BuildRequires are present if using pyproject macros
-        if '%pyproject_wheel' in spec_content or '%pyproject_install' in spec_content:
-            if 'BuildRequires:  pyproject-rpm-macros' not in spec_content:
-                # Add after other BuildRequires
-                spec_content = re.sub(
-                    r'(BuildRequires:.*python.*-devel)',
-                    r'\1\nBuildRequires:  pyproject-rpm-macros',
-                    spec_content,
-                    count=1
-                )
         
         # Add packager information if not present
         if '%changelog' in spec_content and 'ReqPM' not in spec_content:

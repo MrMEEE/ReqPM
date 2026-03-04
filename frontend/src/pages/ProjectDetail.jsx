@@ -1,6 +1,6 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GitBranch, Package, AlertCircle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download, X, Terminal, FileCode } from 'lucide-react';
+import { ArrowLeft, GitBranch, Package, AlertCircle, AlertTriangle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download, X, Terminal, FileCode, Wrench } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
@@ -86,6 +86,66 @@ const VersionDropdown = ({ packageId, currentVersion, onVersionChange }) => {
                 </button>
               ))
             )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+const BUILD_SYSTEMS = [
+  { value: 'unknown', label: 'Unknown' },
+  { value: 'setuptools', label: 'Setuptools' },
+  { value: 'poetry', label: 'Poetry' },
+  { value: 'flit', label: 'Flit' },
+  { value: 'hatchling', label: 'Hatchling' },
+  { value: 'pdm', label: 'PDM' },
+  { value: 'meson', label: 'Meson' },
+  { value: 'scikit-build', label: 'Scikit-Build' },
+  { value: 'other-pyproject', label: 'Other (pyproject)' },
+];
+
+const BUILD_SYSTEM_COLORS = {
+  unknown: 'text-gray-400 bg-gray-800/40 border-gray-700',
+  setuptools: 'text-yellow-400 bg-yellow-900/20 border-yellow-800/50',
+  poetry: 'text-pink-400 bg-pink-900/20 border-pink-800/50',
+  flit: 'text-cyan-400 bg-cyan-900/20 border-cyan-800/50',
+  hatchling: 'text-orange-400 bg-orange-900/20 border-orange-800/50',
+  pdm: 'text-blue-400 bg-blue-900/20 border-blue-800/50',
+  meson: 'text-red-400 bg-red-900/20 border-red-800/50',
+  'scikit-build': 'text-green-400 bg-green-900/20 border-green-800/50',
+  'other-pyproject': 'text-purple-400 bg-purple-900/20 border-purple-800/50',
+};
+
+const BuildSystemDropdown = ({ packageId, currentBuildSystem, onBuildSystemChange }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const current = BUILD_SYSTEMS.find(bs => bs.value === currentBuildSystem);
+  const label = current ? current.label : (currentBuildSystem || 'unknown');
+  const colorClass = BUILD_SYSTEM_COLORS[currentBuildSystem] || BUILD_SYSTEM_COLORS.unknown;
+
+  return (
+    <div className="relative">
+      <button
+        onClick={(e) => { e.stopPropagation(); setIsOpen(!isOpen); }}
+        className={`text-xs px-2 py-0.5 rounded border font-mono ${colorClass} hover:opacity-80`}
+      >
+        {label}
+      </button>
+      {isOpen && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setIsOpen(false)} />
+          <div className="absolute z-20 mt-1 w-44 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col">
+            {BUILD_SYSTEMS.map((bs) => (
+              <button
+                key={bs.value}
+                onClick={(e) => { e.stopPropagation(); setIsOpen(false); if (bs.value !== currentBuildSystem) onBuildSystemChange(packageId, bs.value); }}
+                className={`w-full text-left px-3 py-2 text-xs hover:bg-gray-600 ${
+                  bs.value === currentBuildSystem ? 'bg-gray-600 text-white' : 'text-gray-200'
+                }`}
+              >
+                {bs.label}
+              </button>
+            ))}
           </div>
         </>
       )}
@@ -370,12 +430,24 @@ export default function ProjectDetail() {
       return response.data;
     },
     onSuccess: () => {
-      // Refetch packages after version change
       queryClient.invalidateQueries(['project-packages', id]);
       queryClient.invalidateQueries(['project', id]);
     },
     onError: (error) => {
       alert(`Failed to change version: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
+  const changeBuildSystemMutation = useMutation({
+    mutationFn: async ({ packageId, buildSystem }) => {
+      const response = await packagesAPI.changeBuildSystem(packageId, buildSystem);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['project-packages', id]);
+    },
+    onError: (error) => {
+      alert(`Failed to change build system: ${error.response?.data?.error || error.message}`);
     },
   });
 
@@ -403,11 +475,24 @@ export default function ProjectDetail() {
       const response = await packagesAPI.buildPackage(packageId);
       return response.data;
     },
+    onMutate: (packageId) => {
+      const setPending = (pkg) => pkg.id === packageId ? { ...pkg, build_status: 'pending' } : pkg;
+      queryClient.setQueryData(['project-packages', id], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          packages: old.packages?.map(setPending),
+          direct_dependencies: old.direct_dependencies?.map(setPending),
+          transitive_dependencies: old.transitive_dependencies?.map(setPending),
+        };
+      });
+    },
     onSuccess: (data) => {
       setShowLogs(true);
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
+      queryClient.invalidateQueries(['project-packages', id]);
       alert(`Failed to build package: ${error.response?.data?.detail || error.message}`);
     },
   });
@@ -417,11 +502,24 @@ export default function ProjectDetail() {
       const response = await packagesAPI.rebuildPackage(packageId);
       return response.data;
     },
+    onMutate: (packageId) => {
+      const setPending = (pkg) => pkg.id === packageId ? { ...pkg, build_status: 'pending' } : pkg;
+      queryClient.setQueryData(['project-packages', id], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          packages: old.packages?.map(setPending),
+          direct_dependencies: old.direct_dependencies?.map(setPending),
+          transitive_dependencies: old.transitive_dependencies?.map(setPending),
+        };
+      });
+    },
     onSuccess: (data) => {
       queryClient.invalidateQueries(['project-packages', id]);
       setShowLogs(true);
     },
     onError: (error) => {
+      queryClient.invalidateQueries(['project-packages', id]);
       alert(`Failed to rebuild package: ${error.response?.data?.detail || error.message}`);
     },
   });
@@ -444,12 +542,25 @@ export default function ProjectDetail() {
       const response = await projectsAPI.buildAllPackages(id);
       return response.data;
     },
+    onMutate: () => {
+      const setPending = (pkg) => ({ ...pkg, build_status: 'pending' });
+      queryClient.setQueryData(['project-packages', id], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          packages: old.packages?.map(setPending),
+          direct_dependencies: old.direct_dependencies?.map(setPending),
+          transitive_dependencies: old.transitive_dependencies?.map(setPending),
+        };
+      });
+    },
     onSuccess: (data) => {
       alert(`Started building ${data.count} packages`);
       setShowLogs(true);
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
+      queryClient.invalidateQueries(['project-packages', id]);
       alert(`Failed to build packages: ${error.response?.data?.detail || error.message}`);
     },
   });
@@ -460,6 +571,37 @@ export default function ProjectDetail() {
 
   const handleRebuildPackage = (packageId) => {
     rebuildPackageMutation.mutate(packageId);
+  };
+
+  const fixAndRebuildMutation = useMutation({
+    mutationFn: async (packageId) => {
+      const response = await packagesAPI.fixAndRebuild(packageId);
+      return response.data;
+    },
+    onMutate: (packageId) => {
+      const setPending = (pkg) => pkg.id === packageId ? { ...pkg, build_status: 'pending' } : pkg;
+      queryClient.setQueryData(['project-packages', id], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          packages: old.packages?.map(setPending),
+          direct_dependencies: old.direct_dependencies?.map(setPending),
+          transitive_dependencies: old.transitive_dependencies?.map(setPending),
+        };
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['project-packages', id]);
+      setShowLogs(true);
+    },
+    onError: (error) => {
+      queryClient.invalidateQueries(['project-packages', id]);
+      alert(`Failed to fix & rebuild: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const handleFixAndRebuild = (packageId) => {
+    fixAndRebuildMutation.mutate(packageId);
   };
 
   const handleCancelBuild = (packageId) => {
@@ -781,6 +923,9 @@ export default function ProjectDetail() {
                           Version
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build System
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
                           Requirements File
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
@@ -823,6 +968,13 @@ export default function ProjectDetail() {
                               packageId={pkg.id}
                               currentVersion={pkg.version || '-'}
                               onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                            />
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <BuildSystemDropdown
+                              packageId={pkg.id}
+                              currentBuildSystem={pkg.build_system || 'unknown'}
+                              onBuildSystemChange={(pkgId, buildSystem) => changeBuildSystemMutation.mutate({ packageId: pkgId, buildSystem })}
                             />
                           </td>
                           <td 
@@ -894,6 +1046,15 @@ export default function ProjectDetail() {
                                 Failed
                               </span>
                             )}
+                            {pkg.build_status === 'missing_packages' && (
+                              <span
+                                className="px-2 py-1 bg-amber-900/30 text-amber-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || pkg.build_error_message}
+                              >
+                                <AlertTriangle className="h-3 w-3" />
+                                Missing Deps
+                              </span>
+                            )}
                             {pkg.build_status === 'building' && (
                               <span className="px-2 py-1 bg-blue-900/30 text-blue-300 text-xs rounded flex items-center gap-1">
                                 <RefreshCw className="h-3 w-3 animate-spin" />
@@ -904,6 +1065,15 @@ export default function ProjectDetail() {
                               <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
                                 <Clock className="h-3 w-3" />
                                 Waiting for deps
+                              </span>
+                            )}
+                            {pkg.build_status === 'dep_build_pending' && (
+                              <span
+                                className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || 'Waiting for project packages to be built'}
+                              >
+                                <Clock className="h-3 w-3" />
+                                Dep Build Pending
                               </span>
                             )}
                             {pkg.build_status === 'pending' && (
@@ -985,7 +1155,7 @@ export default function ProjectDetail() {
                                   Live Log
                                 </button>
                               )}
-                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed') && (
+                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1021,7 +1191,7 @@ export default function ProjectDetail() {
                                 <Download className="h-3 w-3" />
                                 Fetch
                               </button>
-                              {pkg.build_status === 'waiting_for_deps' ? (
+                              {(pkg.build_status === 'waiting_for_deps' || pkg.build_status === 'dep_build_pending') ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1058,6 +1228,19 @@ export default function ProjectDetail() {
                                 >
                                   <RefreshCw className="h-3 w-3" />
                                   Rebuild
+                                </button>
+                              )}
+                              {['missing_packages', 'failed'].includes(pkg.build_status) && pkg.source_fetched && pkg.spec_files_count > 0 && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleFixAndRebuild(pkg.id);
+                                  }}
+                                  className="px-3 py-1 bg-teal-600 text-white rounded hover:bg-teal-700 flex items-center gap-1"
+                                  title="Apply auto-fixes to spec and rebuild"
+                                >
+                                  <Wrench className="h-3 w-3" />
+                                  Fix &amp; Rebuild
                                 </button>
                               )}
                             </div>
@@ -1126,6 +1309,9 @@ export default function ProjectDetail() {
                           Version
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                          Build System
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
                           Depended By
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
@@ -1168,6 +1354,13 @@ export default function ProjectDetail() {
                               packageId={pkg.id}
                               currentVersion={pkg.version || '-'}
                               onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                            />
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
+                            <BuildSystemDropdown
+                              packageId={pkg.id}
+                              currentBuildSystem={pkg.build_system || 'unknown'}
+                              onBuildSystemChange={(pkgId, buildSystem) => changeBuildSystemMutation.mutate({ packageId: pkgId, buildSystem })}
                             />
                           </td>
                           <td 
@@ -1252,6 +1445,15 @@ export default function ProjectDetail() {
                                 Failed
                               </span>
                             )}
+                            {pkg.build_status === 'missing_packages' && (
+                              <span
+                                className="px-2 py-1 bg-amber-900/30 text-amber-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || pkg.build_error_message}
+                              >
+                                <AlertTriangle className="h-3 w-3" />
+                                Missing Deps
+                              </span>
+                            )}
                             {pkg.build_status === 'building' && (
                               <span className="px-2 py-1 bg-blue-900/30 text-blue-300 text-xs rounded flex items-center gap-1">
                                 <RefreshCw className="h-3 w-3 animate-spin" />
@@ -1262,6 +1464,15 @@ export default function ProjectDetail() {
                               <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
                                 <Clock className="h-3 w-3" />
                                 Waiting for deps
+                              </span>
+                            )}
+                            {pkg.build_status === 'dep_build_pending' && (
+                              <span
+                                className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || 'Waiting for project packages to be built'}
+                              >
+                                <Clock className="h-3 w-3" />
+                                Dep Build Pending
                               </span>
                             )}
                             {pkg.build_status === 'pending' && (
@@ -1343,7 +1554,7 @@ export default function ProjectDetail() {
                                   Live Log
                                 </button>
                               )}
-                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed') && (
+                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1379,7 +1590,7 @@ export default function ProjectDetail() {
                                 <Download className="h-3 w-3" />
                                 Fetch
                               </button>
-                              {pkg.build_status === 'waiting_for_deps' ? (
+                              {(pkg.build_status === 'waiting_for_deps' || pkg.build_status === 'dep_build_pending') ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1416,6 +1627,19 @@ export default function ProjectDetail() {
                                 >
                                   <RefreshCw className="h-3 w-3" />
                                   Rebuild
+                                </button>
+                              )}
+                              {['missing_packages', 'failed'].includes(pkg.build_status) && pkg.source_fetched && pkg.spec_files_count > 0 && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleFixAndRebuild(pkg.id);
+                                  }}
+                                  className="px-3 py-1 bg-teal-600 text-white rounded hover:bg-teal-700 flex items-center gap-1"
+                                  title="Apply auto-fixes to spec and rebuild"
+                                >
+                                  <Wrench className="h-3 w-3" />
+                                  Fix &amp; Rebuild
                                 </button>
                               )}
                             </div>

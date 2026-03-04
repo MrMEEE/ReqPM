@@ -2,6 +2,45 @@ import { useEffect, useRef, useState } from 'react';
 import { X, Terminal, CheckCircle, XCircle, AlertTriangle, Download, Lightbulb, ChevronDown, ChevronRight } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
 
+function classifyLogLine(line) {
+  const l = line.toLowerCase();
+  // Error patterns
+  if (/\berror\b|bad exit status|failed\b|exception:|traceback|no such file|command not found|child return code was: [^0]/.test(l)) {
+    return 'error';
+  }
+  // Warning patterns
+  if (/\bwarning\b|deprecated|skipping|not found/.test(l)) {
+    return 'warning';
+  }
+  // Success patterns
+  if (/\bwrote:\b|successfully|installed:|installing:|packages installed|finish:|checking build|arch independent/.test(l)) {
+    return 'success';
+  }
+  // Section/stage headers (RPM phase markers and mock stages)
+  if (/^(\+ )?%(build|install|prep|check|clean|generate_buildrequires|pyproject_wheel|pyproject_install|pyproject_buildrequires|autosetup|files)|^INFO \w|^BUILDING|^mock:|^=+$|^-+$/.test(line)) {
+    return 'section';
+  }
+  // Shell commands being executed (lines starting with +)
+  if (/^\+/.test(line)) {
+    return 'command';
+  }
+  // Debug / verbose
+  if (/^debug:|^\[DEBUG\]|reusing|cached|checking/.test(l)) {
+    return 'debug';
+  }
+  return 'default';
+}
+
+const LOG_LINE_COLORS = {
+  error:   'text-red-400 bg-red-950/30',
+  warning: 'text-yellow-300 bg-yellow-950/20',
+  success: 'text-green-400',
+  section: 'text-cyan-300 font-semibold',
+  command: 'text-blue-300 opacity-80',
+  debug:   'text-gray-500',
+  default: 'text-gray-300',
+};
+
 const categoryIcons = {
   'Missing Dependencies': '📦',
   'Missing Packages': '📦',
@@ -267,11 +306,23 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
           <div
             ref={logContainerRef}
             onScroll={handleScroll}
-            className="flex-1 bg-black rounded-lg p-4 overflow-auto font-mono text-xs text-gray-300"
+            className="flex-1 bg-black rounded-lg p-4 overflow-auto font-mono text-xs"
           >
             {log ? (
               <>
-                <pre className="whitespace-pre-wrap">{log}</pre>
+                <div className="space-y-0">
+                  {log.split('\n').map((line, idx) => {
+                    const kind = classifyLogLine(line);
+                    return (
+                      <div
+                        key={idx}
+                        className={`whitespace-pre-wrap leading-5 px-1 rounded-sm ${LOG_LINE_COLORS[kind]}`}
+                      >
+                        {line || '\u00a0'}
+                      </div>
+                    );
+                  })}
+                </div>
                 <div ref={logEndRef} />
               </>
             ) : (

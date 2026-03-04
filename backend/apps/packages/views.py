@@ -361,7 +361,37 @@ class PackageViewSet(viewsets.ModelViewSet):
             'detail': 'Package rebuild triggered',
             'package_id': package.id
         })
-    
+
+    @action(detail=True, methods=['post'])
+    def fix_and_rebuild(self, request, pk=None):
+        """
+        Apply automated spec fixes for known error categories and rebuild.
+
+        POST /api/packages/{id}/fix_and_rebuild/
+        """
+        from backend.apps.packages.tasks import fix_and_rebuild_task
+
+        package = self.get_object()
+
+        if not package.spec_revisions.exists():
+            return Response(
+                {'detail': 'Package must have a spec file before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not package.source_fetched:
+            return Response(
+                {'detail': 'Package source must be fetched before building'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        fix_and_rebuild_task.delay(package.id)
+
+        return Response({
+            'detail': 'Fix & rebuild triggered',
+            'package_id': package.id
+        })
+
     @action(detail=True, methods=['get'])
     def build_status(self, request, pk=None):
         """
@@ -523,6 +553,46 @@ class PackageViewSet(viewsets.ModelViewSet):
         return Response({
             'message': f'Version changed from {old_version} to {new_version}',
             'package': PackageListSerializer(package).data
+        })
+    
+    @action(detail=True, methods=['patch'], url_path='change-build-system')
+    def change_build_system(self, request, pk=None):
+        """
+        Change the stored build system for a package (user override).
+
+        PATCH /api/packages/{id}/change-build-system/
+        Body: { "build_system": "poetry" }
+        """
+        from backend.apps.packages.models import Package
+        package = self.get_object()
+        build_system = request.data.get('build_system')
+
+        if not build_system:
+            return Response(
+                {'error': 'build_system is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        valid_choices = [c[0] for c in Package.BuildSystem.choices]
+        if build_system not in valid_choices:
+            return Response(
+                {'error': f'Invalid build_system. Valid choices: {valid_choices}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        old_build_system = package.build_system
+        package.build_system = build_system
+        package.save(update_fields=['build_system'])
+
+        logger.info(f"Changed build system of {package.name} from {old_build_system} to {build_system}")
+
+        # Auto-regenerate the spec so it picks up the new build system macros
+        generate_spec_file_task.delay(package.id, force=True)
+
+        return Response({
+            'message': f'Build system updated to {build_system}. Spec file is being regenerated.',
+            'package_id': package.id,
+            'build_system': build_system,
         })
     
     @action(detail=True, methods=['get'], url_path='download-rpm')

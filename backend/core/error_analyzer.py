@@ -141,8 +141,43 @@ class BuildErrorAnalyzer:
                 'category': 'Scriplet Error',
                 'suggestion': 'Fix errors in %pre, %post, %preun, or %postun scripts'
             },
+            'deps_not_satisfied': {
+                'pattern': r'(Not all dependencies satisfied|Some packages could not be found\.)',
+                'category': 'Missing Packages',
+                'suggestion': 'Some required packages are not available in the configured repositories'
+            },
         }
-    
+
+    # Common English words that mock/dnf may echo back verbatim from error
+    # messages — these are never valid package names.
+    _NOISE_WORDS = {
+        'not', 'all', 'some', 'be', 'could', 'dependencies', 'found',
+        'packages', 'satisfied', 'no', 'is', 'the', 'and', 'or', 'of',
+        'to', 'in', 'for', 'are', 'was', 'error', 'warning', 'note',
+        'please', 'try', 'again', 'check', 'your', 'has', 'have',
+    }
+
+    def _is_package_name(self, item: str) -> bool:
+        """
+        Reject captured items that are clearly English noise words rather than
+        real package/dep names.  A valid RPM dep name must either:
+          - Contain a package-name character  ( - _ ( ) . digits )
+          - OR be a non-trivial word not in the noise blocklist
+        Items ending with '.' (sentence punctuation) are always rejected.
+        """
+        if item.endswith('.'):
+            return False
+        # Package names never contain spaces
+        if ' ' in item:
+            return False
+        if item.lower() in self._NOISE_WORDS:
+            return False
+        # If the item is purely alphabetic (no hyphens, parens, digits, dots),
+        # it's likely a noise word unless it's long enough to be an actual pkg.
+        # Real single-word packages (gcc, rust, make…) pass because they're
+        # not in _NOISE_WORDS; but generic English words are filtered above.
+        return True
+
     def analyze(self, log_output: str) -> List[BuildError]:
         """
         Analyze build log and extract errors
@@ -170,12 +205,12 @@ class BuildErrorAnalyzer:
                 else:
                     items = matches
                 
-                # Remove duplicates while preserving order
+                # Remove duplicates while preserving order, dropping noise words
                 seen = set()
                 unique_items = []
                 for item in items:
-                    item_clean = item.strip()
-                    if item_clean and item_clean not in seen:
+                    item_clean = item.strip().strip("'\"")
+                    if item_clean and item_clean not in seen and self._is_package_name(item_clean):
                         seen.add(item_clean)
                         unique_items.append(item_clean)
                 

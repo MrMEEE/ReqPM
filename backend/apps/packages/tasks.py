@@ -122,13 +122,25 @@ def generate_spec_file_task(self, package_id: int, force: bool = False):
                 package.version = pkg_info.version
                 package.save()
                 log_package(package_id, 'debug', f"Updated package version to {pkg_info.version}")
+
+            # Detect build system (only if not already set by user)
+            build_system = package.build_system if package.build_system != 'unknown' else 'unknown'
+            if build_system == 'unknown':
+                log_package(package_id, 'debug', "Detecting build system from PyPI...")
+                build_system = pypi_client.detect_build_system(package.name, pkg_info.version)
+                package.build_system = build_system
+                package.save(update_fields=['build_system'])
+                log_package(package_id, 'info', f"Detected build system: {build_system}")
+            else:
+                log_package(package_id, 'debug', f"Using stored build system: {build_system}")
             
             # Generate spec file with project's Python version
-            log_package(package_id, 'debug', f"Generating RPM spec file for version {pkg_info.version} with Python {python_version}...")
+            log_package(package_id, 'debug', f"Generating RPM spec file for version {pkg_info.version} with Python {python_version} (build system: {build_system})...")
             spec_content = spec_gen.generate_spec(
                 package_name=package.name,
                 version=pkg_info.version,
                 python_version=python_version,
+                build_system=build_system,
                 pypi_metadata={'info': pkg_info.__dict__, 'urls': []}
             )
             
@@ -537,11 +549,11 @@ def build_single_package_task(self, package_id: int):
             build_dir = Path(settings.REQPM['BUILD_DIR']) / 'package_builds' / str(package_id)
             build_dir.mkdir(parents=True, exist_ok=True)
             
-            # Write spec file
             spec_file = build_dir / f"{package.name}.spec"
-            spec_file.write_text(spec_revision.content)
             
             # Copy sources from project source directory to build directory
+            # NOTE: skip .spec files — the authoritative spec comes from SpecFileRevision,
+            # and any stale .spec in the sources dir must not overwrite it.
             sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / package.name
             
             if not sources_dir.exists():
@@ -555,11 +567,11 @@ def build_single_package_task(self, package_id: int):
                 logger.error(f"Sources not found for {package.name} at {sources_dir}")
                 return
             
-            # Copy all source files to build directory
+            # Copy all source files to build directory (excluding .spec files)
             logger.info(f"Copying sources for {package.name} from {sources_dir} to {build_dir}")
             try:
                 for source_file in sources_dir.glob('*'):
-                    if source_file.is_file():
+                    if source_file.is_file() and source_file.suffix != '.spec':
                         shutil.copy2(source_file, build_dir)
                         logger.debug(f"Copied {source_file.name}")
             except Exception as e:
@@ -572,6 +584,11 @@ def build_single_package_task(self, package_id: int):
                 log_package(package_id, 'error', f"Failed to copy sources: {str(e)}")
                 logger.error(f"Failed to copy sources for {package.name}: {e}")
                 return
+            
+            # Write spec file AFTER copying sources so it is never overwritten by a
+            # stale .spec that may exist in the sources directory.
+            spec_file.write_text(spec_revision.content)
+            logger.info(f"Wrote spec file: {spec_file} (revision {spec_revision.id})")
             
             # Auto-derive mock config from RHEL version
             target = f"rhel-{rhel_version}-x86_64"
@@ -602,7 +619,6 @@ def build_single_package_task(self, package_id: int):
             )
             
             if not srpm_result.success:
-                package.build_status = 'failed'
                 package.build_completed_at = timezone.now()
                 package.build_error_message = f"SRPM build failed: {srpm_result.error_message}"
                 package.build_log = srpm_result.log_output
@@ -617,6 +633,12 @@ def build_single_package_task(self, package_id: int):
                 except Exception as analyze_err:
                     logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
                     package.analyzed_errors = []
+                # Use specific status if missing packages were detected
+                missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
+                if any(e.get('category') in missing_cats for e in package.analyzed_errors):
+                    package.build_status = _resolve_missing_dep_status(package, project)
+                else:
+                    package.build_status = 'failed'
                 package.save()
                 send_package_update(package_id)
                 log_project(project.id, 'error', f"Build failed for {package.name}: SRPM build failed")
@@ -638,7 +660,6 @@ def build_single_package_task(self, package_id: int):
             )
             
             if not rpm_result.success:
-                package.build_status = 'failed'
                 package.build_completed_at = timezone.now()
                 package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
                 package.build_log = rpm_result.log_output
@@ -653,6 +674,12 @@ def build_single_package_task(self, package_id: int):
                 except Exception as analyze_err:
                     logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
                     package.analyzed_errors = []
+                # Use specific status if missing packages were detected
+                missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
+                if any(e.get('category') in missing_cats for e in package.analyzed_errors):
+                    package.build_status = _resolve_missing_dep_status(package, project)
+                else:
+                    package.build_status = 'failed'
                 package.save()
                 send_package_update(package_id)
                 log_project(project.id, 'error', f"Build failed for {package.name}: RPM build failed")
@@ -720,17 +747,91 @@ def build_single_package_task(self, package_id: int):
             pass
 
 
+def _normalize_dep_names(item: str):
+    """
+    Normalize a single rpm dep string to a list of candidate package names.
+    E.g. 'python3dist(requests) >= 2.0' -> ['python3-requests', 'requests']
+    """
+    import re
+    # Strip version constraints
+    item = re.split(r'\s*[><=!]', item)[0].strip()
+    # python3dist(foo-bar) or python3dist(foo_bar)
+    m = re.match(r'python3?dist\(([^)]+)\)', item, re.IGNORECASE)
+    if m:
+        pkg_name = m.group(1).replace('_', '-').lower()
+        return [f'python3-{pkg_name}', pkg_name]
+    # python3(foo)
+    m = re.match(r'python3?\(([^)]+)\)', item, re.IGNORECASE)
+    if m:
+        pkg_name = m.group(1).replace('_', '-').lower()
+        return [f'python3-{pkg_name}', pkg_name]
+    # Already a plain name
+    return [item.strip(), item.strip().replace('_', '-')]
+
+
+def _find_project_packages_for_items(project, missing_items):
+    """
+    Given a list of missing dep item strings, return Package objects in the
+    same project whose names match (case-insensitive).
+    """
+    from backend.apps.packages.models import Package
+    from django.db.models import Q
+
+    candidate_names = set()
+    for item in missing_items:
+        for name in _normalize_dep_names(item):
+            candidate_names.add(name.lower())
+
+    if not candidate_names:
+        return []
+
+    q = Q()
+    for name in candidate_names:
+        q |= Q(name__iexact=name)
+    return list(Package.objects.filter(project=project).filter(q))
+
+
+def _resolve_missing_dep_status(package, project):
+    """
+    Decide between 'dep_build_pending' and 'missing_packages' based on whether
+    the missing deps are already known packages in the project (just not yet built).
+    Returns the appropriate build_status string.
+    """
+    missing_cats = {
+        'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+        'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
+    }
+    missing_items = []
+    for e in (package.analyzed_errors or []):
+        if e.get('category') in missing_cats:
+            missing_items.extend(e.get('items', []))
+
+    if not missing_items:
+        return 'missing_packages'
+
+    matched = _find_project_packages_for_items(project, missing_items)
+    # If any of the missing deps exist in the project as unbuilt packages → dep_build_pending
+    unbuilt_matches = [p for p in matched if p.build_status not in ('completed', 'not_required') and p.id != package.id]
+    if unbuilt_matches:
+        names = ', '.join(p.name for p in unbuilt_matches)
+        log_package(package.id, 'info',
+            f"Missing deps found as unbuilt project packages: {names} — waiting for them")
+        return 'dep_build_pending'
+
+    return 'missing_packages'
+
+
 def trigger_waiting_builds(completed_package_id: int):
     """
     After a package build completes, check if any packages in waiting_for_deps
-    state now have all their dependencies satisfied and can be built.
+    or dep_build_pending state now have all their dependencies satisfied and can be built.
     """
     from backend.apps.packages.models import Package
     
     try:
         completed_pkg = Package.objects.get(id=completed_package_id)
         
-        # Find packages that depend on the completed one and are waiting
+        # --- Handle waiting_for_deps (explicit PackageDependency links) ---
         waiting_pkgs = Package.objects.filter(
             build_status='waiting_for_deps',
             dependencies__depends_on=completed_pkg
@@ -751,8 +852,111 @@ def trigger_waiting_builds(completed_package_id: int):
                 build_single_package_task.delay(pkg.id)
             else:
                 logger.debug(f"{pkg.name} still waiting for: {unbuilt}")
+
+        # --- Handle dep_build_pending (missing dep items matched to project packages) ---
+        dep_pending_pkgs = Package.objects.filter(
+            project=completed_pkg.project,
+            build_status='dep_build_pending',
+        ).exclude(id=completed_pkg.id)
+
+        for pkg in dep_pending_pkgs:
+            missing_cats = {
+                'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+                'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
+            }
+            missing_items = []
+            for e in (pkg.analyzed_errors or []):
+                if e.get('category') in missing_cats:
+                    missing_items.extend(e.get('items', []))
+
+            if not missing_items:
+                continue
+
+            # Check if the completed package name is one of the blockers
+            blocker_names = set()
+            for item in missing_items:
+                for name in _normalize_dep_names(item):
+                    blocker_names.add(name.lower())
+            if completed_pkg.name.lower() not in blocker_names:
+                continue  # Not related to this package
+
+            # Re-evaluate all blockers
+            matched = _find_project_packages_for_items(completed_pkg.project, missing_items)
+            unresolved = [
+                p for p in matched
+                if p.build_status not in ('completed', 'not_required') and p.id != pkg.id
+            ]
+            if not unresolved:
+                logger.info(f"All dep_build_pending blockers resolved for {pkg.name}, triggering build")
+                log_package(pkg.id, 'info',
+                    f"{completed_pkg.name} is now built — all blockers resolved, starting build...")
+                pkg.build_status = 'pending'
+                pkg.save()
+                build_single_package_task.delay(pkg.id)
+            else:
+                remaining = ', '.join(p.name for p in unresolved)
+                logger.debug(f"{pkg.name} dep_build_pending still waiting for: {remaining}")
+
     except Package.DoesNotExist:
         logger.error(f"Package {completed_package_id} not found in trigger_waiting_builds")
     except Exception as e:
         logger.exception(f"Error in trigger_waiting_builds for {completed_package_id}: {e}")
+
+
+@shared_task(bind=True, max_retries=3)
+def fix_and_rebuild_task(self, package_id: int):
+    """
+    Apply automated spec fixes for known error categories, then trigger a build.
+    If no auto-fixable errors are found the build is triggered anyway (re-try).
+    """
+    from django.utils import timezone
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.spec_fixer import SpecFixer, has_auto_fix
+
+    try:
+        package = Package.objects.select_related('project').get(id=package_id)
+
+        spec_revision = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+
+        if not spec_revision:
+            log_package(package_id, 'error', 'No spec file found — cannot apply fixes')
+            return
+
+        errors = package.analyzed_errors or []
+
+        if has_auto_fix(errors):
+            fixer = SpecFixer()
+            new_content, fixes_applied = fixer.apply_fixes(spec_revision.content, errors)
+
+            if fixes_applied:
+                SpecFileRevision.objects.create(package=package, content=new_content)
+                for fix in fixes_applied:
+                    log_package(package_id, 'info', f'Auto-fix applied: {fix}')
+                log_package(package_id, 'info',
+                    f'{len(fixes_applied)} fix(es) applied — triggering rebuild')
+            else:
+                log_package(package_id, 'info',
+                    'Auto-fix ran but made no changes — triggering rebuild anyway')
+        else:
+            log_package(package_id, 'info',
+                'No auto-fixable errors found — triggering rebuild')
+
+        # Always finish by triggering the actual build
+        build_single_package_task.delay(package_id)
+
+    except Package.DoesNotExist:
+        logger.error(f'Package {package_id} not found in fix_and_rebuild_task')
+    except Exception as e:
+        logger.exception(f'Error in fix_and_rebuild_task for {package_id}: {e}')
+        try:
+            pkg = Package.objects.get(id=package_id)
+            pkg.build_status = 'failed'
+            pkg.build_completed_at = timezone.now()
+            pkg.build_error_message = f'Fix & rebuild error: {e}'
+            pkg.save()
+            send_package_update(package_id)
+        except Exception:
+            pass
 

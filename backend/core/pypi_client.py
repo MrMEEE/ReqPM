@@ -2,6 +2,8 @@
 PyPI metadata fetcher and analyzer
 """
 import json
+import re
+import tarfile
 import urllib.request
 import urllib.error
 from typing import Dict, List, Optional, Set
@@ -275,3 +277,137 @@ class PyPIClient:
         if match:
             return match.group(1)
         return None
+
+    # -------------------------------------------------------------------------
+    # Build system detection
+    # -------------------------------------------------------------------------
+
+    def detect_build_system(self, package_name: str, version: Optional[str] = None) -> str:
+        """
+        Detect the build system used by a Python package.
+        Streams the sdist from PyPI and inspects pyproject.toml.
+
+        Returns one of: 'unknown', 'setuptools', 'poetry', 'flit',
+            'hatchling', 'pdm', 'meson', 'scikit-build', 'other-pyproject'
+        """
+        try:
+            metadata = self._fetch_metadata(package_name, version)
+            if not metadata:
+                return 'unknown'
+
+            # Find sdist URL from the release files
+            urls = metadata.get('urls', [])
+            sdist_url = None
+            for url_info in urls:
+                if url_info.get('packagetype') == 'sdist':
+                    sdist_url = url_info.get('url')
+                    break
+
+            if not sdist_url:
+                logger.warning(f"No sdist found for {package_name}, cannot detect build system")
+                return 'unknown'
+
+            return self._detect_from_sdist(sdist_url)
+
+        except Exception as e:
+            logger.error(f"Error detecting build system for {package_name}: {e}")
+            return 'unknown'
+
+    def _detect_from_sdist(self, sdist_url: str) -> str:
+        """Stream partial sdist tarball to find and read pyproject.toml."""
+        MAX_BYTES = 3 * 1024 * 1024  # 3 MB read limit
+
+        class _LimitedStream:
+            """Wraps a network stream and cuts off after MAX_BYTES are read."""
+            def __init__(self, source):
+                self.source = source
+                self.total = 0
+
+            def read(self, n=-1):
+                if self.total >= MAX_BYTES:
+                    return b''
+                if n < 0:
+                    n = MAX_BYTES - self.total
+                n = min(n, MAX_BYTES - self.total)
+                data = self.source.read(n)
+                self.total += len(data)
+                return data
+
+        try:
+            req = urllib.request.Request(
+                sdist_url,
+                headers={'User-Agent': 'ReqPM/1.0 build-detection'}
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                limited = _LimitedStream(response)
+
+                if sdist_url.endswith(('.tar.gz', '.tgz')):
+                    mode = 'r|gz'
+                elif sdist_url.endswith('.tar.bz2'):
+                    mode = 'r|bz2'
+                elif sdist_url.endswith('.tar.xz'):
+                    mode = 'r|xz'
+                else:
+                    # ZIP / wheel – not a tarball, give up
+                    return 'unknown'
+
+                found_setup_py = False
+                found_setup_cfg = False
+
+                try:
+                    with tarfile.open(fileobj=limited, mode=mode) as tar:
+                        for member in tar:
+                            if not member.isfile():
+                                continue
+                            basename = member.name.split('/')[-1]
+
+                            if basename == 'pyproject.toml':
+                                f = tar.extractfile(member)
+                                if f:
+                                    content = f.read().decode('utf-8', errors='ignore')
+                                    return self._detect_from_pyproject_content(content)
+                            elif basename == 'setup.py':
+                                found_setup_py = True
+                            elif basename == 'setup.cfg':
+                                found_setup_cfg = True
+
+                except tarfile.ReadError:
+                    # Hit the byte-read limit; use what we found so far
+                    pass
+
+                if found_setup_py or found_setup_cfg:
+                    return 'setuptools'
+                return 'unknown'
+
+        except Exception as e:
+            logger.warning(f"Could not detect build system from {sdist_url}: {e}")
+            return 'unknown'
+
+    def _detect_from_pyproject_content(self, content: str) -> str:
+        """Parse pyproject.toml text and return the matching build-system label."""
+        build_section_match = re.search(
+            r'\[build-system\](.*?)(?=\n\[|\Z)',
+            content,
+            re.DOTALL
+        )
+        if not build_section_match:
+            # pyproject.toml exists but has no [build-system] table
+            return 'other-pyproject'
+
+        section = build_section_match.group(1).lower()
+
+        if 'poetry-core' in section or 'poetry.core.masonry' in section:
+            return 'poetry'
+        if 'flit-core' in section or 'flit_core' in section:
+            return 'flit'
+        if 'hatchling' in section:
+            return 'hatchling'
+        if 'pdm-backend' in section or 'pdm.pep517' in section or 'pdm-pep517' in section:
+            return 'pdm'
+        if 'meson' in section:
+            return 'meson'
+        if 'scikit-build-core' in section or 'scikit_build_core' in section:
+            return 'scikit-build'
+        if 'setuptools' in section:
+            return 'setuptools'
+        return 'other-pyproject'
