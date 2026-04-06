@@ -164,6 +164,41 @@ class ProjectViewSet(viewsets.ModelViewSet):
             'project_id': project.id
         })
     
+    @action(detail=True, methods=['post'], url_path='regenerate-failed-specs')
+    def regenerate_failed_specs(self, request, pk=None):
+        """
+        Regenerate spec files only for packages with failed builds
+        
+        POST /api/projects/{id}/regenerate-failed-specs/
+        """
+        from backend.apps.packages.tasks import generate_spec_file_task
+        from backend.apps.projects.tasks import log_project
+        
+        project = self.get_object()
+        
+        # Get all packages with failed builds
+        failed_packages = project.packages.filter(build_status='failed')
+        
+        if not failed_packages.exists():
+            return Response({
+                'detail': 'No failed packages found',
+                'count': 0
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        count = failed_packages.count()
+        
+        # Trigger spec regeneration for each failed package
+        for package in failed_packages:
+            generate_spec_file_task.delay(package.id, force=True)
+        
+        log_project(project.id, 'info', f"Regenerating specs for {count} failed package(s)")
+        
+        return Response({
+            'detail': f'Spec regeneration triggered for {count} failed package(s)',
+            'project_id': project.id,
+            'count': count
+        })
+    
     @action(detail=True, methods=['post'])
     def check_updates(self, request, pk=None):
         """
@@ -361,6 +396,35 @@ class ProjectViewSet(viewsets.ModelViewSet):
             'count': count
         })
     
+    def _get_all_transitive_dependencies(self, packages):
+        """
+        Recursively collect all transitive dependencies of the given packages.
+        Returns a set of Package objects including the original packages.
+        """
+        from backend.apps.packages.models import Package
+        
+        all_packages = set(packages)
+        to_process = list(packages)
+        processed = set()
+        
+        while to_process:
+            package = to_process.pop(0)
+            if package.id in processed:
+                continue
+            processed.add(package.id)
+            
+            # Get all packages this package depends on
+            dependencies = Package.objects.filter(
+                id__in=package.dependencies.values_list('depends_on_id', flat=True)
+            ).prefetch_related('dependencies__depends_on')
+            
+            for dep in dependencies:
+                if dep not in all_packages:
+                    all_packages.add(dep)
+                    to_process.append(dep)
+        
+        return all_packages
+    
     @action(detail=True, methods=['post'], url_path='build-all-packages')
     def build_all_packages(self, request, pk=None):
         """
@@ -374,18 +438,34 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         This means the DB is updated before the response is returned, so the
         frontend's post-success refetch sees the correct statuses straight away.
+        
+        Query parameters:
+        - include_transitive (bool): If true, also build all transitive dependencies.
+                                     Default: true
         """
         from backend.apps.packages.tasks import build_single_package_task, send_package_update
         from backend.apps.packages.models import SpecFileRevision
         from backend.apps.projects.tasks import log_project
 
         project = self.get_object()
+        
+        # Check if we should include transitive dependencies (default: true)
+        include_transitive = request.query_params.get('include_transitive', 'true').lower() in ('true', '1', 'yes')
 
         packages_with_specs = project.packages.filter(
             id__in=SpecFileRevision.objects.values('package_id').distinct()
         ).prefetch_related('dependencies__depends_on')
 
-        packages = [p for p in packages_with_specs if p.source_fetched and p.build_status != 'completed']
+        # Get all packages that are ready to build (have specs and sources)
+        direct_packages = [p for p in packages_with_specs if p.source_fetched and p.build_status != 'completed']
+        
+        # Include transitive dependencies if requested
+        if include_transitive:
+            packages = list(self._get_all_transitive_dependencies(direct_packages))
+            # Filter again for packages with specs and sources (some deps might not have them)
+            packages = [p for p in packages if p.source_fetched and p.build_status != 'completed']
+        else:
+            packages = direct_packages
 
         if not packages:
             return Response(
@@ -421,14 +501,16 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 dispatched_count += 1
 
         count = dispatched_count + waiting_count
+        deps_msg = " (including transitive dependencies)" if include_transitive else ""
         log_project(project.id, 'info',
-                    f"Build all: {dispatched_count} dispatched immediately, {waiting_count} waiting for deps")
-        logger.info(f"Build all: {dispatched_count} dispatched, {waiting_count} waiting in project {project.id}")
+                    f"Build all{deps_msg}: {dispatched_count} dispatched immediately, {waiting_count} waiting for deps")
+        logger.info(f"Build all{deps_msg}: {dispatched_count} dispatched, {waiting_count} waiting in project {project.id}")
 
         return Response({
-            'message': f'Started building {count} packages',
+            'message': f'Started building {count} packages{deps_msg}',
             'count': count,
-            'packages': all_names
+            'packages': all_names,
+            'include_transitive': include_transitive
         })
     
     @action(detail=False, methods=['post'])

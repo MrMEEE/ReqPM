@@ -47,6 +47,7 @@ class SpecFileGenerator:
         version: Optional[str] = None,
         python_version: str = "default",
         build_system: str = "unknown",
+        python_name: Optional[str] = None,
         **kwargs
     ) -> str:
         """
@@ -54,16 +55,20 @@ class SpecFileGenerator:
         Following awx-rpm-v2 approach: pyp2spec [-p PYTHONVERSION] --license gpl [-v VERSION] PACKAGE
         
         Args:
-            package_name: Name of the Python package
+            package_name: Name of the RPM package (normalized with hyphens)
             version: Specific version (None for latest)
             python_version: Python version (e.g., "3.11", "3.12", or "default" to omit -p flag)
             build_system: Detected/stored build system (e.g., 'setuptools', 'poetry', 'hatchling')
+            python_name: Original Python package name from PyPI (may use underscores/hyphens differently than package_name)
             **kwargs: Additional arguments (ignored for compatibility)
         
         Returns:
             Spec file content as string
         """
         logger.info(f"Generating spec for {package_name} using pyp2spec")
+        
+        # Use python_name for PyPI interactions if provided, otherwise use package_name
+        pypi_name = python_name if python_name else package_name
         
         # Build pyp2spec command like awx-rpm-v2:
         # pyp2spec [-p PYTHONVERSION] --license gpl [-v VERSION] PACKAGE
@@ -80,11 +85,11 @@ class SpecFileGenerator:
         
         if version:
             cmd.extend(['-v', version])
-            logger.info(f"Generating spec for {package_name} version {version}")
+            logger.info(f"Generating spec for {package_name} version {version} (PyPI name: {pypi_name})")
         else:
-            logger.info(f"Generating spec for {package_name} (latest version)")
+            logger.info(f"Generating spec for {package_name} (latest version, PyPI name: {pypi_name})")
         
-        cmd.append(package_name)
+        cmd.append(pypi_name)
         
         try:
             # Run pyp2spec and capture stdout (it prints to stdout by default)
@@ -97,14 +102,14 @@ class SpecFileGenerator:
             
             if result.returncode != 0:
                 logger.error(f"pyp2spec failed for {package_name}: {result.stderr}")
-                return self._generate_fallback_spec(package_name, version, python_version)
+                return self._generate_fallback_spec(package_name, version, python_version, python_name)
             
             # pyp2spec prints the spec to stdout by default
             spec_content = result.stdout
             
             if not spec_content or len(spec_content.strip()) == 0:
-                logger.error(f"No spec content generated for {package_name}")
-                return self._generate_fallback_spec(package_name, version, python_version)
+                logger.error(f"pyp2spec returned empty spec for {package_name}")
+                return self._generate_fallback_spec(package_name, version, python_version, python_name)
             
             logger.info(f"Successfully generated spec for {package_name}")
             
@@ -115,10 +120,10 @@ class SpecFileGenerator:
             
         except subprocess.TimeoutExpired:
             logger.error(f"pyp2spec timed out for {package_name}")
-            return self._generate_fallback_spec(package_name, version, python_version)
+            return self._generate_fallback_spec(package_name, version, python_version, python_name)
         except Exception as e:
             logger.error(f"Error generating spec for {package_name}: {e}")
-            return self._generate_fallback_spec(package_name, version, python_version)
+            return self._generate_fallback_spec(package_name, version, python_version, python_name)
     
     def _post_process_spec(self, spec_content: str, package_name: str, version: Optional[str], build_system: str = 'unknown') -> str:
         """
@@ -210,15 +215,16 @@ class SpecFileGenerator:
         
         return spec_content
     
-    def _generate_fallback_spec(self, package_name: str, version: Optional[str] = None, python_version: str = "3.11") -> str:
+    def _generate_fallback_spec(self, package_name: str, version: Optional[str] = None, python_version: str = "3.11", python_name: Optional[str] = None) -> str:
         """
         Generate a basic fallback spec file if pyp2spec fails
         Uses modern pyproject.toml build system
         
         Args:
-            package_name: Package name
+            package_name: RPM package name (normalized with hyphens)
             version: Package version
             python_version: Python version for spec (or "default" to use system default)
+            python_name: Original Python package name from PyPI (may differ from package_name)
         
         Returns:
             Basic spec file content
@@ -226,6 +232,7 @@ class SpecFileGenerator:
         logger.warning(f"Using fallback spec generation for {package_name}")
         
         rpm_name = self._normalize_package_name(package_name)
+        pypi_name = python_name if python_name else package_name
         version = version or "0.0.1"
         date = datetime.now().strftime("%a %b %d %Y")
         
@@ -236,21 +243,21 @@ class SpecFileGenerator:
         spec_content = f"""Name:           {rpm_name}
 Version:        {version}
 Release:        1%{{?dist}}
-Summary:        Python package {package_name}
+Summary:        Python package {pypi_name}
 
 License:        Unknown
-URL:            https://pypi.org/project/{package_name}
-Source0:        %{{pypi_source {package_name}}}
+URL:            https://pypi.org/project/{pypi_name}
+Source0:        %{{pypi_source {pypi_name}}}
 
 BuildArch:      noarch
 BuildRequires:  python{py_suffix}-devel
 BuildRequires:  pyproject-rpm-macros
 
 %description
-Python package {package_name}
+Python package {pypi_name}
 
 %prep
-%autosetup -n {package_name}-%{{version}}
+%autosetup -n {pypi_name}-%{{version}}
 
 %generate_buildrequires
 %pyproject_buildrequires
@@ -260,7 +267,7 @@ Python package {package_name}
 
 %install
 %pyproject_install
-%pyproject_save_files {package_name.replace('-', '_')}
+%pyproject_save_files {pypi_name.replace('-', '_')}
 
 %files -f %{{pyproject_files}}
 

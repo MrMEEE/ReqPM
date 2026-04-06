@@ -205,6 +205,7 @@ export default function ProjectDetail() {
   const [directSort, setDirectSort] = useState({ key: null, dir: 'asc' });
   const [transitiveSort, setTransitiveSort] = useState({ key: null, dir: 'asc' });
   const [wsConnected, setWsConnected] = useState(false);
+  const [generatingSpecPackages, setGeneratingSpecPackages] = useState(new Set());
   const wsRef = useRef(null);
 
   const { data: project, isLoading, error } = useQuery({
@@ -378,6 +379,9 @@ export default function ProjectDetail() {
       const response = await packagesAPI.generateSpec(packageId, { force: true });
       return response.data;
     },
+    onMutate: (packageId) => {
+      setGeneratingSpecPackages(prev => new Set(prev).add(packageId));
+    },
     onSuccess: (data) => {
       console.log('Spec generation triggered:', data);
       queryClient.invalidateQueries(['project-packages', id]);
@@ -389,6 +393,14 @@ export default function ProjectDetail() {
     onError: (error) => {
       console.error('Spec generation error:', error);
       alert(`Failed to generate spec: ${error.response?.data?.detail || error.message}`);
+    },
+    onSettled: (data, error, packageId) => {
+      // Remove from pending set after completion (success or error)
+      setGeneratingSpecPackages(prev => {
+        const next = new Set(prev);
+        next.delete(packageId);
+        return next;
+      });
     },
   });
 
@@ -592,6 +604,21 @@ export default function ProjectDetail() {
     },
   });
 
+  const regenerateFailedSpecsMutation = useMutation({
+    mutationFn: async () => {
+      const response = await projectsAPI.regenerateFailedSpecs(id);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries(['project-packages', id]);
+      setShowLogs(true);
+      alert(`Regenerating specs for ${data.count} failed package(s)`);
+    },
+    onError: (error) => {
+      alert(`Failed to regenerate specs: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
   const handleBuildPackage = (packageId) => {
     buildPackageMutation.mutate(packageId);
   };
@@ -729,6 +756,15 @@ export default function ProjectDetail() {
                 Regenerate Specs
               </button>
               <button
+                onClick={() => regenerateFailedSpecsMutation.mutate()}
+                disabled={regenerateFailedSpecsMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-50 transition-colors"
+                title="Regenerate spec files only for packages with failed builds"
+              >
+                <Wrench className={`h-4 w-4 ${regenerateFailedSpecsMutation.isPending ? 'animate-spin' : ''}`} />
+                Regen Failed Specs
+              </button>
+              <button
                 onClick={handleFetchAllSources}
                 disabled={fetchAllSourcesMutation.isPending}
                 className="flex items-center gap-2 px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 disabled:opacity-50 transition-colors"
@@ -849,21 +885,10 @@ export default function ProjectDetail() {
               </p>
             </div>
             <div>
-              <label className="text-sm font-medium text-gray-400">RHEL Versions</label>
-              <div className="flex flex-wrap gap-2 mt-1">
-                {project.rhel_versions?.length > 0 ? (
-                  project.rhel_versions.map((version) => (
-                    <span
-                      key={version}
-                      className="px-2 py-1 bg-gray-700 text-gray-200 text-xs rounded"
-                    >
-                      RHEL {version}
-                    </span>
-                  ))
-                ) : (
-                  <span className="text-gray-400 text-sm">No RHEL versions selected</span>
-                )}
-              </div>
+              <label className="text-sm font-medium text-gray-400">RHEL Version</label>
+              <p className="text-sm text-gray-300 mt-1">
+                {project.rhel_version ? `RHEL ${project.rhel_version}` : 'Not specified'}
+              </p>
             </div>
             {project.build_repositories && (
               <div>
@@ -1198,11 +1223,12 @@ export default function ProjectDetail() {
                                   e.stopPropagation();
                                   handleGenerateSpec(pkg.id);
                                 }}
-                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 flex items-center gap-1"
-                                title="Generate SPEC file for this package"
+                                disabled={generatingSpecPackages.has(pkg.id)}
+                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                title={generatingSpecPackages.has(pkg.id) ? "Generating spec..." : "Generate SPEC file for this package"}
                               >
                                 <FileCode className="h-3 w-3" />
-                                Gen Spec
+                                {generatingSpecPackages.has(pkg.id) ? 'Generating...' : 'Gen Spec'}
                               </button>
                               <button
                                 onClick={(e) => {
@@ -1584,11 +1610,12 @@ export default function ProjectDetail() {
                                   e.stopPropagation();
                                   handleGenerateSpec(pkg.id);
                                 }}
-                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 flex items-center gap-1"
-                                title="Generate SPEC file for this package"
+                                disabled={generatingSpecPackages.has(pkg.id)}
+                                className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                                title={generatingSpecPackages.has(pkg.id) ? "Generating spec..." : "Generate SPEC file for this package"}
                               >
                                 <FileCode className="h-3 w-3" />
-                                Gen Spec
+                                {generatingSpecPackages.has(pkg.id) ? 'Generating...' : 'Gen Spec'}
                               </button>
                               <button
                                 onClick={(e) => {
@@ -1911,7 +1938,7 @@ function EditRequirementsModal({ project, onClose, onSuccess }) {
 function EditConfigModal({ project, onClose, onSuccess }) {
   const [formData, setFormData] = useState({
     python_version: project.python_version || 'default',
-    rhel_versions: project.rhel_versions || [],
+    rhel_version: project.rhel_version || '9',
   });
   const [error, setError] = useState('');
 
@@ -1969,31 +1996,30 @@ function EditConfigModal({ project, onClose, onSuccess }) {
 
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-2">
-              RHEL Versions to Build *
+              RHEL Version to Build *
             </label>
             <div className="space-y-2">
               {['8', '9', '10'].map((version) => (
                 <label key={version} className="flex items-center space-x-2 cursor-pointer">
                   <input
-                    type="checkbox"
-                    checked={formData.rhel_versions.includes(version)}
+                    type="radio"
+                    name="rhel_version"
+                    value={version}
+                    checked={formData.rhel_version === version}
                     onChange={(e) => {
-                      const checked = e.target.checked;
                       setFormData(prev => ({
                         ...prev,
-                        rhel_versions: checked
-                          ? [...prev.rhel_versions, version]
-                          : prev.rhel_versions.filter(v => v !== version)
+                        rhel_version: e.target.value
                       }));
                     }}
-                    className="form-checkbox h-4 w-4 text-blue-600 bg-gray-700 border-gray-600 rounded focus:ring-blue-500"
+                    className="form-radio h-4 w-4 text-blue-600 bg-gray-700 border-gray-600 focus:ring-blue-500"
                   />
                   <span className="text-gray-300">RHEL {version}</span>
                 </label>
               ))}
             </div>
             <p className="mt-1 text-xs text-gray-400">
-              Select RHEL versions to build packages for. One build job will be created per version selected.
+              Select RHEL version to build packages for
             </p>
           </div>
 

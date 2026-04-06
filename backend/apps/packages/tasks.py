@@ -128,6 +128,22 @@ def generate_spec_file_task(self, package_id: int, force: bool = False):
                 package.version = pkg_info.version
                 package.save()
                 log_package(package_id, 'debug', f"Updated package version to {pkg_info.version}")
+            
+            # Store the canonical Python package name from PyPI tarball (may differ from normalized RPM name)
+            # Extract from source tarball filename as PyPI metadata name may use hyphens while tarball uses underscores
+            if not package.python_name and pkg_info.source_url:
+                import os
+                import re
+                tarball_name = os.path.basename(pkg_info.source_url)
+                # Extract package name from tarball: package_name-version.tar.gz
+                match = re.match(r'^(.+?)-(\d+.*?)\.tar\.gz$', tarball_name)
+                if match:
+                    python_name = match.group(1)
+                    package.python_name = python_name
+                    package.save(update_fields=['python_name'])
+                    log_package(package_id, 'debug', f"Stored Python package name from tarball: {python_name}")
+                else:
+                    log_package(package_id, 'warning', f"Could not parse tarball name: {tarball_name}")
 
             # Detect build system (only if not already set by user)
             build_system = package.build_system if package.build_system != 'unknown' else 'unknown'
@@ -147,6 +163,7 @@ def generate_spec_file_task(self, package_id: int, force: bool = False):
                 version=pkg_info.version,
                 python_version=python_version,
                 build_system=build_system,
+                python_name=package.python_name,
                 pypi_metadata={'info': pkg_info.__dict__, 'urls': []}
             )
             

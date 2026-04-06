@@ -46,6 +46,8 @@ class Package(models.Model):
     name = models.CharField(max_length=255)
     python_name = models.CharField(
         max_length=255,
+        blank=True,
+        default='',
         help_text=_('Original Python package name from PyPI')
     )
     version = models.CharField(max_length=100)
