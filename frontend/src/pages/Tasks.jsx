@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { List, Search, Filter, CheckCircle, XCircle, Clock, Loader, AlertCircle, ChevronDown, ChevronUp, Terminal, Package, FileCode } from 'lucide-react';
 import { tasksAPI, packagesAPI } from '../lib/api';
 import LiveTaskLog from '../components/LiveTaskLog';
-import LiveBuildLog from '../components/LiveBuildLog';
+import LivePackageBuildLog from '../components/LivePackageBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -343,7 +343,7 @@ export default function Tasks() {
       
       {/* Build Log Modal */}
       {buildLogPackage && (
-        <LiveBuildLog
+        <LivePackageBuildLog
           packageId={buildLogPackage.id}
           packageName={buildLogPackage.name}
           onClose={() => setBuildLogPackage(null)}
