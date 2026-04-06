@@ -62,6 +62,7 @@ class PackageListSerializer(serializers.ModelSerializer):
     source_fetched = serializers.BooleanField(read_only=True)
     source_path = serializers.CharField(read_only=True)
     has_build_log = serializers.SerializerMethodField()
+    waiting_for_dep_names = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
@@ -74,7 +75,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
             'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
-            'has_build_log',
+            'has_build_log', 'waiting_for_dep_names',
             'created_at', 'updated_at', 'last_built_at'
         ]
         read_only_fields = [
@@ -87,6 +88,16 @@ class PackageListSerializer(serializers.ModelSerializer):
     def get_has_build_log(self, obj):
         """Check if a build log exists (without sending the full log)"""
         return bool(obj.build_log)
+
+    def get_waiting_for_dep_names(self, obj):
+        """Names of unbuilt direct deps when the package is in waiting_for_deps state."""
+        if obj.build_status != 'waiting_for_deps':
+            return []
+        return [
+            dep.depends_on.name
+            for dep in obj.dependencies.select_related('depends_on').all()
+            if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
+        ]
 
     def get_dependency_count(self, obj):
         """Get count of dependencies"""

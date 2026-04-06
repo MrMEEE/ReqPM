@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { List, Search, Filter, CheckCircle, XCircle, Clock, Loader, AlertCircle, ChevronDown, ChevronUp, Terminal } from 'lucide-react';
-import { tasksAPI } from '../lib/api';
+import { List, Search, Filter, CheckCircle, XCircle, Clock, Loader, AlertCircle, ChevronDown, ChevronUp, Terminal, Package, FileCode } from 'lucide-react';
+import { tasksAPI, packagesAPI } from '../lib/api';
 import LiveTaskLog from '../components/LiveTaskLog';
+import LiveBuildLog from '../components/LiveBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -31,6 +32,7 @@ export default function Tasks() {
   const [currentPage, setCurrentPage] = useState(1);
   const [expandedTask, setExpandedTask] = useState(null);
   const [liveLogTask, setLiveLogTask] = useState(null);
+  const [buildLogPackage, setBuildLogPackage] = useState(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['tasks', currentPage, statusFilter, search],
@@ -63,6 +65,40 @@ export default function Tasks() {
     if (!name) return 'Unknown Task';
     // Remove module prefix for cleaner display
     return name.split('.').pop().replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+  };
+
+  const getTaskTypeIcon = (context) => {
+    if (!context) return Package;
+    
+    switch (context.type) {
+      case 'build':
+      case 'build_job':
+        return FileCode;
+      case 'package':
+        return Package;
+      case 'project':
+        return List;
+      default:
+        return Package;
+    }
+  };
+
+  const formatTaskContext = (task) => {
+    const context = task.task_context;
+    const relatedPkg = task.related_package;
+    
+    if (!context) return 'General task';
+    
+    let description = context.description || 'Task';
+    
+    if (relatedPkg) {
+      if (relatedPkg.rhel_version) {
+        return `${description}: ${relatedPkg.name} (RHEL ${relatedPkg.rhel_version})`;
+      }
+      return `${description}: ${relatedPkg.name}`;
+    }
+    
+    return description;
   };
 
   if (error) {
@@ -148,6 +184,20 @@ export default function Tasks() {
                         </span>
                       )}
                     </div>
+                    
+                    {/* Task Context - What is it working on */}
+                    {task.task_context && (
+                      <div className="mb-2 flex items-center gap-2">
+                        {(() => {
+                          const Icon = getTaskTypeIcon(task.task_context);
+                          return <Icon className="h-4 w-4 text-blue-400" />;
+                        })()}
+                        <span className="text-sm text-blue-300 font-medium">
+                          {formatTaskContext(task)}
+                        </span>
+                      </div>
+                    )}
+                    
                     <div className="text-xs text-gray-400 space-y-1">
                       <p>
                         <span className="font-medium">Task ID:</span>{' '}
@@ -166,13 +216,27 @@ export default function Tasks() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
+                    {/* Build Log button - only show for package build tasks */}
+                    {task.related_package && (
+                      <button
+                        onClick={() => setBuildLogPackage(task.related_package)}
+                        className="p-2 hover:bg-gray-600 rounded transition-colors text-green-400 hover:text-green-300"
+                        title="View build log"
+                      >
+                        <FileCode className="h-5 w-5" />
+                      </button>
+                    )}
+                    
+                    {/* Task Log button */}
                     <button
                       onClick={() => setLiveLogTask(task)}
                       className="p-2 hover:bg-gray-600 rounded transition-colors text-blue-400 hover:text-blue-300"
-                      title="View live log"
+                      title="View task log"
                     >
                       <Terminal className="h-5 w-5" />
                     </button>
+                    
+                    {/* Expand/Collapse button */}
                     <button
                       onClick={() => toggleExpand(task.id)}
                       className="p-2 hover:bg-gray-600 rounded transition-colors"
@@ -274,6 +338,15 @@ export default function Tasks() {
           taskId={liveLogTask.task_id}
           taskName={liveLogTask.task_name}
           onClose={() => setLiveLogTask(null)}
+        />
+      )}
+      
+      {/* Build Log Modal */}
+      {buildLogPackage && (
+        <LiveBuildLog
+          packageId={buildLogPackage.id}
+          packageName={buildLogPackage.name}
+          onClose={() => setBuildLogPackage(null)}
         />
       )}
     </div>

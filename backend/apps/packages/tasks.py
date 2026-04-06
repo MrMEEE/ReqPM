@@ -44,6 +44,12 @@ def send_package_update(package_id: int):
                         'analyzed_errors': package.analyzed_errors or [],
                         'srpm_path': package.srpm_path,
                         'rpm_path': package.rpm_path,
+                        'waiting_for_dep_names': [
+                            dep.depends_on.name
+                            for dep in package.dependencies.select_related('depends_on').all()
+                            if dep.depends_on
+                            and dep.depends_on.build_status not in ('completed', 'not_required')
+                        ] if package.build_status == 'waiting_for_deps' else [],
                     }
                 }
             )

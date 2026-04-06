@@ -364,72 +364,71 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='build-all-packages')
     def build_all_packages(self, request, pk=None):
         """
-        Build all packages in the project
-        
-        POST /api/projects/{id}/build-all-packages/
-        
-        Triggers builds for all packages that have specs and sources.
-        Only builds packages that haven't been successfully built yet.
-        Builds will be triggered in dependency order (dependencies first).
+        Build all packages in the project.
+
+        Packages whose PackageDependency links are all satisfied (completed /
+        not_required) are set to 'pending' and dispatched immediately.
+        Packages that still have unbuilt deps are set to 'waiting_for_deps'
+        without dispatching a task — trigger_waiting_builds() will dispatch
+        them automatically as each dep finishes.
+
+        This means the DB is updated before the response is returned, so the
+        frontend's post-success refetch sees the correct statuses straight away.
         """
-        from backend.apps.packages.tasks import build_single_package_task
+        from backend.apps.packages.tasks import build_single_package_task, send_package_update
         from backend.apps.packages.models import SpecFileRevision
         from backend.apps.projects.tasks import log_project
-        
+
         project = self.get_object()
-        
-        # Get all packages with specs (source_fetched is a @property, filter in Python)
+
         packages_with_specs = project.packages.filter(
             id__in=SpecFileRevision.objects.values('package_id').distinct()
-        )
-        # Filter for packages that have their sources fetched and are not already successfully built
+        ).prefetch_related('dependencies__depends_on')
+
         packages = [p for p in packages_with_specs if p.source_fetched and p.build_status != 'completed']
-        
+
         if not packages:
             return Response(
                 {'detail': 'No packages need building (all packages are either missing specs/sources or already built)'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Sort packages by dependency order (build dependencies first)
-        # We'll use a simple topological sort based on dependencies
-        package_list = packages
-        build_order = []
-        remaining = set(package_list)
-        
-        while remaining:
-            # Find packages with no unbuilt dependencies in remaining set
-            ready = []
-            for pkg in remaining:
-                deps = set(pkg.dependencies.filter(
-                    depends_on__in=remaining
-                ).values_list('depends_on_id', flat=True))
-                
-                if not deps:
-                    ready.append(pkg)
-            
-            if not ready:
-                # Circular dependency or no progress - add all remaining
-                build_order.extend(remaining)
-                break
-            
-            build_order.extend(ready)
-            for pkg in ready:
-                remaining.remove(pkg)
-        
-        count = len(build_order)
-        
-        # Trigger builds
-        for package in build_order:
-            build_single_package_task.delay(package.id)
-        
-        log_project(project.id, 'info', f"Triggered builds for {count} packages")
-        logger.info(f"Triggered builds for {count} packages in project {project.id}")
-        
+
+        dispatched_count = 0
+        waiting_count = 0
+        all_names = []
+
+        for package in packages:
+            unbuilt_deps = [
+                dep.depends_on.name
+                for dep in package.dependencies.all()
+                if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
+            ]
+
+            package.build_error_message = ''
+            package.build_log = ''
+            all_names.append(package.name)
+
+            if unbuilt_deps:
+                package.build_status = 'waiting_for_deps'
+                package.save()
+                send_package_update(package.id)
+                waiting_count += 1
+            else:
+                package.build_status = 'pending'
+                package.save()
+                send_package_update(package.id)
+                build_single_package_task.delay(package.id)
+                dispatched_count += 1
+
+        count = dispatched_count + waiting_count
+        log_project(project.id, 'info',
+                    f"Build all: {dispatched_count} dispatched immediately, {waiting_count} waiting for deps")
+        logger.info(f"Build all: {dispatched_count} dispatched, {waiting_count} waiting in project {project.id}")
+
         return Response({
             'message': f'Started building {count} packages',
             'count': count,
-            'packages': [pkg.name for pkg in build_order]
+            'packages': all_names
         })
     
     @action(detail=False, methods=['post'])

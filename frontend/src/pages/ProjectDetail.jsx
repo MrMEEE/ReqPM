@@ -1,6 +1,6 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GitBranch, Package, AlertCircle, AlertTriangle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, Hammer, Download, X, Terminal, FileCode, Wrench } from 'lucide-react';
+import { ArrowLeft, GitBranch, Package, AlertCircle, AlertTriangle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, ChevronsUpDown, Hammer, Download, X, Terminal, FileCode, Wrench } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
@@ -153,6 +153,41 @@ const BuildSystemDropdown = ({ packageId, currentBuildSystem, onBuildSystemChang
   );
 };
 
+function sortPackages(list, { key, dir }) {
+  if (!key) return list;
+  return [...list].sort((a, b) => {
+    let av = a[key];
+    let bv = b[key];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (Array.isArray(av)) av = av.length;
+    if (Array.isArray(bv)) bv = bv.length;
+    if (typeof av === 'boolean') { av = av ? 1 : 0; bv = typeof bv === 'boolean' ? (bv ? 1 : 0) : 0; }
+    if (typeof av === 'number' && typeof bv === 'number') return dir === 'asc' ? av - bv : bv - av;
+    const cmp = String(av).toLowerCase().localeCompare(String(bv).toLowerCase());
+    return dir === 'asc' ? cmp : -cmp;
+  });
+}
+
+const SortTh = ({ label, sortKey, sort, onSort }) => {
+  const active = sortKey && sort.key === sortKey;
+  const Icon = active ? (sort.dir === 'asc' ? ChevronUp : ChevronDown) : ChevronsUpDown;
+  return (
+    <th
+      className={`px-4 py-3 text-left text-xs font-medium uppercase tracking-wider ${
+        sortKey ? 'cursor-pointer select-none text-gray-400 hover:text-white' : 'text-gray-400'
+      }`}
+      onClick={sortKey ? () => onSort(sortKey) : undefined}
+    >
+      <span className="inline-flex items-center gap-1">
+        {label}
+        {sortKey && <Icon className={`h-3 w-3 ${active ? 'text-blue-400' : 'opacity-30'}`} />}
+      </span>
+    </th>
+  );
+};
+
 export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -166,6 +201,9 @@ export default function ProjectDetail() {
   const [directPage, setDirectPage] = useState(1);
   const [transitivePage, setTransitivePage] = useState(1);
   const [pageSize] = useState(20);
+  const [packageSearch, setPackageSearch] = useState('');
+  const [directSort, setDirectSort] = useState({ key: null, dir: 'asc' });
+  const [transitiveSort, setTransitiveSort] = useState({ key: null, dir: 'asc' });
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef(null);
 
@@ -542,22 +580,11 @@ export default function ProjectDetail() {
       const response = await projectsAPI.buildAllPackages(id);
       return response.data;
     },
-    onMutate: () => {
-      const setPending = (pkg) => ({ ...pkg, build_status: 'pending' });
-      queryClient.setQueryData(['project-packages', id], (old) => {
-        if (!old) return old;
-        return {
-          ...old,
-          packages: old.packages?.map(setPending),
-          direct_dependencies: old.direct_dependencies?.map(setPending),
-          transitive_dependencies: old.transitive_dependencies?.map(setPending),
-        };
-      });
-    },
     onSuccess: (data) => {
-      alert(`Started building ${data.count} packages`);
-      setShowLogs(true);
+      // Refetch first so real DB statuses load while the alert is visible
       queryClient.invalidateQueries(['project-packages', id]);
+      setShowLogs(true);
+      alert(`Started building ${data.count} packages`);
     },
     onError: (error) => {
       queryClient.invalidateQueries(['project-packages', id]);
@@ -887,11 +914,22 @@ export default function ProjectDetail() {
       {/* Packages - Split into Direct and Transitive Dependencies */}
       <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
         <div className="p-6 border-b border-gray-700">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-4 flex-wrap">
             <h2 className="text-lg font-semibold text-white flex items-center gap-2">
               <Package className="h-5 w-5" />
               Packages ({packagesData?.count || 0})
             </h2>
+            <input
+              type="text"
+              placeholder="Filter packages…"
+              value={packageSearch}
+              onChange={(e) => {
+                setPackageSearch(e.target.value);
+                setDirectPage(1);
+                setTransitivePage(1);
+              }}
+              className="px-3 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-white placeholder-gray-400 focus:outline-none focus:border-blue-500 w-56"
+            />
           </div>
         </div>
         
@@ -899,15 +937,21 @@ export default function ProjectDetail() {
           <div className="space-y-6 p-6">
             {/* Direct Dependencies */}
             {packagesData.direct_dependencies && packagesData.direct_dependencies.length > 0 && (() => {
+              const searchLower = packageSearch.toLowerCase();
+              const filteredDirect = packageSearch
+                ? packagesData.direct_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
+                : packagesData.direct_dependencies;
+              const sortedDirect = sortPackages(filteredDirect, directSort);
               const startIdx = (directPage - 1) * pageSize;
               const endIdx = startIdx + pageSize;
-              const paginatedDirect = packagesData.direct_dependencies.slice(startIdx, endIdx);
-              const totalPages = Math.ceil(packagesData.direct_dependencies.length / pageSize);
+              const paginatedDirect = sortedDirect.slice(startIdx, endIdx);
+              const totalPages = Math.ceil(filteredDirect.length / pageSize);
+              if (filteredDirect.length === 0) return null;
               
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  📋 Direct Dependencies ({packagesData.direct_count || packagesData.direct_dependencies.length})
+                  📋 Direct Dependencies ({packageSearch ? `${filteredDirect.length} of ` : ''}{packagesData.direct_count || packagesData.direct_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Packages from requirements files
                   </span>
@@ -916,39 +960,17 @@ export default function ProjectDetail() {
                   <table className="min-w-full divide-y divide-gray-700">
                     <thead className="bg-gray-900">
                       <tr>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Package Name
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Version
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build System
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Requirements File
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Extras
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build Order
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Status
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Source
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build Status
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          RPM/SRPM
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Actions
-                        </th>
+                        <SortTh label="Package Name" sortKey="name" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Version" sortKey="version" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Build System" sortKey="build_system" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Requirements File" sortKey="requirements_file" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Extras" sortKey={null} sort={directSort} onSort={() => {}} />
+                        <SortTh label="Build Order" sortKey="build_order" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Status" sortKey="status" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Source" sortKey="source_fetched" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Build Status" sortKey="build_status" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="RPM/SRPM" sortKey="rpm_path" sort={directSort} onSort={(k) => { setDirectSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setDirectPage(1); }} />
+                        <SortTh label="Actions" sortKey={null} sort={directSort} onSort={() => {}} />
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-700">
@@ -1062,7 +1084,10 @@ export default function ProjectDetail() {
                               </span>
                             )}
                             {pkg.build_status === 'waiting_for_deps' && (
-                              <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
+                              <span
+                                className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : 'Waiting for dependencies to be built'}
+                              >
                                 <Clock className="h-3 w-3" />
                                 Waiting for deps
                               </span>
@@ -1254,7 +1279,7 @@ export default function ProjectDetail() {
                 {totalPages > 1 && (
                   <div className="mt-4 flex items-center justify-between">
                     <div className="text-sm text-gray-400">
-                      Showing {startIdx + 1} to {Math.min(endIdx, packagesData.direct_dependencies.length)} of {packagesData.direct_dependencies.length} direct dependencies
+                      Showing {startIdx + 1} to {Math.min(endIdx, filteredDirect.length)} of {filteredDirect.length} direct dependencies
                     </div>
                     <div className="flex items-center gap-2">
                       <button
@@ -1285,15 +1310,21 @@ export default function ProjectDetail() {
 
             {/* Transitive Dependencies */}
             {packagesData.transitive_dependencies && packagesData.transitive_dependencies.length > 0 && (() => {
+              const searchLower = packageSearch.toLowerCase();
+              const filteredTransitive = packageSearch
+                ? packagesData.transitive_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
+                : packagesData.transitive_dependencies;
+              const sortedTransitive = sortPackages(filteredTransitive, transitiveSort);
               const startIdx = (transitivePage - 1) * pageSize;
               const endIdx = startIdx + pageSize;
-              const paginatedTransitive = packagesData.transitive_dependencies.slice(startIdx, endIdx);
-              const totalPages = Math.ceil(packagesData.transitive_dependencies.length / pageSize);
+              const paginatedTransitive = sortedTransitive.slice(startIdx, endIdx);
+              const totalPages = Math.ceil(filteredTransitive.length / pageSize);
+              if (filteredTransitive.length === 0) return null;
               
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  🔗 Transitive Dependencies ({packagesData.transitive_count || packagesData.transitive_dependencies.length})
+                  🔗 Transitive Dependencies ({packageSearch ? `${filteredTransitive.length} of ` : ''}{packagesData.transitive_count || packagesData.transitive_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Dependencies of dependencies
                   </span>
@@ -1302,39 +1333,17 @@ export default function ProjectDetail() {
                   <table className="min-w-full divide-y divide-gray-700">
                     <thead className="bg-gray-900">
                       <tr>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Package Name
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Version
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build System
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Depended By
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Extras
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build Order
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Status
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Source
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Build Status
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          RPM/SRPM
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                          Actions
-                        </th>
+                        <SortTh label="Package Name" sortKey="name" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Version" sortKey="version" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Build System" sortKey="build_system" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Depended By" sortKey="dependent_packages" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Extras" sortKey={null} sort={transitiveSort} onSort={() => {}} />
+                        <SortTh label="Build Order" sortKey="build_order" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Status" sortKey="status" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Source" sortKey="source_fetched" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Build Status" sortKey="build_status" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="RPM/SRPM" sortKey="rpm_path" sort={transitiveSort} onSort={(k) => { setTransitiveSort(p => p.key===k ? {key:k,dir:p.dir==='asc'?'desc':'asc'} : {key:k,dir:'asc'}); setTransitivePage(1); }} />
+                        <SortTh label="Actions" sortKey={null} sort={transitiveSort} onSort={() => {}} />
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-700">
@@ -1461,7 +1470,10 @@ export default function ProjectDetail() {
                               </span>
                             )}
                             {pkg.build_status === 'waiting_for_deps' && (
-                              <span className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded flex items-center gap-1">
+                              <span
+                                className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
+                                title={pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : 'Waiting for dependencies to be built'}
+                              >
                                 <Clock className="h-3 w-3" />
                                 Waiting for deps
                               </span>
@@ -1653,7 +1665,7 @@ export default function ProjectDetail() {
                 {totalPages > 1 && (
                   <div className="mt-4 flex items-center justify-between">
                     <div className="text-sm text-gray-400">
-                      Showing {startIdx + 1} to {Math.min(endIdx, packagesData.transitive_dependencies.length)} of {packagesData.transitive_dependencies.length} transitive dependencies
+                      Showing {startIdx + 1} to {Math.min(endIdx, filteredTransitive.length)} of {filteredTransitive.length} transitive dependencies
                     </div>
                     <div className="flex items-center gap-2">
                       <button

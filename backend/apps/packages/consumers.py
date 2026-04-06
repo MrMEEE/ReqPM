@@ -224,14 +224,17 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                             new_content = f.read()
                         
                         if new_content:
-                            # Add a header when we first encounter a file
-                            if last_pos == 0 and len(log_files) > 1:
-                                header = f"\n=== {log_file.name} ===\n"
-                                new_content = header + new_content
+                            # Prefix each line with the filename
+                            prefixed_lines = []
+                            for line in new_content.splitlines():
+                                prefixed_lines.append(f"{log_file.name} - {line}")
+                            prefixed_content = '\n'.join(prefixed_lines)
+                            if prefixed_content:
+                                prefixed_content += '\n'  # Add trailing newline if there was content
                             
                             await self.send(text_data=json.dumps({
                                 'type': 'log',
-                                'data': new_content
+                                'data': prefixed_content
                             }))
                             sent_any = True
                         
@@ -254,9 +257,17 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                             f.seek(last_pos)
                             remaining = f.read()
                         if remaining:
+                            # Prefix each line with the filename
+                            prefixed_lines = []
+                            for line in remaining.splitlines():
+                                prefixed_lines.append(f"{log_file.name} - {line}")
+                            prefixed_content = '\n'.join(prefixed_lines)
+                            if prefixed_content:
+                                prefixed_content += '\n'
+                            
                             await self.send(text_data=json.dumps({
                                 'type': 'log',
-                                'data': remaining
+                                'data': prefixed_content
                             }))
                     except (OSError, IOError):
                         pass

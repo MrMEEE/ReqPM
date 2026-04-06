@@ -2,6 +2,7 @@
 URL configuration for ReqPM project.
 """
 from django.urls import path, include
+from django.views.generic import RedirectView
 from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework.decorators import api_view
@@ -38,6 +39,9 @@ def api_root(request, format=None):
 
 
 urlpatterns = [
+    # Redirect root to API docs
+    path('', RedirectView.as_view(url='/api/docs/', permanent=False)),
+
     # API Root
     path('api/', api_root, name='api-root'),
     

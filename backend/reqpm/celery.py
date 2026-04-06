@@ -37,7 +37,10 @@ def reset_orphaned_builds(**kwargs):
         import django
         django.setup()
         from backend.apps.packages.models import Package
-        stuck = Package.objects.filter(build_status__in=['pending', 'building', 'waiting_for_deps'])
+        # Only reset packages that were actively running when the worker died.
+        # 'waiting_for_deps' is an intentional queued state set by build_all_packages
+        # or the single-package build view — do NOT reset it on startup.
+        stuck = Package.objects.filter(build_status__in=['pending', 'building'])
         count = stuck.count()
         if count:
             ids = list(stuck.values_list('id', flat=True))

@@ -12,6 +12,7 @@ DJANGO_PID="$SCRIPT_DIR/.django.pid"
 REDIS_PID="$SCRIPT_DIR/.redis.pid"
 CELERY_PID="$SCRIPT_DIR/.celery.pid"
 CELERY_BEAT_PID="$SCRIPT_DIR/.celery-beat.pid"
+CELERY_PROJECTS_PID="$SCRIPT_DIR/.celery-projects.pid"
 FRONTEND_PID="$SCRIPT_DIR/.frontend.pid"
 
 # Log files
@@ -21,6 +22,7 @@ DJANGO_LOG="$LOG_DIR/django.log"
 REDIS_LOG="$LOG_DIR/redis.log"
 CELERY_LOG="$LOG_DIR/celery.log"
 CELERY_BEAT_LOG="$LOG_DIR/celery-beat.log"
+CELERY_PROJECTS_LOG="$LOG_DIR/celery-projects.log"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
 
 # Virtual environment
@@ -141,6 +143,32 @@ start_celery() {
     fi
 }
 
+# Function to start the serial projects worker (clone + resolve tasks).
+# concurrency=1 ensures project resolution tasks never run concurrently,
+# preventing SQLite write-lock contention between multiple projects.
+start_celery_projects() {
+    if is_running "$CELERY_PROJECTS_PID"; then
+        print_warning "Celery projects worker is already running (PID: $(cat $CELERY_PROJECTS_PID))"
+        return 0
+    fi
+
+    print_status "Starting Celery projects worker (serial)..."
+
+    source "$VENV/bin/activate"
+
+    nohup celery -A backend.reqpm worker -l info -Q projects --concurrency=1 \
+        --hostname=projects@%h --pidfile="$CELERY_PROJECTS_PID" \
+        > "$CELERY_PROJECTS_LOG" 2>&1 &
+
+    sleep 4
+    if is_running "$CELERY_PROJECTS_PID"; then
+        print_success "Celery projects worker started (PID: $(cat $CELERY_PROJECTS_PID))"
+    else
+        print_error "Failed to start Celery projects worker"
+        return 1
+    fi
+}
+
 # Function to start Celery beat
 start_celery_beat() {
     if is_running "$CELERY_BEAT_PID"; then
@@ -248,6 +276,11 @@ stop_celery() {
     stop_service "Celery worker" "$CELERY_PID"
 }
 
+# Function to stop the serial projects worker
+stop_celery_projects() {
+    stop_service "Celery projects worker" "$CELERY_PROJECTS_PID"
+}
+
 # Function to stop Celery beat
 stop_beat() {
     stop_service "Celery beat" "$CELERY_BEAT_PID"
@@ -277,11 +310,17 @@ status() {
     fi
     
     if is_running "$CELERY_PID"; then
-        print_success "Celery Worker: Running (PID: $(cat $CELERY_PID))"
+        print_success "Celery Worker:          Running (PID: $(cat $CELERY_PID))"
     else
-        print_error "Celery Worker: Stopped"
+        print_error "Celery Worker:          Stopped"
     fi
-    
+
+    if is_running "$CELERY_PROJECTS_PID"; then
+        print_success "Celery Projects Worker: Running (PID: $(cat $CELERY_PROJECTS_PID))"
+    else
+        print_error "Celery Projects Worker: Stopped"
+    fi
+
     if is_running "$CELERY_BEAT_PID"; then
         print_success "Celery Beat:   Running (PID: $(cat $CELERY_BEAT_PID))"
     else
@@ -306,6 +345,7 @@ start_all() {
     start_redis
     start_django
     start_celery
+    start_celery_projects
     start_celery_beat
     start_frontend
     
@@ -321,6 +361,7 @@ stop_all() {
     
     stop_frontend
     stop_beat
+    stop_celery_projects
     stop_celery
     stop_django
     stop_redis
@@ -365,6 +406,11 @@ restart_service() {
             sleep 1
             start_celery
             ;;
+        celery-projects)
+            stop_celery_projects
+            sleep 1
+            start_celery_projects
+            ;;
         beat)
             stop_beat
             sleep 1
@@ -380,7 +426,7 @@ restart_service() {
             ;;
         *)
             print_error "Unknown service: $service"
-            echo "Available: django, redis, celery, beat, frontend, all"
+            echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
             exit 1
             ;;
     esac
@@ -399,6 +445,9 @@ logs() {
             ;;
         celery)
             tail -f "$CELERY_LOG"
+            ;;
+        celery-projects)
+            tail -f "$CELERY_PROJECTS_LOG"
             ;;
         beat)
             tail -f "$CELERY_BEAT_LOG"
@@ -425,12 +474,13 @@ case "${1:-}" in
                 django) start_django ;;
                 redis) start_redis ;;
                 celery) start_celery ;;
+                celery-projects) start_celery_projects ;;
                 beat) start_celery_beat ;;
                 frontend) start_frontend ;;
                 all) start_all ;;
                 *)
                     print_error "Unknown service: $2"
-                    echo "Available: django, redis, celery, beat, frontend, all"
+                    echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
                     exit 1
                     ;;
             esac
@@ -444,12 +494,13 @@ case "${1:-}" in
                 django) stop_django ;;
                 redis) stop_redis ;;
                 celery) stop_celery ;;
+                celery-projects) stop_celery_projects ;;
                 beat) stop_beat ;;
                 frontend) stop_frontend ;;
                 all) stop_all ;;
                 *)
                     print_error "Unknown service: $2"
-                    echo "Available: django, redis, celery, beat, frontend, all"
+                    echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
                     exit 1
                     ;;
             esac

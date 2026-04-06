@@ -54,32 +54,38 @@ class BuildErrorAnalyzer:
             'ambiguous_shebang': {
                 'pattern': r'ambiguous python shebang',
                 'category': 'Ambiguous Python Shebang',
-                'suggestion': 'Run fixpythonshebangs to correct Python shebangs'
+                'suggestion': 'Run fixpythonshebangs to correct Python shebangs',
+                'capture_items': False,
             },
             'empty_debuginfo': {
                 'pattern': r'Empty %files file.*debugsourcefiles\.list',
                 'category': 'Empty Debug Info',
-                'suggestion': 'Remove debug package generation (add %global debug_package %{nil})'
+                'suggestion': 'Remove debug package generation (add %global debug_package %{nil})',
+                'capture_items': False,
             },
             'rust_missing': {
                 'pattern': r'Cargo, the Rust package manager, is not installed',
                 'category': 'Missing Rust/Cargo',
-                'suggestion': 'Add rust and cargo as BuildRequires'
+                'suggestion': 'Add rust and cargo as BuildRequires',
+                'capture_items': False,
             },
             'wheel_missing': {
                 'pattern': r"error: invalid command 'bdist_wheel'",
                 'category': 'Missing Python Wheel',
-                'suggestion': 'Add python3-wheel as BuildRequires'
+                'suggestion': 'Add python3-wheel as BuildRequires',
+                'capture_items': False,
             },
             'gcc_missing': {
                 'pattern': r"error: command 'gcc' failed: No such file or directory",
                 'category': 'Missing GCC',
-                'suggestion': 'Add gcc as BuildRequires'
+                'suggestion': 'Add gcc as BuildRequires',
+                'capture_items': False,
             },
             'noarch_binaries': {
                 'pattern': r'Arch dependent binaries in noarch package',
                 'category': 'Architecture Mismatch',
-                'suggestion': 'Remove BuildArch: noarch from spec file (package contains binaries)'
+                'suggestion': 'Remove BuildArch: noarch from spec file (package contains binaries)',
+                'capture_items': False,
             },
             'bad_interpreter': {
                 'pattern': r'bad interpreter: No such file or directory',
@@ -144,7 +150,26 @@ class BuildErrorAnalyzer:
             'deps_not_satisfied': {
                 'pattern': r'(Not all dependencies satisfied|Some packages could not be found\.)',
                 'category': 'Missing Packages',
-                'suggestion': 'Some required packages are not available in the configured repositories'
+                'suggestion': 'Some required packages are not available in the configured repositories',
+                'capture_items': False,
+            },
+            'invalid_pyproject_license': {
+                'pattern': r'invalid pyproject\.toml config: .project\.license.',
+                'category': 'Invalid Pyproject License',
+                'suggestion': 'Convert license = "SPDX" to license = {text = "SPDX"} in pyproject.toml (PEP 621 compliance)',
+                'capture_items': False,
+            },
+            'setup_py_missing': {
+                'pattern': r"can't open file.*setup\.py.*No such file or directory",
+                'category': 'Missing Setup.py',
+                'suggestion': 'Package uses pyproject.toml only - replace %py3_build/%py3_install with %pyproject_wheel/%pyproject_install',
+                'capture_items': False,
+            },
+            'gxx_missing': {
+                'pattern': r"(FileNotFoundError.*'g\+\+'|command 'g\+\+' failed: No such file)",
+                'category': 'Missing G++ Compiler',
+                'suggestion': 'Add gcc-c++ as BuildRequires',
+                'capture_items': False,
             },
         }
 
@@ -160,22 +185,33 @@ class BuildErrorAnalyzer:
     def _is_package_name(self, item: str) -> bool:
         """
         Reject captured items that are clearly English noise words rather than
-        real package/dep names.  A valid RPM dep name must either:
-          - Contain a package-name character  ( - _ ( ) . digits )
-          - OR be a non-trivial word not in the noise blocklist
-        Items ending with '.' (sentence punctuation) are always rejected.
+        real package/dep names.
+
+        Valid RPM dep strings can contain spaces when version constraints are
+        present, e.g. 'python3dist(hyperlink) >= 21' — we allow those.
+        Pure prose words/sentences are rejected.
         """
         if item.endswith('.'):
             return False
-        # Package names never contain spaces
+
+        # If item contains spaces, only accept it when it looks like an RPM
+        # dep with a version constraint: "<name> <op> <ver>"
+        # where <op> is one of >=, <=, =, >, <, !=
         if ' ' in item:
-            return False
+            # Split on first space; the base name must look package-like
+            base = item.split()[0]
+            rest = item[len(base):].strip()
+            # rest must start with a version operator
+            if not re.match(r'^[><=!]', rest):
+                return False
+            # base must look like a package name (contains non-alpha chars or
+            # is a known rpm-style dep like python3dist(...))
+            if not re.search(r'[-_.()0-9:/]', base):
+                return False
+
         if item.lower() in self._NOISE_WORDS:
             return False
-        # If the item is purely alphabetic (no hyphens, parens, digits, dots),
-        # it's likely a noise word unless it's long enough to be an actual pkg.
-        # Real single-word packages (gcc, rust, make…) pass because they're
-        # not in _NOISE_WORDS; but generic English words are filtered above.
+
         return True
 
     def analyze(self, log_output: str) -> List[BuildError]:
@@ -206,21 +242,29 @@ class BuildErrorAnalyzer:
                     items = matches
                 
                 # Remove duplicates while preserving order, dropping noise words
+                # Only apply package-name filtering for patterns that capture
+                # actual dependency/package names (capture_items=True, default True).
+                capture_items = config.get('capture_items', True)
                 seen = set()
                 unique_items = []
-                for item in items:
-                    item_clean = item.strip().strip("'\"")
-                    if item_clean and item_clean not in seen and self._is_package_name(item_clean):
+                if capture_items:
+                    for item in items:
+                        item_clean = item.strip().strip("'\"")
+                        if not item_clean or item_clean in seen:
+                            continue
+                        if not self._is_package_name(item_clean):
+                            continue
                         seen.add(item_clean)
                         unique_items.append(item_clean)
-                
-                if unique_items:
-                    # Create error with first occurrence message
+
+                # Always create an error if the pattern matched, even when no
+                # items survived filtering (sentinel / detection-only patterns).
+                if matches:
                     error = BuildError(
                         category=category,
-                        message=f"Found {len(unique_items)} occurrence(s)",
+                        message=f"Found {len(unique_items)} occurrence(s)" if unique_items else "Detected",
                         suggestion=suggestion,
-                        items=unique_items[:10]  # Limit to 10 items
+                        items=unique_items[:10]
                     )
                     errors.append(error)
         

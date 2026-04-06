@@ -32,11 +32,15 @@ class PackageInfo:
     
     @property
     def runtime_dependencies(self) -> List[str]:
-        """Get runtime dependencies only"""
+        """Get mandatory runtime dependencies (no optional extras)."""
         deps = []
         for req in self.requires_dist:
-            # Skip test/dev/docs dependencies
-            if any(marker in req.lower() for marker in ['extra == "test"', 'extra == "dev"', 'extra == "docs"']):
+            # Skip anything that is conditional on an extra being requested.
+            # A bare `extra ==` anywhere in the marker means the dep is optional
+            # and should not be included unless the caller explicitly installs
+            # that extra (e.g. pip install pkg[speedups]).
+            req_lower = req.lower()
+            if 'extra ==' in req_lower or 'extra==' in req_lower:
                 continue
             deps.append(req)
         return deps

@@ -247,90 +247,140 @@ def analyze_requirements_task(self, project_id: int):
 @shared_task(bind=True, max_retries=3)
 def resolve_dependencies_task(self, project_id: int):
     """
-    Resolve dependencies for all packages in a project
-    
-    Args:
-        project_id: ID of the project
+    Resolve dependencies for all packages in a project.
+
+    Structured in two phases to minimise SQLite write-lock contention:
+      Phase 1 – collect all data from PyPI (no DB writes, network I/O only).
+      Phase 2 – apply all DB changes inside a single transaction.atomic() block
+                 so the write lock is held for milliseconds, not minutes.
     """
     try:
+        from django.db import transaction
+        from django.db.models import Count
         from backend.apps.packages.models import Package, PackageDependency
         from backend.core.pypi_client import PyPIClient
-        
+
         project = Project.objects.get(id=project_id)
-        packages = Package.objects.filter(project=project)
-        
+
         log_project(project_id, 'info', "Starting dependency resolution...")
-        
+
         pypi_client = PyPIClient()
         resolver = DependencyResolver()
-        
-        # Build dependency tree
-        dependency_tree = {}
-        new_packages = []  # Track newly created packages for spec generation
-        
+
+        packages = list(Package.objects.filter(project=project).prefetch_related('extras'))
+
+        # ------------------------------------------------------------------
+        # Phase 1: collect PyPI data — no DB writes, all network I/O here.
+        # pkg_resolved[package]: list of (dep_name, dep_version) tuples
+        # ------------------------------------------------------------------
+        pkg_resolved: dict = {}
         for package in packages:
-            # Get package info from PyPI
-            pkg_info = pypi_client.get_package_info(package.python_name or package.name, package.version or None)
-            
-            if pkg_info:
-                # Store runtime dependencies
-                deps = []
-                for dep_req in pkg_info.runtime_dependencies:
-                    dep_name = pypi_client._parse_package_name(dep_req)
-                    if dep_name:
-                        deps.append(dep_name)
-                        
-                        # Get version from PyPI for transitive dependencies
-                        dep_info = pypi_client.get_package_info(dep_name)
-                        dep_version = dep_info.version if dep_info else None
-                        
-                        # Create or get dependency package
-                        dep_package, created = Package.objects.get_or_create(
-                            project=project,
-                            name=dep_name,
-                            defaults={
-                                'python_name': dep_name,
-                                'version': dep_version or '',
-                                'package_type': 'dependency',
-                                'is_direct_dependency': False,
-                            }
-                        )
-                        
-                        if created:
-                            new_packages.append(dep_package.id)
-                        
-                        # Update version if not set
-                        if not dep_package.version and dep_version:
-                            dep_package.version = dep_version
-                            dep_package.save()
-                        
-                        # Create dependency link
-                        PackageDependency.objects.get_or_create(
-                            package=package,
-                            depends_on=dep_package,
-                            defaults={'dependency_type': 'runtime'}
-                        )
-                
-                dependency_tree[package.name] = deps
-        
-        # Calculate build order
-        build_levels = resolver.calculate_build_order(dependency_tree)
-        
-        # Assign build order to packages
-        for level_index, level_packages in enumerate(build_levels):
-            for pkg_name in level_packages:
-                Package.objects.filter(
-                    project=project,
-                    name=pkg_name
-                ).update(build_order=level_index)
-        
-        # Generate specs for newly created transitive dependencies
+            pkg_info = pypi_client.get_package_info(
+                package.python_name or package.name,
+                package.version or None,
+            )
+            if not pkg_info:
+                continue
+
+            # Mandatory runtime deps + any enabled-extra deps
+            dep_requirements = list(pkg_info.runtime_dependencies)
+            enabled_extras = [e for e in package.extras.all() if e.enabled]
+            for extra in enabled_extras:
+                if extra.dependencies:
+                    for req in extra.dependencies.split(','):
+                        req = req.strip()
+                        if req:
+                            dep_requirements.append(req)
+
+            if enabled_extras:
+                extra_names = [e.name for e in enabled_extras]
+                log_project(project_id, 'debug',
+                            f"{package.name}: including deps from extras: {extra_names}")
+
+            seen: set = set()
+            dep_list: list = []
+            for dep_req in dep_requirements:
+                dep_name = pypi_client._parse_package_name(dep_req)
+                if not dep_name or dep_name in seen:
+                    continue
+                seen.add(dep_name)
+                dep_info = pypi_client.get_package_info(dep_name)
+                dep_list.append((dep_name, dep_info.version if dep_info else None))
+
+            pkg_resolved[package] = dep_list
+
+        # ------------------------------------------------------------------
+        # Phase 2: all DB mutations in one atomic block.
+        # SQLite holds a write lock only for this section, not during PyPI I/O.
+        # ------------------------------------------------------------------
+        new_packages: list = []
+        dependency_tree: dict = {}
+
+        with transaction.atomic():
+            # Wipe old links so re-runs are idempotent (stale extras gone too).
+            PackageDependency.objects.filter(package__project=project).delete()
+
+            for package, dep_list in pkg_resolved.items():
+                dep_names = []
+                for dep_name, dep_version in dep_list:
+                    dep_names.append(dep_name)
+
+                    dep_package, created = Package.objects.get_or_create(
+                        project=project,
+                        name=dep_name,
+                        defaults={
+                            'python_name': dep_name,
+                            'version': dep_version or '',
+                            'package_type': 'dependency',
+                            'is_direct_dependency': False,
+                        }
+                    )
+                    if created:
+                        new_packages.append(dep_package.id)
+
+                    if not dep_package.version and dep_version:
+                        dep_package.version = dep_version
+                        dep_package.save(update_fields=['version'])
+
+                    PackageDependency.objects.get_or_create(
+                        package=package,
+                        depends_on=dep_package,
+                        defaults={'dependency_type': 'runtime'},
+                    )
+
+                dependency_tree[package.name] = dep_names
+
+            # Prune transitive packages no longer reachable.
+            orphaned = Package.objects.filter(
+                project=project,
+                is_direct_dependency=False,
+            ).annotate(
+                parent_count=Count('dependents'),
+            ).filter(parent_count=0)
+            orphaned_count = orphaned.count()
+            if orphaned_count:
+                log_project(project_id, 'info',
+                            f"Pruning {orphaned_count} orphaned transitive package(s) no longer required")
+                orphaned.delete()
+
+            # Assign build order.
+            build_levels = resolver.calculate_build_order(dependency_tree)
+            for level_index, level_packages in enumerate(build_levels):
+                for pkg_name in level_packages:
+                    Package.objects.filter(
+                        project=project,
+                        name=pkg_name,
+                    ).update(build_order=level_index)
+
+        # Generate specs for newly created transitive dependencies (outside
+        # the transaction so spec-gen tasks aren't delayed by the lock).
         if new_packages:
-            log_project(project_id, 'info', f"Generating specs for {len(new_packages)} new transitive dependencies")
+            log_project(project_id, 'info',
+                        f"Generating specs for {len(new_packages)} new transitive dependencies")
             from backend.apps.packages.tasks import generate_spec_file_task
             for pkg_id in new_packages:
                 generate_spec_file_task.delay(pkg_id, force=True)
-        
+
         log_project(project_id, 'info', f"Dependency resolution complete: {len(build_levels)} build levels, {len(new_packages)} new packages")
         logger.info(f"Resolved dependencies for project {project_id}: {len(build_levels)} build levels")
     

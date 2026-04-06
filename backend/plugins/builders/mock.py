@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from .base import BaseBuilder, BuildResult
 from backend.core.gpg_key_manager import get_gpg_key_manager
+from backend.core.log_merger import merge_log_file_paths
 import logging
 
 logger = logging.getLogger(__name__)
@@ -559,13 +560,14 @@ class MockBuilder(BaseBuilder):
         
         # Read detailed logs from Mock's result directory
         # Mock writes detailed logs to build.log and root.log files
-        detailed_log = ""
         build_log_path = Path(output_dir) / "build.log"
         root_log_path = Path(output_dir) / "root.log"
+        state_log_path = Path(output_dir) / "state.log"
         
         logger.info(f"Checking for Mock logs in: {output_dir}")
         logger.info(f"build.log exists: {build_log_path.exists()}")
         logger.info(f"root.log exists: {root_log_path.exists()}")
+        logger.info(f"state.log exists: {state_log_path.exists()}")
         
         # List all files in the output directory for debugging
         try:
@@ -576,27 +578,17 @@ class MockBuilder(BaseBuilder):
         except Exception as e:
             logger.warning(f"Could not list output directory: {e}")
         
-        if build_log_path.exists():
-            try:
-                with open(build_log_path, 'r', encoding='utf-8', errors='replace') as f:
-                    build_log_content = f.read()
-                    detailed_log += f"=== Mock Build Log ({len(build_log_content)} bytes) ===\n{build_log_content}\n\n"
-                    logger.info(f"Read build.log: {len(build_log_content)} bytes")
-            except Exception as e:
-                logger.warning(f"Could not read build.log: {e}")
-        else:
-            logger.warning(f"build.log not found at {build_log_path}")
+        # Merge all log files with timestamps and filename prefixes
+        log_paths = [p for p in [build_log_path, root_log_path, state_log_path] if p.exists()]
+        detailed_log = merge_log_file_paths(log_paths, sort_by_time=True)
         
-        if root_log_path.exists():
+        # Log file sizes for debugging
+        for log_path in log_paths:
             try:
-                with open(root_log_path, 'r', encoding='utf-8', errors='replace') as f:
-                    root_log_content = f.read()
-                    detailed_log += f"=== Mock Root Log ({len(root_log_content)} bytes) ===\n{root_log_content}\n\n"
-                    logger.info(f"Read root.log: {len(root_log_content)} bytes")
+                size = log_path.stat().st_size
+                logger.info(f"Read {log_path.name}: {size} bytes")
             except Exception as e:
-                logger.warning(f"Could not read root.log: {e}")
-        else:
-            logger.warning(f"root.log not found at {root_log_path}")
+                logger.warning(f"Could not stat {log_path.name}: {e}")
         
         # Combine stdout/stderr with detailed logs
         log_output = f"=== Mock Command Output ===\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\n{detailed_log}"

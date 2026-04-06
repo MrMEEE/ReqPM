@@ -19,9 +19,13 @@ AUTO_FIXABLE_CATEGORIES = {
     'Missing Python Modules',
     'Missing Python Wheel',
     'Missing GCC',
+    'Missing G++ Compiler',
     'Ambiguous Python Shebang',
     'Empty Debug Info',
     'Architecture Mismatch',
+    'Invalid Pyproject License',
+    'Missing Setup.py',
+    'Unpackaged Files',
 }
 
 
@@ -84,6 +88,24 @@ class SpecFixer:
 
             elif category == 'Architecture Mismatch':
                 content, applied = self._fix_arch_mismatch(content)
+                fixes.extend(applied)
+
+            elif category == 'Invalid Pyproject License':
+                content, applied = self._fix_pyproject_license(content)
+                fixes.extend(applied)
+
+            elif category == 'Missing G++ Compiler':
+                content, applied = self._add_buildrequires_items(content, ['gcc-c++'])
+                fixes.extend(applied)
+
+            elif category == 'Missing Setup.py':
+                content, applied = self._fix_legacy_macros(content)
+                fixes.extend(applied)
+
+            elif category == 'Unpackaged Files':
+                # Extract file list from error items or log
+                # This will be filled in by extracting from build log
+                content, applied = self._fix_unpackaged_files(content, error)
                 fixes.extend(applied)
 
         return content, fixes
@@ -212,3 +234,164 @@ class SpecFixer:
             flags=re.MULTILINE | re.IGNORECASE,
         )
         return fixed, ['Removed BuildArch: noarch (package contains arch-dependent binaries)']
+
+    def _fix_pyproject_license(self, spec: str) -> tuple:
+        """
+        Inject a sed patch after %autosetup to convert a bare SPDX license string
+        in pyproject.toml to the PEP 621-compliant table form.
+
+        Transforms:  license = "MIT"
+        Into:        license = {text = "MIT"}
+
+        This is needed for packages whose pyproject.toml pre-dates PEP 639.
+        """
+        # sed_cmd is also the idempotency marker -- if it's already in the spec
+        # then a previous fix_and_rebuild already applied this patch.
+        sed_cmd = r"""sed -i 's/^license = "\(.*\)"/license = {text = "\1"}/' pyproject.toml 2>/dev/null || true"""
+        if sed_cmd in spec:
+            return spec, []
+
+        fix_msg = 'Patched pyproject.toml: converted bare license string to {text = "..."} (PEP 621)'
+
+        # Inject after %autosetup (use lambda to prevent re.sub from interpreting
+        # backslashes in sed_cmd as regex backreferences)
+        if '%autosetup' in spec:
+            new_spec = re.sub(
+                r'(%autosetup\b[^\n]*)',
+                lambda m: m.group(1) + '\n' + sed_cmd,
+                spec,
+                count=1,
+            )
+            if new_spec != spec:
+                return new_spec, [fix_msg]
+
+        # Fallback: inject after %setup
+        if '%setup' in spec:
+            new_spec = re.sub(
+                r'(%setup\b[^\n]*)',
+                lambda m: m.group(1) + '\n' + sed_cmd,
+                spec,
+                count=1,
+            )
+            if new_spec != spec:
+                return new_spec, [fix_msg]
+
+        return spec, []
+
+    def _fix_legacy_macros(self, spec: str) -> tuple:
+        """
+        Replace legacy %py3_build and %py3_install macros with modern pyproject macros.
+        
+        This fixes packages that use pyproject.toml but have specs generated with
+        old-style macros that expand to 'python3 setup.py build/install'.
+        
+        Conversions:
+        - %py3_build -> %pyproject_wheel
+        - %py3_install -> %pyproject_install
+        - Also adds necessary BuildRequires and %generate_buildrequires section
+        """
+        applied = []
+        content = spec
+        
+        # Replace macros
+        if '%py3_build' in content:
+            content = re.sub(r'%py3_build\b', '%pyproject_wheel', content)
+            applied.append('Replaced %py3_build with %pyproject_wheel')
+        
+        if '%py3_install' in content:
+            content = re.sub(r'%py3_install\b', '%pyproject_install', content)
+            applied.append('Replaced %py3_install with %pyproject_install')
+        
+        # Also handle variants
+        if '%python_build' in content:
+            content = re.sub(r'%python_build\b', '%pyproject_wheel', content)
+            applied.append('Replaced %python_build with %pyproject_wheel')
+        
+        if '%python_install' in content:
+            content = re.sub(r'%python_install\b', '%pyproject_install', content)
+            applied.append('Replaced %python_install with %pyproject_install')
+        
+        # Replace literal python3 setup.py commands
+        if 'python3 setup.py build' in content:
+            content = re.sub(r'/usr/bin/python3\s+setup\.py\s+build[^\n]*', '%pyproject_wheel', content)
+            applied.append('Replaced literal "python3 setup.py build" with %pyproject_wheel')
+        
+        if 'python3 setup.py install' in content:
+            content = re.sub(r'/usr/bin/python3\s+setup\.py\s+install[^\n]*', '%pyproject_install', content)
+            applied.append('Replaced literal "python3 setup.py install" with %pyproject_install')
+        
+        # If we made any changes, ensure pyproject-rpm-macros is present
+        if applied:
+            if 'pyproject-rpm-macros' not in content:
+                # Add pyproject-rpm-macros as BuildRequires
+                if 'BuildRequires' in content:
+                    content = re.sub(
+                        r'(BuildRequires\s*:)',
+                        'BuildRequires:  pyproject-rpm-macros\n\\1',
+                        content,
+                        count=1,
+                    )
+                    applied.append('Added BuildRequires: pyproject-rpm-macros')
+            
+            # Ensure %generate_buildrequires section exists
+            if '%generate_buildrequires' not in content:
+                # Insert before %build section
+                content = re.sub(
+                    r'^(%build)',
+                    '%generate_buildrequires\n%pyproject_buildrequires\n\n\\1',
+                    content,
+                    flags=re.MULTILINE,
+                    count=1,
+                )
+                applied.append('Added %generate_buildrequires section with %pyproject_buildrequires')
+            elif '%pyproject_buildrequires' not in content:
+                # %generate_buildrequires exists but no %pyproject_buildrequires
+                content = re.sub(
+                    r'^(%generate_buildrequires)',
+                    '\\1\n%pyproject_buildrequires',
+                    content,
+                    flags=re.MULTILINE,
+                    count=1,
+                )
+                applied.append('Added %pyproject_buildrequires to %generate_buildrequires section')
+        
+        return content, applied
+
+    def _fix_unpackaged_files(self, spec: str, error: dict) -> tuple:
+        """
+        Handle unpackaged files by making the %files section more comprehensive.
+        
+        For now, we use a simple approach: replace overly specific %files patterns
+        with more inclusive ones. A more sophisticated approach would parse the
+        actual list from the build log.
+        """
+        applied = []
+        content = spec
+        
+        # Check if %files section only has %{python3_sitelib}/* or similar
+        # If so, add common additional patterns
+        if '%files' in content:
+            # Check if we have a very minimal %files section
+            files_section_match = re.search(
+                r'(%files[^\n]*\n)(.*?)(?=\n%|\Z)', 
+                content, 
+                re.MULTILINE | re.DOTALL
+            )
+            
+            if files_section_match:
+                files_header = files_section_match.group(1)
+                files_content = files_section_match.group(2).strip()
+                
+                # If %files only has sitelib entries, add common extras
+                if '%{python3_sitelib}' in files_content and '%{_bindir}' not in files_content:
+                    # Add %{_bindir}/* for scripts (with wildcard so it doesn't fail if empty)
+                    new_files = files_header + '%{_bindir}/*\n' + files_content
+                    
+                    # Replace the old %files section with the new one
+                    content = content.replace(
+                        files_section_match.group(0),
+                        new_files
+                    )
+                    applied.append('Added %{_bindir}/* to %files section for executable scripts')
+        
+        return content, applied

@@ -116,6 +116,11 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {
+                # Wait up to 30 s for a write lock instead of immediately raising
+                # "database is locked" when multiple Celery workers write concurrently.
+                'timeout': 30,
+            },
         }
     }
 
@@ -224,6 +229,15 @@ CELERY_TASK_SOFT_TIME_LIMIT = 3300  # 55 minutes
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 1000
 CELERY_RESULT_EXTENDED = True  # Store task arguments and more details
+
+# Route project-level tasks to a dedicated queue consumed by a single-concurrency
+# worker.  This prevents concurrent resolution runs from fighting over the SQLite
+# write lock when multiple projects are created or re-synced at the same time.
+CELERY_TASK_ROUTES = {
+    'backend.apps.projects.tasks.clone_project_task': {'queue': 'projects'},
+    'backend.apps.projects.tasks.resolve_dependencies_task': {'queue': 'projects'},
+    'backend.apps.projects.tasks.sync_all_projects_task': {'queue': 'projects'},
+}
 
 # Django Guardian settings
 AUTHENTICATION_BACKENDS = (
