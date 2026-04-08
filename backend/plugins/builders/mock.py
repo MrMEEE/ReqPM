@@ -561,8 +561,17 @@ class MockBuilder(BaseBuilder):
             '--resultdir', output_dir,
             '--no-clean',  # Reuse bootstrap chroot
             '--rpmbuild-opts=--nocheck',  # Skip tests
-            '--rebuild', srpm_path,
         ]
+
+        # Add project-local repo so already-built packages in this project are
+        # available as build dependencies without needing to be in a remote repo.
+        local_repo_dir = kwargs.get('local_repo_dir')
+        if local_repo_dir and Path(local_repo_dir).exists():
+            repo_url = f'file://{local_repo_dir}'
+            args += ['--addrepo', repo_url]
+            logger.info(f"Adding project local repo: {repo_url}")
+
+        args += ['--rebuild', srpm_path]
         
         logger.info(f"Building RPM with Mock: {target} {arch} (uniqueext={unique_ext})")
         

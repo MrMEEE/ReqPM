@@ -759,14 +759,23 @@ def build_single_package_task(self, package_id: int):
             # Build RPM
             logger.info(f"Building RPM for {package.name}")
             log_package(package_id, 'info', "Building RPM...")
-            
+
+            # Ensure all already-built packages in this project are available
+            # as build dependencies by pointing mock at the project-local repo.
+            try:
+                local_repo_dir = _update_project_local_repo(project.id, [], rhel_version=rhel_version)
+            except Exception as e:
+                logger.warning(f"Could not prepare project local repo for {package.name}: {e}")
+                local_repo_dir = None
+
             arch = 'x86_64'
             rpm_result = builder.build_rpm(
                 srpm_path=srpm_result.srpm_path,
                 output_dir=str(build_dir / 'RPMS'),
                 target=target,
                 arch=arch,
-                unique_ext=f"pkg{package_id}"
+                unique_ext=f"pkg{package_id}",
+                local_repo_dir=local_repo_dir,
             )
             
             if not rpm_result.success:
@@ -781,6 +790,8 @@ def build_single_package_task(self, package_id: int):
                     fixed = True
                 # Check if there are unpackaged files that need to be added to %files
                 elif _detect_and_fix_unpackaged_files(package_id, rpm_result.log_output or ''):
+                    fixed = True
+                elif _detect_and_fix_wrong_module_glob(package_id, rpm_result.log_output or ''):
                     fixed = True
                 
                 if fixed:
@@ -899,7 +910,15 @@ def build_single_package_task(self, package_id: int):
                 package.analyzed_errors = []
             package.save()
             send_package_update(package_id)
-            
+
+            # Add newly built RPMs to the project-local repo so subsequent
+            # builds in the same project can depend on them.
+            try:
+                _update_project_local_repo(project.id, rpm_result.rpm_paths or [], rhel_version=rhel_version)
+                log_package(package_id, 'info', "RPMs added to project local repo")
+            except Exception as e:
+                logger.warning(f"Could not update project local repo after build of {package.name}: {e}")
+
             log_project(project.id, 'info', f"Build completed for {package.name}")
             log_package(package_id, 'info', f"Build completed successfully")
             logger.info(f"Build completed for package {package_id}: {rpm_file}")
@@ -1154,7 +1173,11 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         
         # Modify the %files section to include the unpackaged files
         spec_content = current_spec.content
-        
+
+        # If the spec uses %pyproject_save_files, site-packages files are already
+        # covered by %{pyproject_files}. Only add files outside that scope (e.g. /usr/bin/).
+        uses_pyproject_save = '%pyproject_save_files' in spec_content
+
         # Convert file paths to RPM macros where applicable
         files_to_add = []
         for file_path in unpackaged_files:
@@ -1162,6 +1185,10 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
                 # Use RPM macro for /usr/bin
                 script_name = file_path[len('/usr/bin/'):]
                 files_to_add.append(f'%{{_bindir}}/{script_name}')
+            elif file_path.startswith('/usr/lib/python') and uses_pyproject_save:
+                # Already handled by %pyproject_save_files — skip to avoid "listed twice"
+                logger.info(f"Skipping site-packages path already covered by %pyproject_save_files: {file_path}")
+                continue
             elif file_path.startswith('/usr/lib/'):
                 # Keep as-is or use appropriate macro
                 files_to_add.append(file_path)
@@ -1177,7 +1204,11 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         # Current: %files -f %{pyproject_files}
         # New: %files -f %{pyproject_files}\n<additional files>
         files_pattern = r'(%files\s+-f\s+%\{pyproject_files\})'
-        
+
+        if not files_to_add:
+            logger.info(f"All unpackaged files already covered by %pyproject_save_files for {package_id}")
+            return False
+
         if re.search(files_pattern, spec_content):
             # Add the unpackaged files after the %files line
             additional_files = '\n'.join(files_to_add)
@@ -1208,6 +1239,140 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         logger.error(f"Error in unpackaged files detection/fix for package {package_id}: {e}")
         log_package(package_id, 'error', f'Error in auto-fix: {e}')
         return False
+
+
+def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
+    """
+    Detect the 'Globs did not match any module: <name>' error from
+    pyproject_save_files and fix the spec by replacing the bad glob with *.
+
+    This happens for namespace packages (e.g. poetry-core installs as
+    poetry/core/ not poetry_core/) where the dist-info name doesn't match
+    the actual installed module directory.
+
+    Returns True if the fix was applied, False otherwise.
+    """
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.error_analyzer import BuildErrorAnalyzer
+    from backend.core.spec_fixer import SpecFixer
+
+    _GLOB_ERRORS = (
+        'Globs did not match any module',
+        'Attempted to use a namespaced package with . in the glob',
+    )
+    if not any(s in build_log for s in _GLOB_ERRORS):
+        return False
+
+    logger.info(f"Detected wrong module glob error for package {package_id}")
+    log_package(package_id, 'info', 'Detected wrong %pyproject_save_files glob — will try with +auto')
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+
+        if not current_spec:
+            logger.warning(f"No spec file found for package {package_id}")
+            return False
+
+        analyzer = BuildErrorAnalyzer()
+        errors = analyzer.analyze(build_log)
+        fixer = SpecFixer()
+        error_dicts = [
+            {'category': e.category, 'items': e.items, 'message': e.message, 'suggestion': e.suggestion}
+            for e in errors
+        ]
+        new_spec, fixes = fixer.apply_fixes(current_spec.content, error_dicts)
+
+        if not fixes:
+            logger.warning(f"SpecFixer produced no fixes for wrong module glob on {package.name}")
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_spec,
+            commit_message=f'Auto-fixed: replaced bad %pyproject_save_files glob with * ({"; ".join(fixes)})'
+        )
+        log_package(package_id, 'info', f'Auto-fixed spec: {"; ".join(fixes)}')
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in wrong_module_glob fix for package {package_id}: {e}")
+        return False
+
+
+def _update_project_local_repo(project_id: int, rpm_paths: list, rhel_version: int = None) -> str:
+    """
+    Copy newly built RPMs into a per-project, per-RHEL-version local DNF repo
+    and run createrepo_c so subsequent builds within the same project can depend
+    on them.
+
+    RPMs are stored under build_artifacts/projects/<id>/el<N>/  (e.g. el10).
+    This avoids mixing el9 and el10 packages which would cause ABI conflicts
+    when mock tries to satisfy BuildRequires inside the target chroot.
+
+    If rhel_version is given explicitly, all RPMs go into that folder and the
+    function returns its path.  If not given, each RPM is auto-routed to the
+    folder matching its own .elN. suffix and the function returns the 'common'
+    fallback directory (callers that need a specific path should pass rhel_version).
+
+    Returns the absolute path to the versioned repo directory for rhel_version
+    (or 'common' when rhel_version is None).
+    """
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+    from django.conf import settings
+
+    base = Path(settings.REQPM['BUILD_DIR']) / 'projects' / str(project_id)
+
+    def _repo_dir_for_version(ver):
+        label = f'el{ver}' if ver else 'common'
+        d = base / label
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    dirs_to_update = set()
+
+    for rpm_path in (rpm_paths or []):
+        if not rpm_path or not Path(rpm_path).exists():
+            continue
+
+        # Determine which folder this RPM belongs in.
+        if rhel_version is not None:
+            target_ver = rhel_version
+        else:
+            m = re.search(r'\.el(\d+)\.', Path(rpm_path).name)
+            target_ver = int(m.group(1)) if m else None
+
+        repo_dir = _repo_dir_for_version(target_ver)
+        dest = repo_dir / Path(rpm_path).name
+        if not dest.exists():
+            shutil.copy2(rpm_path, dest)
+            label = f'el{target_ver}' if target_ver else 'common'
+            logger.info(f"Copied {Path(rpm_path).name} into project {project_id}/{label} local repo")
+        dirs_to_update.add(repo_dir)
+
+    # Ensure the target version directory always exists (even when no RPMs given)
+    primary_dir = _repo_dir_for_version(rhel_version)
+    dirs_to_update.add(primary_dir)
+
+    # Rebuild repo metadata for every affected directory
+    for repo_dir in dirs_to_update:
+        try:
+            result = subprocess.run(
+                ['createrepo_c', '--update', str(repo_dir)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning(f"createrepo_c failed for {repo_dir}: {result.stderr}")
+        except Exception as e:
+            logger.warning(f"createrepo_c exception for {repo_dir}: {e}")
+
+    return str(primary_dir)
 
 
 def _normalize_dep_names(item: str):
