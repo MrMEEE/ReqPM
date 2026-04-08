@@ -29,7 +29,6 @@ class GPGKeyManager:
     """
     
     DISTRIBUTION_GPG_KEYS_REPO = "https://github.com/rpm-software-management/distribution-gpg-keys.git"
-    DISTRIBUTION_GPG_KEYS_DIR = "/usr/share/distribution-gpg-keys"
     
     def __init__(self, cache_dir: Optional[str] = None):
         """
@@ -110,16 +109,12 @@ class GPGKeyManager:
             if not self._copy_keys_to_cache():
                 return False, "Failed to copy keys to cache"
             
-            # Update system keys
-            if not self._update_system_keys():
-                return False, "Failed to update system keys"
-            
             # Update timestamp
             timestamp_file = Path(self.cache_dir) / ".last_update"
             with open(timestamp_file, 'w') as f:
                 f.write(datetime.now().isoformat())
             
-            logger.info("Successfully updated GPG keys")
+            logger.info("Successfully updated GPG keys in cache directory")
             return True, "GPG keys updated successfully"
             
         except Exception as e:
@@ -226,69 +221,6 @@ class GPGKeyManager:
             logger.error(f"Error copying keys to cache: {e}")
             return False
     
-    def _update_system_keys(self) -> bool:
-        """
-        Update system GPG keys directory
-        
-        Returns:
-            True if successful
-        """
-        try:
-            # Check if we need sudo privileges
-            if not os.access(self.DISTRIBUTION_GPG_KEYS_DIR, os.W_OK):
-                logger.info(f"Using sudo to update system keys at {self.DISTRIBUTION_GPG_KEYS_DIR}")
-                
-                # Create backup
-                backup_dir = f"{self.DISTRIBUTION_GPG_KEYS_DIR}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                if Path(self.DISTRIBUTION_GPG_KEYS_DIR).exists():
-                    result = subprocess.run(
-                        ['sudo', 'cp', '-a', self.DISTRIBUTION_GPG_KEYS_DIR, backup_dir],
-                        capture_output=True,
-                        text=True,
-                        timeout=60
-                    )
-                    
-                    if result.returncode != 0:
-                        logger.warning(f"Failed to create backup: {result.stderr}")
-                
-                # Update system keys
-                result = subprocess.run(
-                    ['sudo', 'rsync', '-av', '--delete', 
-                     str(self.keys_dir) + '/',
-                     self.DISTRIBUTION_GPG_KEYS_DIR + '/'],
-                    capture_output=True,
-                    text=True,
-                    timeout=300
-                )
-                
-                if result.returncode != 0:
-                    logger.error(f"Failed to update system keys: {result.stderr}")
-                    return False
-                
-                logger.info(f"System keys updated successfully at {self.DISTRIBUTION_GPG_KEYS_DIR}")
-                return True
-            else:
-                # We have write access, copy directly
-                logger.info(f"Updating system keys at {self.DISTRIBUTION_GPG_KEYS_DIR}")
-                
-                # Create backup
-                if Path(self.DISTRIBUTION_GPG_KEYS_DIR).exists():
-                    backup_dir = f"{self.DISTRIBUTION_GPG_KEYS_DIR}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    shutil.copytree(self.DISTRIBUTION_GPG_KEYS_DIR, backup_dir)
-                
-                # Update keys
-                if Path(self.DISTRIBUTION_GPG_KEYS_DIR).exists():
-                    shutil.rmtree(self.DISTRIBUTION_GPG_KEYS_DIR)
-                
-                shutil.copytree(self.keys_dir, self.DISTRIBUTION_GPG_KEYS_DIR)
-                
-                logger.info("System keys updated successfully")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error updating system keys: {e}")
-            return False
-    
     def get_key_info(self, distribution: str = "redhat") -> Dict[str, any]:
         """
         Get information about available keys for a distribution
@@ -334,25 +266,23 @@ class GPGKeyManager:
     
     def verify_keys_installed(self) -> Tuple[bool, str]:
         """
-        Verify that GPG keys are properly installed
+        Verify that GPG keys are properly installed in cache
         
         Returns:
             Tuple of (success, message)
         """
         try:
-            system_keys_dir = Path(self.DISTRIBUTION_GPG_KEYS_DIR)
-            
-            if not system_keys_dir.exists():
-                return False, f"System keys directory not found: {system_keys_dir}"
+            if not self.keys_dir.exists():
+                return False, f"Keys cache directory not found: {self.keys_dir}"
             
             # Check for Red Hat keys
-            redhat_keys = list(system_keys_dir.glob('redhat/RPM-GPG-KEY-*'))
+            redhat_keys = list(self.keys_dir.glob('redhat/RPM-GPG-KEY-*'))
             
             if not redhat_keys:
-                return False, "No Red Hat GPG keys found in system directory"
+                return False, "No Red Hat GPG keys found in cache directory"
             
-            logger.info(f"Found {len(redhat_keys)} Red Hat GPG keys")
-            return True, f"Found {len(redhat_keys)} Red Hat GPG keys"
+            logger.info(f"Found {len(redhat_keys)} Red Hat GPG keys in cache")
+            return True, f"Found {len(redhat_keys)} Red Hat GPG keys in cache"
             
         except Exception as e:
             error_msg = f"Error verifying keys: {e}"

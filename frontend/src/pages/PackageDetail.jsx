@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
 import { useState } from 'react';
+import { useToast } from '../contexts/ToastContext';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -26,6 +27,7 @@ export default function PackageDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const toast = useToast();
   
   const [editingSpec, setEditingSpec] = useState(null);
   const [specContent, setSpecContent] = useState('');
@@ -117,7 +119,7 @@ export default function PackageDetail() {
       queryClient.invalidateQueries(['package-logs', id]);
     },
     onError: (error) => {
-      alert(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -146,11 +148,11 @@ export default function PackageDetail() {
 
   const handleSaveSpec = () => {
     if (!specContent.trim()) {
-      alert('Spec content cannot be empty');
+      toast.warning('Spec content cannot be empty');
       return;
     }
     if (!commitMessage.trim()) {
-      alert('Commit message is required');
+      toast.warning('Commit message is required');
       return;
     }
     saveSpecMutation.mutate({

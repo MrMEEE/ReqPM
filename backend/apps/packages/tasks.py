@@ -4,6 +4,7 @@ Celery tasks for package operations
 from celery import shared_task
 from django.conf import settings
 import logging
+import os
 
 from backend.core.spec_generator import SpecFileGenerator
 from backend.core.pypi_client import PyPIClient
@@ -571,7 +572,11 @@ def build_single_package_task(self, package_id: int):
             # Prepare build directory
             build_dir = Path(settings.REQPM['BUILD_DIR']) / 'package_builds' / str(package_id)
             build_dir.mkdir(parents=True, exist_ok=True)
-            
+
+            # Delete any stale log files from a previous build so the live consumer
+            # doesn't re-stream old content on this fresh build.
+            _delete_build_log_files(build_dir)
+
             spec_file = build_dir / f"{package.name}.spec"
             
             # Copy sources from project source directory to build directory
@@ -591,12 +596,47 @@ def build_single_package_task(self, package_id: int):
                 return
             
             # Copy all source files to build directory (excluding .spec files)
+            # Fix filename mismatches for PyPI packages during copy
+            # PyPI downloads use normalized names (lowercase, underscores) but spec files
+            # may reference the original package name (CamelCase, hyphens)
+            # HOWEVER: For packages with dots or hyphens in the name, DON'T rename the tarball
+            # because PyPI normalizes both the tarball AND directory names to underscores,
+            # and renaming the tarball causes RPM spec macros to expect wrong directory names.
             logger.info(f"Copying sources for {package.name} from {sources_dir} to {build_dir}")
+            import re
             try:
+                # Check if package name has dots or hyphens - if so, don't rename tarballs
+                has_special_chars = '.' in package.python_name or '-' in package.python_name
+                
                 for source_file in sources_dir.glob('*'):
                     if source_file.is_file() and source_file.suffix != '.spec':
-                        shutil.copy2(source_file, build_dir)
-                        logger.debug(f"Copied {source_file.name}")
+                        # Check if this is a tarball that needs renaming
+                        match = re.match(r'^(.+?)-(\d+.*?)\.tar\.gz$', source_file.name)
+                        if match and source_file.suffix == '.gz' and not has_special_chars:
+                            # Only rename if package name has NO dots or hyphens
+                            tarball_pkg_name = match.group(1)
+                            tarball_version = match.group(2)
+                            
+                            # If the tarball name doesn't match package.name, rename it during copy
+                            if tarball_pkg_name != package.name:
+                                expected_name = f"{package.name}-{tarball_version}.tar.gz"
+                                dest_path = build_dir / expected_name
+                                shutil.copy2(source_file, dest_path)
+                                logger.info(f"Copied and renamed: {source_file.name} -> {expected_name}")
+                                log_package(package_id, 'debug', f"Renamed source file: {source_file.name} -> {expected_name}")
+                            else:
+                                # Name matches, just copy
+                                shutil.copy2(source_file, build_dir)
+                                logger.debug(f"Copied {source_file.name}")
+                        else:
+                            # Not a tarball, doesn't match pattern, or package has dots/hyphens - just copy as-is
+                            shutil.copy2(source_file, build_dir)
+                            if has_special_chars and '.tar.gz' in source_file.name:
+                                logger.info(f"Copied {source_file.name} without renaming (package has dots/hyphens)")
+                                log_package(package_id, 'debug', f"Kept original filename: {source_file.name}")
+                            else:
+                                logger.debug(f"Copied {source_file.name}")
+                            
             except Exception as e:
                 package.build_status = 'failed'
                 package.build_completed_at = timezone.now()
@@ -642,32 +682,79 @@ def build_single_package_task(self, package_id: int):
             )
             
             if not srpm_result.success:
-                package.build_completed_at = timezone.now()
-                package.build_error_message = f"SRPM build failed: {srpm_result.error_message}"
-                package.build_log = srpm_result.log_output
-                # Analyze build log for structured errors
-                try:
-                    analyzer = BuildErrorAnalyzer()
-                    errors = analyzer.analyze(srpm_result.log_output or '')
-                    package.analyzed_errors = [
-                        {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
-                        for e in errors
-                    ]
-                except Exception as analyze_err:
-                    logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
-                    package.analyzed_errors = []
-                # Use specific status if missing packages were detected
-                missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
-                if any(e.get('category') in missing_cats for e in package.analyzed_errors):
-                    package.build_status = _resolve_missing_dep_status(package, project)
-                else:
-                    package.build_status = 'failed'
-                package.save()
-                send_package_update(package_id)
-                log_project(project.id, 'error', f"Build failed for {package.name}: SRPM build failed")
-                log_package(package_id, 'error', f"SRPM build failed: {srpm_result.error_message}")
-                logger.error(f"SRPM build failed for {package.name}: {srpm_result.error_message}")
-                return
+                # Check if this is a directory mismatch error that can be auto-fixed
+                if _detect_and_fix_directory_mismatch(package_id, srpm_result.log_output or ''):
+                    # Spec file was regenerated, retry the build
+                    logger.info(f"Retrying build for {package.name} after fixing directory mismatch")
+                    log_package(package_id, 'info', 'Retrying build with regenerated spec file...')
+                    
+                    # Clear build log and old disk log files before retry
+                    package.build_log = ''
+                    package.save()
+                    _delete_build_log_files(build_dir)
+                    
+                    # Re-fetch the package and spec
+                    package.refresh_from_db()
+                    spec_revision = SpecFileRevision.objects.filter(
+                        package=package
+                    ).order_by('-created_at').first()
+                    
+                    if spec_revision:
+                        # Write the new spec file
+                        spec_file = build_dir / f"{package.name}.spec"
+                        spec_file.write_text(spec_revision.content)
+                        logger.info(f"Updated spec file for {package.name}")
+                        
+                        # Retry SRPM build with new spec
+                        logger.info(f"Retrying SRPM build for {package.name}")
+                        log_package(package_id, 'info', "Rebuilding SRPM with fixed spec...")
+                        
+                        srpm_result = builder.build_srpm(
+                            spec_file=str(spec_file),
+                            sources_dir=str(build_dir),
+                            output_dir=str(build_dir / 'SRPMS'),
+                            target=target
+                        )
+                        
+                        # If it still fails after retry, fall through to normal error handling
+                        if not srpm_result.success:
+                            logger.warning(f"SRPM build still failed after directory mismatch fix for {package.name}")
+                
+                # If still failing (or wasn't a directory mismatch), handle as normal error
+                if not srpm_result.success:
+                    package.build_completed_at = timezone.now()
+                    package.build_error_message = f"SRPM build failed: {srpm_result.error_message}"
+                    package.build_log = srpm_result.log_output
+                    package.build_root_log = srpm_result.root_log_output
+                    # Analyze build log for structured errors (combine build.log + root.log)
+                    try:
+                        analyzer = BuildErrorAnalyzer()
+                        combined_log = (srpm_result.log_output or '') + '\n' + (srpm_result.root_log_output or '')
+                        errors = analyzer.analyze(combined_log)
+                        package.analyzed_errors = [
+                            {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
+                            for e in errors
+                        ]
+                    except Exception as analyze_err:
+                        logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
+                        package.analyzed_errors = []
+                    # Use specific status if missing packages were detected
+                    missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
+                    if any(e.get('category') in missing_cats for e in package.analyzed_errors):
+                        package.build_status = _resolve_missing_dep_status(package, project)
+                        # Auto-add missing dependencies to transitive dependency list
+                        try:
+                            auto_add_missing_dependencies(package_id)
+                        except Exception as auto_add_err:
+                            logger.warning(f"Error auto-adding dependencies for {package.name}: {auto_add_err}")
+                    else:
+                        package.build_status = 'failed'
+                    package.save()
+                    send_package_update(package_id)
+                    log_project(project.id, 'error', f"Build failed for {package.name}: SRPM build failed")
+                    log_package(package_id, 'error', f"SRPM build failed: {srpm_result.error_message}")
+                    logger.error(f"SRPM build failed for {package.name}: {srpm_result.error_message}")
+                    return
             
             # Build RPM
             logger.info(f"Building RPM for {package.name}")
@@ -683,32 +770,114 @@ def build_single_package_task(self, package_id: int):
             )
             
             if not rpm_result.success:
-                package.build_completed_at = timezone.now()
-                package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
-                package.build_log = rpm_result.log_output
-                # Analyze build log for structured errors
-                try:
-                    analyzer = BuildErrorAnalyzer()
-                    errors = analyzer.analyze(rpm_result.log_output or '')
-                    package.analyzed_errors = [
-                        {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
-                        for e in errors
-                    ]
-                except Exception as analyze_err:
-                    logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
-                    package.analyzed_errors = []
-                # Use specific status if missing packages were detected
-                missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
-                if any(e.get('category') in missing_cats for e in package.analyzed_errors):
-                    package.build_status = _resolve_missing_dep_status(package, project)
-                else:
-                    package.build_status = 'failed'
-                package.save()
-                send_package_update(package_id)
-                log_project(project.id, 'error', f"Build failed for {package.name}: RPM build failed")
-                log_package(package_id, 'error', f"RPM build failed: {rpm_result.error_message}")
-                logger.error(f"RPM build failed for {package.name}: {rpm_result.error_message}")
-                return
+                # Check for auto-fixable errors
+                fixed = False
+                
+                # Check if this is a directory mismatch error that can be auto-fixed
+                if _detect_and_fix_directory_mismatch(package_id, rpm_result.log_output or ''):
+                    fixed = True
+                # Check if build files (pyproject.toml/setup.py) are missing
+                elif _detect_and_fix_missing_build_files(package_id, rpm_result.log_output or ''):
+                    fixed = True
+                # Check if there are unpackaged files that need to be added to %files
+                elif _detect_and_fix_unpackaged_files(package_id, rpm_result.log_output or ''):
+                    fixed = True
+                
+                if fixed:
+                    # Spec file was regenerated, retry the build from SRPM
+                    logger.info(f"Retrying build for {package.name} after auto-fix")
+                    log_package(package_id, 'info', 'Retrying full build with regenerated spec file...')
+                    
+                    # Clear build log and old disk log files before retry
+                    package.build_log = ''
+                    package.save()
+                    _delete_build_log_files(build_dir)
+                    
+                    # Re-fetch the package and spec
+                    package.refresh_from_db()
+                    spec_revision = SpecFileRevision.objects.filter(
+                        package=package
+                    ).order_by('-created_at').first()
+                    
+                    if spec_revision:
+                        # Write the new spec file
+                        spec_file = build_dir / f"{package.name}.spec"
+                        spec_file.write_text(spec_revision.content)
+                        logger.info(f"Updated spec file for {package.name}")
+                        
+                        # Debug: Verify spec content
+                        if 'BUILD_SUBDIR' in spec_revision.content:
+                            logger.info(f"✓ Spec has BUILD_SUBDIR subdirectory search logic")
+                            log_package(package_id, 'info', 'Using spec with subdirectory search logic')
+                        else:
+                            logger.warning(f"✗ Spec does NOT have BUILD_SUBDIR logic!")
+                            log_package(package_id, 'warning', 'Spec missing subdirectory search logic')
+                        
+                        # Rebuild both SRPM and RPM with new spec
+                        logger.info(f"Rebuilding SRPM for {package.name} from {spec_file}")
+                        log_package(package_id, 'info', "Rebuilding SRPM with fixed spec...")
+                        
+                        srpm_result = builder.build_srpm(
+                            spec_file=str(spec_file),
+                            sources_dir=str(build_dir),
+                            output_dir=str(build_dir / 'SRPMS'),
+                            target=target
+                        )
+                        
+                        if srpm_result.success:
+                            logger.info(f"Rebuilding RPM for {package.name}")
+                            log_package(package_id, 'info', "Rebuilding RPM...")
+                            
+                            rpm_result = builder.build_rpm(
+                                srpm_path=srpm_result.srpm_path,
+                                output_dir=str(build_dir / 'RPMS'),
+                                target=target,
+                                arch=arch,
+                                unique_ext=f"pkg{package_id}"
+                            )
+                            
+                            # If it still fails after retry, fall through to normal error handling
+                            if not rpm_result.success:
+                                logger.warning(f"RPM build still failed after auto-fix for {package.name}")
+                        else:
+                            logger.warning(f"SRPM rebuild failed after auto-fix for {package.name}")
+                            rpm_result.success = False
+                
+                # If still failing (or wasn't an auto-fixable error), handle as normal error
+                if not rpm_result.success:
+                    package.build_completed_at = timezone.now()
+                    package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
+                    package.build_log = rpm_result.log_output
+                    package.build_root_log = rpm_result.root_log_output
+                    # Analyze build log for structured errors (combine build.log + root.log)
+                    try:
+                        analyzer = BuildErrorAnalyzer()
+                        combined_log = (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or '')
+                        errors = analyzer.analyze(combined_log)
+                        package.analyzed_errors = [
+                            {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
+                            for e in errors
+                        ]
+                    except Exception as analyze_err:
+                        logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
+                        package.analyzed_errors = []
+                    # Use specific status if missing packages were detected
+                    missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
+                    if any(e.get('category') in missing_cats for e in package.analyzed_errors):
+                        package.build_status = _resolve_missing_dep_status(package, project)
+                        # Auto-add missing dependencies to transitive dependency list
+                        try:
+                            auto_add_missing_dependencies(package_id)
+                        except Exception as auto_add_err:
+                            logger.warning(f"Error auto-adding dependencies for {package.name}: {auto_add_err}")
+                    else:
+                        package.build_status = 'failed'
+                    package.save()
+                    send_package_update(package_id)
+                    log_project(project.id, 'error', f"Build failed for {package.name}: RPM build failed")
+                    log_package(package_id, 'error', f"RPM build failed: {rpm_result.error_message}")
+                    logger.error(f"RPM build failed for {package.name}: {rpm_result.error_message}")
+                    return
             
             # Update package with success
             rpm_file = rpm_result.rpm_paths[0] if rpm_result.rpm_paths else None
@@ -770,14 +939,288 @@ def build_single_package_task(self, package_id: int):
             pass
 
 
+def _delete_build_log_files(build_dir):
+    """Delete old disk log files before a retry so the consumer doesn't re-stream stale content."""
+    for log_name in ('build.log', 'root.log', 'state.log'):
+        for sub in ('RPMS', 'SRPMS', ''):
+            log_path = (build_dir / sub / log_name) if sub else (build_dir / log_name)
+            if log_path.exists():
+                try:
+                    log_path.unlink()
+                    logger.info(f"Deleted stale log file before retry: {log_path}")
+                except Exception as e:
+                    logger.warning(f"Could not delete {log_path}: {e}")
+
+
+def _detect_and_fix_directory_mismatch(package_id: int, build_log: str):
+    """
+    Detect if build failed due to directory name mismatch (cd: <dir>: No such file).
+    This happens when PyPI normalizes package names (hyphens/dots to underscores) but
+    spec file still expects original name.
+    
+    If detected, regenerates the spec file with corrected directory name and returns True.
+    Returns False if not a directory mismatch error or fix failed.
+    """
+    import re
+    import importlib
+    from backend.apps.packages.models import Package, SpecFileRevision
+    import backend.core.spec_generator as spec_gen_module
+    
+    # Force reload to pick up any code changes
+    importlib.reload(spec_gen_module)
+    
+    logger.info(f"Checking for directory mismatch in package {package_id}")
+    
+    # Check if this is a directory mismatch error
+    # Pattern matches: "cd: <dirname>: No such file" or "line X: cd: <dirname>: No such file"
+    match = re.search(r'cd:\s+([^:]+):\s+No such file', build_log)
+    if not match:
+        logger.info(f"No directory mismatch detected for package {package_id}")
+        return False
+    
+    expected_dir = match.group(1)
+    logger.info(f"Detected directory mismatch for package {package_id}: expected '{expected_dir}'")
+    log_package(package_id, 'info', f'Detected directory mismatch: expected {expected_dir}')
+    
+    try:
+        package = Package.objects.get(id=package_id)
+        
+        # Directory mismatch detected - regenerate spec with fallback logic
+        # This handles both old specs (with %autosetup) and ensures new specs have fallback
+        logger.info(f"Regenerating spec file for {package.name} to fix directory mismatch...")
+        log_package(package_id, 'info', 'Regenerating spec file to fix directory mismatch...')
+        
+        # Regenerate spec file synchronously using SpecFileGenerator
+        generator = spec_gen_module.SpecFileGenerator()
+        new_spec_content = generator.generate_spec(
+            package_name=package.name,
+            version=package.version,
+            python_name=package.python_name
+        )
+        
+        if new_spec_content:
+            # Create a new spec revision
+            new_revision = SpecFileRevision.objects.create(
+                package=package,
+                content=new_spec_content,
+                commit_message='Auto-regenerated to fix directory name mismatch with fallback logic'
+            )
+            logger.info(f"Successfully regenerated spec file for {package.name}")
+            log_package(package_id, 'info', 'Auto-regenerated spec with directory fallback logic')
+            return True
+        else:
+            logger.warning(f"Failed to generate new spec content for {package.name}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error in directory mismatch detection/fix for package {package_id}: {e}")
+        log_package(package_id, 'error', f'Error in auto-fix: {e}')
+        return False
+
+
+def _detect_and_fix_missing_build_files(package_id: int, build_log: str):
+    """
+    Detect if build failed because pyproject.toml/setup.py weren't found in the expected location.
+    This happens when build files are in a subdirectory of the extracted tarball.
+    
+    If detected, regenerates the spec file with subdirectory search logic and returns True.
+    Returns False if not this error type or fix failed.
+    """
+    import re
+    import importlib
+    from backend.apps.packages.models import Package, SpecFileRevision
+    import backend.core.spec_generator as spec_gen_module
+    
+    # Force reload to pick up any code changes
+    importlib.reload(spec_gen_module)
+    
+    logger.info(f"Checking for missing build files in package {package_id}")
+    
+    # Check if this is a missing build files error
+    # Pattern matches: "Neither pyproject.toml nor setup.py found"
+    if 'Neither pyproject.toml nor setup.py found' not in build_log:
+        logger.info(f"No missing build files error detected for package {package_id}")
+        return False
+    
+    logger.info(f"Detected missing build files for package {package_id}")
+    log_package(package_id, 'info', 'Detected missing build files (may be in subdirectory)')
+    
+    try:
+        package = Package.objects.get(id=package_id)
+        
+        # Regenerate spec with subdirectory search logic
+        logger.info(f"Regenerating spec file for {package.name} with build file search...")
+        log_package(package_id, 'info', 'Regenerating spec to handle nested build files...')
+        
+        # Regenerate spec file synchronously using SpecFileGenerator
+        generator = spec_gen_module.SpecFileGenerator()
+        new_spec_content = generator.generate_spec(
+            package_name=package.name,
+            version=package.version,
+            python_name=package.python_name
+        )
+        
+        if new_spec_content:
+            # Create a new spec revision
+            new_revision = SpecFileRevision.objects.create(
+                package=package,
+                content=new_spec_content,
+                commit_message='Auto-regenerated to handle build files in subdirectories'
+            )
+            logger.info(f"Successfully regenerated spec file for {package.name}")
+            log_package(package_id, 'info', 'Auto-regenerated spec with subdirectory build file search')
+            return True
+        else:
+            logger.warning(f"Failed to generate new spec content for {package.name}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error in missing build files detection/fix for package {package_id}: {e}")
+        log_package(package_id, 'error', f'Error in auto-fix: {e}')
+        return False
+
+
+def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
+    """
+    Detect if build failed because some installed files were not included in %files section.
+    This commonly happens when packages install scripts to /usr/bin or other system directories.
+    
+    If detected, regenerates the spec file with additional files in %files section and returns True.
+    Returns False if not this error type or fix failed.
+    """
+    import re
+    import importlib
+    from backend.apps.packages.models import Package, SpecFileRevision
+    
+    logger.info(f"Checking for unpackaged files in package {package_id}")
+    
+    # Check if this is an unpackaged files error (case-insensitive, handles "build.log - " prefix)
+    if not re.search(r'installed \(but unpackaged\) file\(s\) found:', build_log, re.IGNORECASE):
+        logger.info(f"No unpackaged files error detected for package {package_id}")
+        return False
+    
+    logger.info(f"Detected unpackaged files error for package {package_id}")
+    log_package(package_id, 'info', 'Detected unpackaged files error')
+    
+    # Strip "filename.log - " prefix used in merged log format (e.g. "build.log - content")
+    _prefix_re = re.compile(r'^[\w.-]+\.log\s*-\s*')
+    def _strip_prefix(line):
+        m = _prefix_re.match(line)
+        return line[m.end():] if m else line
+    
+    try:
+        # Extract the unpackaged file paths from the log
+        # Pattern: After "Installed (but unpackaged) file(s) found:", there are indented file paths
+        unpackaged_files = []
+        lines = build_log.split('\n')
+        in_unpackaged_section = False
+        
+        for line in lines:
+            stripped_line = _strip_prefix(line)
+            if re.search(r'installed \(but unpackaged\) file\(s\) found:', stripped_line, re.IGNORECASE):
+                in_unpackaged_section = True
+                continue
+            
+            if in_unpackaged_section:
+                # Unpackaged files are indented (may have "build.log -     /path" format)
+                raw_stripped = stripped_line.strip()
+                if raw_stripped and raw_stripped.startswith('/'):
+                    unpackaged_files.append(raw_stripped)
+                    logger.info(f"Found unpackaged file: {raw_stripped}")
+                elif raw_stripped and not raw_stripped.startswith('/'):
+                    # Any non-empty, non-path line ends the unpackaged files section
+                    break
+        
+        if not unpackaged_files:
+            logger.warning("Unpackaged files error detected but couldn't extract file paths")
+            return False
+
+        # Deduplicate while preserving order
+        unpackaged_files = list(dict.fromkeys(unpackaged_files))
+
+        logger.info(f"Found {len(unpackaged_files)} unpackaged file(s): {unpackaged_files}")
+        log_package(package_id, 'info', f'Found {len(unpackaged_files)} unpackaged file(s)')
+        
+        package = Package.objects.get(id=package_id)
+        
+        # Get the current spec file
+        current_spec = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+        
+        if not current_spec:
+            logger.warning(f"No spec file found for package {package_id}")
+            return False
+        
+        # Modify the %files section to include the unpackaged files
+        spec_content = current_spec.content
+        
+        # Convert file paths to RPM macros where applicable
+        files_to_add = []
+        for file_path in unpackaged_files:
+            if file_path.startswith('/usr/bin/'):
+                # Use RPM macro for /usr/bin
+                script_name = file_path[len('/usr/bin/'):]
+                files_to_add.append(f'%{{_bindir}}/{script_name}')
+            elif file_path.startswith('/usr/lib/'):
+                # Keep as-is or use appropriate macro
+                files_to_add.append(file_path)
+            elif file_path.startswith('/usr/share/'):
+                # Use RPM macro for /usr/share
+                rel_path = file_path[len('/usr/share/'):]
+                files_to_add.append(f'%{{_datadir}}/{rel_path}')
+            else:
+                # Keep as-is for other paths
+                files_to_add.append(file_path)
+        
+        # Find and replace the %files section
+        # Current: %files -f %{pyproject_files}
+        # New: %files -f %{pyproject_files}\n<additional files>
+        files_pattern = r'(%files\s+-f\s+%\{pyproject_files\})'
+        
+        if re.search(files_pattern, spec_content):
+            # Add the unpackaged files after the %files line
+            additional_files = '\n'.join(files_to_add)
+            new_files_section = f'%files -f %{{pyproject_files}}\n{additional_files}'
+            new_spec_content = re.sub(
+                files_pattern,
+                new_files_section,
+                spec_content
+            )
+            
+            logger.info(f"Updated %files section with {len(files_to_add)} additional file(s)")
+            log_package(package_id, 'info', f'Adding {len(files_to_add)} file(s) to %files section')
+            
+            # Create a new spec revision with the modified content
+            new_revision = SpecFileRevision.objects.create(
+                package=package,
+                content=new_spec_content,
+                commit_message=f'Auto-fixed: Added {len(files_to_add)} unpackaged file(s) to %files section'
+            )
+            logger.info(f"Successfully updated spec file for {package.name}")
+            log_package(package_id, 'info', 'Auto-regenerated spec with additional files in %files section')
+            return True
+        else:
+            logger.warning(f"Could not find %files section pattern in spec for {package.name}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error in unpackaged files detection/fix for package {package_id}: {e}")
+        log_package(package_id, 'error', f'Error in auto-fix: {e}')
+        return False
+
+
 def _normalize_dep_names(item: str):
     """
     Normalize a single rpm dep string to a list of candidate package names.
     E.g. 'python3dist(requests) >= 2.0' -> ['python3-requests', 'requests']
+    E.g. '(python3dist(flit-core) < 4~~ with ...)' -> ['python3-flit-core', 'flit-core']
     """
     import re
-    # Strip version constraints
-    item = re.split(r'\s*[><=!]', item)[0].strip()
+    # Strip leading/trailing parentheses and whitespace
+    item = item.strip().strip('()')
+    # Strip version constraints (handle 'with' keyword for complex constraints)
+    item = re.split(r'\s+(with|[><=!])', item)[0].strip()
     # python3dist(foo-bar) or python3dist(foo_bar)
     m = re.match(r'python3?dist\(([^)]+)\)', item, re.IGNORECASE)
     if m:
@@ -842,6 +1285,192 @@ def _resolve_missing_dep_status(package, project):
         return 'dep_build_pending'
 
     return 'missing_packages'
+
+
+def auto_add_missing_dependencies(package_id: int):
+    """
+    Automatically add missing dependencies to the project's transitive dependency list.
+    
+    When a build fails due to missing packages/dependencies, this function:
+    1. Extracts missing package names from analyzed_errors
+    2. Normalizes them to Python package names
+    3. Checks if they already exist in the project (direct or transitive)
+    4. For new packages, fetches info from PyPI and adds them as transitive dependencies
+    5. Records dependency relationship (which package depends on which)
+    
+    Args:
+        package_id: ID of the package that failed with missing dependencies
+    """
+    from backend.apps.packages.models import Package, PackageDependency
+    from backend.core.pypi_client import PyPIClient
+    from backend.apps.projects.tasks import log_project
+    
+    try:
+        package = Package.objects.select_related('project').get(id=package_id)
+        project = package.project
+        
+        # Categories that indicate missing packages/dependencies
+        missing_cats = {
+            'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+            'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
+        }
+        
+        # Extract all missing items from analyzed errors
+        missing_items = []
+        for error in (package.analyzed_errors or []):
+            if error.get('category') in missing_cats:
+                items = error.get('items', [])
+                missing_items.extend(items)
+        
+        if not missing_items:
+            logger.debug(f"No missing dependencies found for package {package.name}")
+            return
+        
+        logger.info(f"Found {len(missing_items)} missing items for {package.name}: {missing_items}")
+        log_package(package_id, 'info', f"Analyzing {len(missing_items)} missing dependencies...")
+        
+        # Normalize dependency names to Python package names
+        candidate_packages = set()
+        for item in missing_items:
+            normalized_names = _normalize_dep_names(item)
+            for name in normalized_names:
+                # Extract base package name (remove python3- prefix, handle special cases)
+                clean_name = name.lower()
+                if clean_name.startswith('python3-'):
+                    clean_name = clean_name[8:]  # Remove 'python3-' prefix
+                elif clean_name.startswith('python-'):
+                    clean_name = clean_name[7:]  # Remove 'python-' prefix
+                
+                # Skip system packages that aren't Python packages
+                skip_packages = {
+                    'gcc', 'gcc-c++', 'g++', 'cargo', 'rust', 'wheel',
+                    'setuptools', 'pip', 'mock', 'rpm-build'
+                }
+                if clean_name not in skip_packages:
+                    candidate_packages.add(clean_name)
+        
+        if not candidate_packages:
+            logger.debug(f"No Python packages to add (only system packages)")
+            return
+        
+        # Check which packages already exist in the project
+        existing_packages = Package.objects.filter(
+            project=project,
+            name__in=[name.replace('_', '-') for name in candidate_packages] + list(candidate_packages)
+        ).values_list('name', flat=True)
+        existing_names_lower = {name.lower().replace('-', '_') for name in existing_packages}
+        
+        # Add missing packages that don't exist
+        pypi_client = PyPIClient()
+        added_count = 0
+        failed_count = 0
+        
+        for pkg_name in candidate_packages:
+            # Normalize package name for comparison (use underscore as canonical)
+            normalized = pkg_name.replace('-', '_')
+            
+            if normalized in existing_names_lower:
+                # Package exists - still create dependency relationship
+                existing_pkg = Package.objects.filter(
+                    project=project,
+                    name__iexact=normalized.replace('_', '-')
+                ).first()
+                if not existing_pkg:
+                    existing_pkg = Package.objects.filter(
+                        project=project,
+                        name__iexact=normalized
+                    ).first()
+                
+                if existing_pkg:
+                    # Create dependency relationship if it doesn't exist
+                    PackageDependency.objects.get_or_create(
+                        package=package,
+                        depends_on=existing_pkg,
+                        defaults={'dependency_type': PackageDependency.DependencyType.BUILD}
+                    )
+                    logger.debug(f"Package {pkg_name} already exists, created dependency relationship")
+                continue
+            
+            # Try to fetch package info from PyPI
+            try:
+                # PyPI typically uses hyphens in package names
+                pypi_name = pkg_name.replace('_', '-')
+                pkg_info = pypi_client.get_package_info(pypi_name)
+                
+                if not pkg_info:
+                    # Try with underscores if hyphens failed
+                    if '_' not in pkg_name and '-' in pkg_name:
+                        pypi_name = pkg_name.replace('-', '_')
+                        pkg_info = pypi_client.get_package_info(pypi_name)
+                
+                if pkg_info:
+                    # Normalize package name to prevent duplicates (case-insensitive)
+                    normalized_name = pkg_info.name.lower()
+                    
+                    # Check if package already exists (case-insensitive check)
+                    existing = Package.objects.filter(
+                        project=project,
+                        name=normalized_name
+                    ).first()
+                    
+                    if existing:
+                        # Package exists - create dependency relationship
+                        PackageDependency.objects.get_or_create(
+                            package=package,
+                            depends_on=existing,
+                            defaults={'dependency_type': PackageDependency.DependencyType.BUILD}
+                        )
+                        logger.debug(f"Package {normalized_name} already exists, created dependency relationship")
+                        continue
+                    
+                    # Create new transitive dependency
+                    new_package = Package.objects.create(
+                        project=project,
+                        name=normalized_name,
+                        python_name=pkg_info.name,
+                        version=pkg_info.version,
+                        package_type='dependency',
+                        is_direct_dependency=False,
+                        summary=pkg_info.summary[:500] if pkg_info.summary else '',
+                        description=pkg_info.description[:1000] if pkg_info.description else '',
+                        homepage=pkg_info.home_page[:500] if pkg_info.home_page else '',
+                        license=pkg_info.license[:100] if pkg_info.license else '',
+                    )
+                    
+                    # Record dependency relationship (package depends on new_package)
+                    PackageDependency.objects.get_or_create(
+                        package=package,
+                        depends_on=new_package,
+                        defaults={'dependency_type': PackageDependency.DependencyType.BUILD}
+                    )
+                    
+                    added_count += 1
+                    logger.info(f"Auto-added transitive dependency: {normalized_name} v{pkg_info.version} for {package.name}")
+                    log_package(package_id, 'info', f"Auto-added missing dependency: {normalized_name}")
+                    
+                    # Trigger spec generation for the new package
+                    from backend.apps.packages.tasks import generate_spec_file_task
+                    generate_spec_file_task.delay(new_package.id, force=False)
+                else:
+                    failed_count += 1
+                    logger.warning(f"Could not find package {pkg_name} on PyPI")
+                    
+            except Exception as e:
+                failed_count += 1
+                logger.warning(f"Error adding package {pkg_name}: {e}")
+        
+        if added_count > 0:
+            log_project(project.id, 'info', 
+                f"Auto-added {added_count} missing dependencies as transitive deps for {package.name}")
+            logger.info(f"Auto-added {added_count} packages, {failed_count} failed for package {package.name}")
+        elif failed_count > 0:
+            log_package(package_id, 'warning', 
+                f"Could not auto-add {failed_count} missing dependencies (not found on PyPI or system packages)")
+    
+    except Package.DoesNotExist:
+        logger.error(f"Package {package_id} not found in auto_add_missing_dependencies")
+    except Exception as e:
+        logger.exception(f"Error in auto_add_missing_dependencies for package {package_id}: {e}")
 
 
 def trigger_waiting_builds(completed_package_id: int):

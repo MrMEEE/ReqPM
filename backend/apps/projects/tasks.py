@@ -14,6 +14,23 @@ from backend.apps.projects.models import Project, ProjectBranch, ProjectLog
 logger = logging.getLogger(__name__)
 
 
+def normalize_package_name(name: str) -> str:
+    """
+    Normalize a package name to prevent duplicates.
+    Converts to lowercase for case-insensitive comparison.
+    
+    PyPI package names are case-insensitive, so 'Django' and 'django' 
+    are the same package. This function ensures consistent storage.
+    
+    Args:
+        name: Package name to normalize
+        
+    Returns:
+        Normalized package name (lowercase)
+    """
+    return name.lower() if name else name
+
+
 def log_project(project_id: int, level: str, message: str):
     """
     Helper function to log project messages
@@ -197,10 +214,14 @@ def analyze_requirements_task(self, project_id: int):
         log_project(project_id, 'info', "Creating package records...")
         created_count = 0
         for req in all_requirements:
+            # Normalize package name to prevent duplicates (case-insensitive)
+            normalized_name = normalize_package_name(req.name)
+            
             package, created = Package.objects.get_or_create(
                 project=project,
-                name=req.name,
+                name=normalized_name,
                 defaults={
+                    'python_name': req.name,  # Store original name from requirements
                     'version': req.specs[0][1] if req.specs else '',
                     'package_type': 'dependency',
                     'requirements_file': getattr(req, 'source_file', ''),
@@ -212,11 +233,14 @@ def analyze_requirements_task(self, project_id: int):
             if not created:
                 package.is_direct_dependency = True
                 package.requirements_file = getattr(req, 'source_file', '')
+                # Update python_name if not set
+                if not package.python_name:
+                    package.python_name = req.name
                 package.save()
             
             if created:
                 created_count += 1
-                logger.info(f"Created package: {req.name} for project {project_id}")
+                logger.info(f"Created package: {normalized_name} for project {project_id}")
         
         project.status = 'ready'
         project.save()
@@ -323,13 +347,15 @@ def resolve_dependencies_task(self, project_id: int):
             for package, dep_list in pkg_resolved.items():
                 dep_names = []
                 for dep_name, dep_version in dep_list:
-                    dep_names.append(dep_name)
+                    # Normalize package name to prevent duplicates (case-insensitive)
+                    normalized_dep_name = normalize_package_name(dep_name)
+                    dep_names.append(normalized_dep_name)
 
                     dep_package, created = Package.objects.get_or_create(
                         project=project,
-                        name=dep_name,
+                        name=normalized_dep_name,
                         defaults={
-                            'python_name': dep_name,
+                            'python_name': dep_name,  # Store original name from PyPI
                             'version': dep_version or '',
                             'package_type': 'dependency',
                             'is_direct_dependency': False,
@@ -338,6 +364,11 @@ def resolve_dependencies_task(self, project_id: int):
                     if created:
                         new_packages.append(dep_package.id)
 
+                    # Update python_name if not set
+                    if not dep_package.python_name:
+                        dep_package.python_name = dep_name
+                        dep_package.save(update_fields=['python_name'])
+                    
                     if not dep_package.version and dep_version:
                         dep_package.version = dep_version
                         dep_package.save(update_fields=['version'])

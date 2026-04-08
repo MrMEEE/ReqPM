@@ -187,11 +187,17 @@ class MockBuilder(BaseBuilder):
         logger.debug(f"Running mock command: {' '.join(cmd)}")
         
         try:
+            # Use English locale to ensure consistent error messages
+            env = os.environ.copy()
+            env['LANG'] = 'en_US.UTF-8'
+            env['LC_ALL'] = 'en_US.UTF-8'
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                env=env
             )
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
@@ -469,11 +475,17 @@ class MockBuilder(BaseBuilder):
         logger.info(f"Building SRPM: {' '.join(cmd)}")
         
         try:
+            # Use English locale to ensure consistent error messages
+            env = os.environ.copy()
+            env['LANG'] = 'en_US.UTF-8'
+            env['LC_ALL'] = 'en_US.UTF-8'
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600
+                timeout=600,
+                env=env
             )
             
             build_duration = int(time.time() - start_time)
@@ -578,20 +590,34 @@ class MockBuilder(BaseBuilder):
         except Exception as e:
             logger.warning(f"Could not list output directory: {e}")
         
-        # Merge all log files with timestamps and filename prefixes
-        log_paths = [p for p in [build_log_path, root_log_path, state_log_path] if p.exists()]
-        detailed_log = merge_log_file_paths(log_paths, sort_by_time=True)
+        # Store build.log in log_output and root.log in root_log_output.
+        # root.log is persisted so error analysis can detect missing dynamic
+        # BuildRequires that only appear there.
+        persisted_log_paths = [p for p in [build_log_path] if p.exists()]
+        detailed_log = merge_log_file_paths(persisted_log_paths, sort_by_time=False)
+        
+        # Read root.log for error analysis (may be large; capped at 1 MB)
+        root_log_content = ""
+        if root_log_path.exists():
+            try:
+                size = root_log_path.stat().st_size
+                logger.info(f"Read root.log: {size} bytes")
+                with open(root_log_path, 'r', errors='replace') as f:
+                    root_log_content = f.read(1024 * 1024)  # cap at 1 MB
+            except Exception as e:
+                logger.warning(f"Could not read root.log: {e}")
         
         # Log file sizes for debugging
-        for log_path in log_paths:
-            try:
-                size = log_path.stat().st_size
-                logger.info(f"Read {log_path.name}: {size} bytes")
-            except Exception as e:
-                logger.warning(f"Could not stat {log_path.name}: {e}")
+        for log_path in [build_log_path, state_log_path]:
+            if log_path.exists():
+                try:
+                    size = log_path.stat().st_size
+                    logger.info(f"Read {log_path.name}: {size} bytes")
+                except Exception as e:
+                    logger.warning(f"Could not stat {log_path.name}: {e}")
         
-        # Combine stdout/stderr with detailed logs
-        log_output = f"=== Mock Command Output ===\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\n{detailed_log}"
+        log_output = detailed_log
+        root_log_output = root_log_content
         
         # Clean up both the build chroot and its bootstrap chroot to free disk space
         logger.info(f"Cleaning up build chroot: {target} (uniqueext={unique_ext})")
@@ -619,6 +645,7 @@ class MockBuilder(BaseBuilder):
                 success=True,
                 rpm_paths=rpm_files,
                 log_output=log_output,
+                root_log_output=root_log_output,
                 build_duration=build_duration
             )
         else:
@@ -626,6 +653,7 @@ class MockBuilder(BaseBuilder):
                 success=False,
                 error_message=f"Mock build failed with code {returncode}",
                 log_output=log_output,
+                root_log_output=root_log_output,
                 build_duration=build_duration
             )
     

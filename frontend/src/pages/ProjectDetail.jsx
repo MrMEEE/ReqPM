@@ -6,6 +6,7 @@ import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
 import ConfirmDialog from '../components/ConfirmDialog';
 import LivePackageBuildLog from '../components/LivePackageBuildLog';
+import { useToast } from '../contexts/ToastContext';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -27,7 +28,7 @@ const StatusBadge = ({ status }) => {
   );
 };
 
-const VersionDropdown = ({ packageId, currentVersion, onVersionChange }) => {
+const VersionDropdown = ({ packageId, currentVersion, onVersionChange, toast }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [versions, setVersions] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -40,7 +41,7 @@ const VersionDropdown = ({ packageId, currentVersion, onVersionChange }) => {
         setVersions(response.data.versions || []);
       } catch (error) {
         console.error('Failed to fetch versions:', error);
-        alert('Failed to fetch versions');
+        toast.error('Failed to fetch versions');
       } finally {
         setLoading(false);
       }
@@ -192,6 +193,7 @@ export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [showEditRequirements, setShowEditRequirements] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showEditConfig, setShowEditConfig] = useState(false);
@@ -310,7 +312,7 @@ export default function ProjectDetail() {
       setShowLogs(true);
     },
     onError: (error) => {
-      alert(`Failed to resolve dependencies: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to resolve dependencies: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -334,7 +336,7 @@ export default function ProjectDetail() {
       navigate(`/builds?project=${id}`);
     },
     onError: (error) => {
-      alert(`Failed to start build: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to start build: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -352,7 +354,7 @@ export default function ProjectDetail() {
     },
     onError: (error) => {
       setShowRegenerateConfirm(false);
-      alert(`Failed to regenerate specs: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to regenerate specs: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -366,7 +368,7 @@ export default function ProjectDetail() {
       setShowLogs(true);
     },
     onError: (error) => {
-      alert(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -392,7 +394,7 @@ export default function ProjectDetail() {
     },
     onError: (error) => {
       console.error('Spec generation error:', error);
-      alert(`Failed to generate spec: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to generate spec: ${error.response?.data?.detail || error.message}`);
     },
     onSettled: (data, error, packageId) => {
       // Remove from pending set after completion (success or error)
@@ -466,7 +468,7 @@ export default function ProjectDetail() {
       });
     },
     onError: (error) => {
-      alert(`Failed to toggle extra: ${error.response?.data?.error || error.message}`);
+      toast.error(`Failed to toggle extra: ${error.response?.data?.error || error.message}`);
     },
   });
 
@@ -484,7 +486,7 @@ export default function ProjectDetail() {
       queryClient.invalidateQueries(['project', id]);
     },
     onError: (error) => {
-      alert(`Failed to change version: ${error.response?.data?.error || error.message}`);
+      toast.error(`Failed to change version: ${error.response?.data?.error || error.message}`);
     },
   });
 
@@ -497,7 +499,7 @@ export default function ProjectDetail() {
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
-      alert(`Failed to change build system: ${error.response?.data?.error || error.message}`);
+      toast.error(`Failed to change build system: ${error.response?.data?.error || error.message}`);
     },
   });
 
@@ -507,12 +509,12 @@ export default function ProjectDetail() {
       return response.data;
     },
     onSuccess: (data) => {
-      alert(`Started fetching sources for ${data.count} packages`);
+      toast.info(`Started fetching sources for ${data.count} packages`);
       // Refetch packages to update source status
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
-      alert(`Failed to fetch sources: ${error.response?.data?.error || error.message}`);
+      toast.error(`Failed to fetch sources: ${error.response?.data?.error || error.message}`);
     },
   });
 
@@ -543,7 +545,7 @@ export default function ProjectDetail() {
     },
     onError: (error) => {
       queryClient.invalidateQueries(['project-packages', id]);
-      alert(`Failed to build package: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to build package: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -570,7 +572,7 @@ export default function ProjectDetail() {
     },
     onError: (error) => {
       queryClient.invalidateQueries(['project-packages', id]);
-      alert(`Failed to rebuild package: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to rebuild package: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -583,7 +585,7 @@ export default function ProjectDetail() {
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
-      alert(`Failed to cancel build: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to cancel build: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -593,14 +595,14 @@ export default function ProjectDetail() {
       return response.data;
     },
     onSuccess: (data) => {
-      // Refetch first so real DB statuses load while the alert is visible
+      // Refetch first so real DB statuses load while the toast is visible
       queryClient.invalidateQueries(['project-packages', id]);
       setShowLogs(true);
-      alert(`Started building ${data.count} packages`);
+      toast.success(`Started building ${data.count} packages`);
     },
     onError: (error) => {
       queryClient.invalidateQueries(['project-packages', id]);
-      alert(`Failed to build packages: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to build packages: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -612,10 +614,10 @@ export default function ProjectDetail() {
     onSuccess: (data) => {
       queryClient.invalidateQueries(['project-packages', id]);
       setShowLogs(true);
-      alert(`Regenerating specs for ${data.count} failed package(s)`);
+      toast.info(`Regenerating specs for ${data.count} failed package(s)`);
     },
     onError: (error) => {
-      alert(`Failed to regenerate specs: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to regenerate specs: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -650,7 +652,7 @@ export default function ProjectDetail() {
     },
     onError: (error) => {
       queryClient.invalidateQueries(['project-packages', id]);
-      alert(`Failed to fix & rebuild: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to fix & rebuild: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -673,7 +675,7 @@ export default function ProjectDetail() {
   const handleStartBuild = () => {
     // Check if project has required configuration
     if (!project.rhel_versions || project.rhel_versions.length === 0) {
-      alert('Please configure RHEL versions in project settings before building');
+      toast.warning('Please configure RHEL versions in project settings before building');
       return;
     }
     createBuildMutation.mutate();
@@ -777,7 +779,7 @@ export default function ProjectDetail() {
                 onClick={handleBuildAllPackages}
                 disabled={buildAllPackagesMutation.isPending}
                 className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 transition-colors"
-                title="Build all packages with specs and sources"
+                title="Build all packages that failed or haven't been built yet"
               >
                 <Hammer className={`h-4 w-4 ${buildAllPackagesMutation.isPending ? 'animate-spin' : ''}`} />
                 Build All Packages
@@ -1015,6 +1017,7 @@ export default function ProjectDetail() {
                               packageId={pkg.id}
                               currentVersion={pkg.version || '-'}
                               onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                              toast={toast}
                             />
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
@@ -1120,7 +1123,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'dep_build_pending' && (
                               <span
                                 className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || 'Waiting for project packages to be built'}
+                                title={pkg.dep_blocking_items?.length ? `Still waiting for:\n${pkg.dep_blocking_items.join('\n')}` : 'Waiting for project packages to be built'}
                               >
                                 <Clock className="h-3 w-3" />
                                 Dep Build Pending
@@ -1242,25 +1245,25 @@ export default function ProjectDetail() {
                                 <Download className="h-3 w-3" />
                                 Fetch
                               </button>
-                              {(pkg.build_status === 'waiting_for_deps' || pkg.build_status === 'dep_build_pending') ? (
+                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status)) ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleCancelBuild(pkg.id);
                                   }}
                                   className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
-                                  title="Cancel waiting build"
+                                  title={pkg.build_status === 'building' ? "Cancel running build" : "Cancel waiting build"}
                                 >
                                   <X className="h-3 w-3" />
                                   Cancel
                                 </button>
-                              ) : pkg.build_status === 'not_built' || pkg.build_status === 'pending' ? (
+                              ) : pkg.build_status === 'not_built' ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleBuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
                                   className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
                                 >
@@ -1273,7 +1276,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleRebuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
                                   className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title="Rebuild package"
                                 >
@@ -1389,6 +1392,7 @@ export default function ProjectDetail() {
                               packageId={pkg.id}
                               currentVersion={pkg.version || '-'}
                               onVersionChange={(pkgId, version) => changeVersionMutation.mutate({ packageId: pkgId, version })}
+                              toast={toast}
                             />
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
@@ -1507,7 +1511,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'dep_build_pending' && (
                               <span
                                 className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || 'Waiting for project packages to be built'}
+                                title={pkg.dep_blocking_items?.length ? `Still waiting for:\n${pkg.dep_blocking_items.join('\n')}` : 'Waiting for project packages to be built'}
                               >
                                 <Clock className="h-3 w-3" />
                                 Dep Build Pending
@@ -1629,25 +1633,25 @@ export default function ProjectDetail() {
                                 <Download className="h-3 w-3" />
                                 Fetch
                               </button>
-                              {(pkg.build_status === 'waiting_for_deps' || pkg.build_status === 'dep_build_pending') ? (
+                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status)) ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleCancelBuild(pkg.id);
                                   }}
                                   className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
-                                  title="Cancel waiting build"
+                                  title={pkg.build_status === 'building' ? "Cancel running build" : "Cancel waiting build"}
                                 >
                                   <X className="h-3 w-3" />
                                   Cancel
                                 </button>
-                              ) : pkg.build_status === 'not_built' || pkg.build_status === 'pending' ? (
+                              ) : pkg.build_status === 'not_built' ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleBuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
                                   className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
                                 >
@@ -1660,7 +1664,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleRebuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building' || pkg.build_status === 'pending'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
                                   className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title="Rebuild package"
                                 >

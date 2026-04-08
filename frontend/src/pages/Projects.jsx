@@ -3,9 +3,12 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { projectsAPI } from '../lib/api';
 import { Plus, GitBranch, RefreshCw, Trash2 } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
+import ConfirmDialog from '../components/ConfirmDialog';
 
 export default function Projects() {
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [projectToDelete, setProjectToDelete] = useState(null);
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -92,9 +95,8 @@ export default function Projects() {
                     </button>
                     <button
                       onClick={() => {
-                        if (confirm('Are you sure you want to delete this project?')) {
-                          deleteMutation.mutate(project.id);
-                        }
+                        setProjectToDelete(project);
+                        setShowDeleteConfirm(true);
                       }}
                       className="p-2 text-gray-400 hover:text-red-400 hover:bg-gray-700 rounded transition-colors"
                       title="Delete project"
@@ -165,6 +167,25 @@ export default function Projects() {
           }}
         />
       )}
+
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        onClose={() => {
+          setShowDeleteConfirm(false);
+          setProjectToDelete(null);
+        }}
+        onConfirm={() => {
+          if (projectToDelete) {
+            deleteMutation.mutate(projectToDelete.id);
+          }
+          setShowDeleteConfirm(false);
+          setProjectToDelete(null);
+        }}
+        title="Delete Project"
+        message={`Are you sure you want to delete "${projectToDelete?.name}"? This action cannot be undone.`}
+        confirmText="Delete"
+        variant="danger"
+      />
     </div>
   );
 }

@@ -55,14 +55,15 @@ class PackageListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for package listings"""
     
     project_name = serializers.CharField(source='project.name', read_only=True)
-    dependency_count = serializers.SerializerMethodField()
-    spec_files_count = serializers.SerializerMethodField()
+    dependency_count = serializers.IntegerField(read_only=True)  # Use annotated value
+    spec_files_count = serializers.IntegerField(read_only=True)  # Use annotated value
     dependent_packages = serializers.SerializerMethodField()
     extras = serializers.SerializerMethodField()
     source_fetched = serializers.BooleanField(read_only=True)
     source_path = serializers.CharField(read_only=True)
     has_build_log = serializers.SerializerMethodField()
     waiting_for_dep_names = serializers.SerializerMethodField()
+    dep_blocking_items = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
@@ -75,7 +76,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
             'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
-            'has_build_log', 'waiting_for_dep_names',
+            'has_build_log', 'waiting_for_dep_names', 'dep_blocking_items',
             'created_at', 'updated_at', 'last_built_at'
         ]
         read_only_fields = [
@@ -86,39 +87,107 @@ class PackageListSerializer(serializers.ModelSerializer):
         ]
     
     def get_has_build_log(self, obj):
-        """Check if a build log exists (without sending the full log)"""
+        """Check if a build log exists (without loading the deferred field)"""
+        # Use annotated _has_build_log if available (from optimized query)
+        if hasattr(obj, '_has_build_log'):
+            return obj._has_build_log
+        # Fallback: check if build_log exists (may trigger DB query if not deferred)
         return bool(obj.build_log)
 
     def get_waiting_for_dep_names(self, obj):
         """Names of unbuilt direct deps when the package is in waiting_for_deps state."""
         if obj.build_status != 'waiting_for_deps':
             return []
-        return [
-            dep.depends_on.name
-            for dep in obj.dependencies.select_related('depends_on').all()
-            if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
-        ]
+        # Use prefetched data to avoid additional queries
+        if hasattr(obj, '_prefetched_objects_cache') and 'dependencies' in obj._prefetched_objects_cache:
+            return [
+                dep.depends_on.name
+                for dep in obj.dependencies.all()
+                if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
+            ]
+        return []
 
-    def get_dependency_count(self, obj):
-        """Get count of dependencies"""
-        return obj.dependencies.count()
-    
-    def get_spec_files_count(self, obj):
-        """Get count of spec file revisions"""
-        return obj.spec_revisions.count()
-    
+    def get_dep_blocking_items(self, obj):
+        """For dep_build_pending packages, return only the items still blocked (not yet completed)."""
+        if obj.build_status != 'dep_build_pending':
+            return []
+        import re
+        from django.db.models import Q
+        from backend.apps.packages.models import Package as Pkg
+
+        missing_cats = {
+            'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+            'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
+        }
+        all_items = [
+            item
+            for e in (obj.analyzed_errors or [])
+            if e.get('category') in missing_cats
+            for item in (e.get('items') or [])
+            if item
+        ]
+        if not all_items:
+            return []
+
+        # Normalize: python3dist(foo) >= x  →  candidate names
+        def _normalize(item):
+            s = item.strip().strip('()')
+            s = re.split(r'\s+(with|[><=!])', s)[0].strip()
+            m = re.match(r'python3?dist\(([^)]+)\)', s, re.IGNORECASE)
+            if m:
+                pkg_name = m.group(1).replace('_', '-').lower()
+                return [f'python3-{pkg_name}', pkg_name]
+            m = re.match(r'python3?\(([^)]+)\)', s, re.IGNORECASE)
+            if m:
+                pkg_name = m.group(1).replace('_', '-').lower()
+                return [f'python3-{pkg_name}', pkg_name]
+            return [s, s.replace('_', '-')]
+
+        # Build a map: candidate_name → original item string
+        name_to_item = {}
+        for item in all_items:
+            for name in _normalize(item):
+                name_to_item[name.lower()] = item
+
+        if not name_to_item:
+            return all_items
+
+        # Find matching project packages that are NOT yet completed
+        q = Q()
+        for name in name_to_item:
+            q |= Q(name__iexact=name)
+        unresolved_names = set(
+            Pkg.objects.filter(project=obj.project)
+            .filter(q)
+            .exclude(build_status__in=('completed', 'not_required'))
+            .values_list('name', flat=True)
+        )
+
+        # Return original item strings whose project package is still unresolved
+        seen = set()
+        result = []
+        for name, item in name_to_item.items():
+            if name in {n.lower() for n in unresolved_names} and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
     def get_dependent_packages(self, obj):
         """Get list of packages that depend on this package"""
-        # Get all dependencies where this package is depended upon
-        dependents = obj.dependents.select_related('package').values_list('package__name', flat=True)
-        return list(dependents)
+        # Use prefetched data to avoid additional queries
+        if hasattr(obj, '_prefetched_objects_cache') and 'dependents' in obj._prefetched_objects_cache:
+            return [dep.package.name for dep in obj.dependents.all() if dep.package]
+        return []
     
     def get_extras(self, obj):
         """Get list of extras with their enabled status"""
-        return [
-            {'id': extra.id, 'name': extra.name, 'enabled': extra.enabled}
-            for extra in obj.extras.all()
-        ]
+        # Use prefetched data to avoid additional queries
+        if hasattr(obj, '_prefetched_objects_cache') and 'extras' in obj._prefetched_objects_cache:
+            return [
+                {'id': extra.id, 'name': extra.name, 'enabled': extra.enabled}
+                for extra in obj.extras.all()
+            ]
+        return []
 
 
 class PackageExtraSerializer(serializers.ModelSerializer):
@@ -173,9 +242,35 @@ class PackageCreateSerializer(serializers.ModelSerializer):
             'license', 'homepage', 'project'
         ]
     
+    def validate(self, attrs):
+        """Validate that no duplicate package exists (case-insensitive)"""
+        name = attrs.get('name', '')
+        project = attrs.get('project')
+        
+        # Normalize name to lowercase
+        normalized_name = name.lower()
+        
+        # Check for existing package with same name (case-insensitive)
+        if project:
+            existing = Package.objects.filter(
+                project=project,
+                name__iexact=normalized_name
+            ).first()
+            
+            if existing:
+                raise serializers.ValidationError({
+                    'name': f'Package "{existing.name}" already exists in this project (case-insensitive match)'
+                })
+        
+        attrs['name'] = normalized_name  # Store normalized name
+        return attrs
+    
     def create(self, validated_data):
         """Create package with default values"""
         validated_data['status'] = 'pending'
+        # Store original name as python_name if not provided
+        if 'python_name' not in validated_data or not validated_data['python_name']:
+            validated_data['python_name'] = validated_data['name']
         return Package.objects.create(**validated_data)
 
 

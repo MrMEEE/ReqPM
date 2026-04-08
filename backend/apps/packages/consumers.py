@@ -85,12 +85,12 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
         return str(build_dir)
 
     def _find_log_files(self, build_dir):
-        """Find mock log files in the build directory (RPMS/build.log, RPMS/root.log)"""
+        """Find mock log files in the build directory"""
         bd = Path(build_dir)
         log_files = []
         for sub in ['RPMS', 'SRPMS', '']:
             d = bd / sub if sub else bd
-            for name in ['build.log', 'root.log']:
+            for name in ['build.log', 'root.log', 'state.log']:
                 f = d / name
                 if f.exists():
                     log_files.append(f)
@@ -164,6 +164,19 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
 
     async def _send_completed_log(self, pkg):
         """Send the full stored build log for a completed/failed build"""
+        # Send error analysis FIRST so it appears even if the log transfer is interrupted
+        if pkg['analyzed_errors']:
+            await self.send(text_data=json.dumps({
+                'type': 'analyzed_errors',
+                'errors': pkg['analyzed_errors']
+            }))
+
+        if pkg['build_error_message']:
+            await self.send(text_data=json.dumps({
+                'type': 'error_message',
+                'message': pkg['build_error_message']
+            }))
+
         if pkg['build_log']:
             # Send in chunks to avoid overwhelming the WebSocket
             log = pkg['build_log']
@@ -173,19 +186,31 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                     'type': 'log',
                     'data': log[i:i + chunk_size]
                 }))
-        
-        if pkg['build_error_message']:
-            await self.send(text_data=json.dumps({
-                'type': 'error_message',
-                'message': pkg['build_error_message']
-            }))
-        
-        if pkg['analyzed_errors']:
-            await self.send(text_data=json.dumps({
-                'type': 'analyzed_errors',
-                'errors': pkg['analyzed_errors']
-            }))
-        
+
+        # Also stream root.log and state.log from disk — these are not persisted in the
+        # DB (too large) but are available on disk for completed builds.
+        build_dir = await self.get_build_dir()
+        disk_log_files = await asyncio.to_thread(self._find_log_files, build_dir)
+        already_in_db_sources = {'build.log'}  # sent via build_log field above
+        for log_file in disk_log_files:
+            if log_file.name in already_in_db_sources:
+                continue
+            try:
+                content = await asyncio.to_thread(
+                    log_file.read_text, encoding='utf-8', errors='replace'
+                )
+                if not content:
+                    continue
+                prefixed = '\n'.join(f"{log_file.name} - {line}" for line in content.splitlines()) + '\n'
+                chunk_size = 64 * 1024
+                for i in range(0, len(prefixed), chunk_size):
+                    await self.send(text_data=json.dumps({
+                        'type': 'log',
+                        'data': prefixed[i:i + chunk_size]
+                    }))
+            except Exception as e:
+                logger.debug(f"Could not read disk log {log_file}: {e}")
+
         await self.send(text_data=json.dumps({
             'type': 'status',
             'status': pkg['build_status'],
@@ -193,6 +218,7 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
             'build_completed_at': pkg['build_completed_at'],
             'srpm_path': pkg['srpm_path'],
             'rpm_path': pkg['rpm_path'],
+            'analyzed_errors': pkg['analyzed_errors'] or [],
         }))
 
     async def _stream_live_build(self, pkg):
@@ -204,6 +230,11 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
         """
         build_dir = await self.get_build_dir()
         
+        # If the DB log was cleared (empty) this is a fresh/retried build — tell the
+        # frontend to discard any previously displayed lines.
+        if not pkg['build_log']:
+            await self.send(text_data=json.dumps({'type': 'clear_log'}))
+
         # Track file positions for each log file we find
         file_positions = {}  # path → last read position
         sent_any = False
@@ -298,6 +329,7 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                     'build_completed_at': pkg['build_completed_at'],
                     'srpm_path': pkg['srpm_path'],
                     'rpm_path': pkg['rpm_path'],
+                    'analyzed_errors': pkg['analyzed_errors'] or [],
                 }))
                 break
             

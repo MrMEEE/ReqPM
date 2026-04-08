@@ -1,6 +1,30 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { X, Terminal, CheckCircle, XCircle, AlertTriangle, Download, Lightbulb, ChevronDown, ChevronRight } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
+
+// Source labels and default visibility
+const SOURCE_LABELS = {
+  'build.log': 'Build',
+  'root.log': 'Root',
+  'state.log': 'State',
+  'output': 'Mock Output',
+};
+const SOURCE_COLORS = {
+  'build.log': 'bg-blue-600 hover:bg-blue-500',
+  'root.log': 'bg-purple-700 hover:bg-purple-600',
+  'state.log': 'bg-gray-600 hover:bg-gray-500',
+  'output': 'bg-gray-700 hover:bg-gray-600',
+};
+const DEFAULT_VISIBLE_SOURCES = new Set(['build.log']);
+
+/** Parse a raw line into {source, content}. Lines arriving from the backend are prefixed
+ *  as "build.log - <content>" or "root.log - <content>" etc. */
+function parseRawLine(raw) {
+  const m = raw.match(/^([\w-]+\.log) - (.*)$/);
+  if (m) return { source: m[1], content: m[2] };
+  return { source: 'output', content: raw };
+}
 
 function classifyLogLine(line) {
   const l = line.toLowerCase();
@@ -124,16 +148,61 @@ function ErrorAnalysisPanel({ errors }) {
 }
 
 export default function LivePackageBuildLog({ packageId, packageName, onClose }) {
-  const [log, setLog] = useState('');
+  // All lines stored in a ref to avoid expensive React state for 150k+ entries.
+  // We increment flushCount to trigger re-renders after each batch.
+  const allLinesRef = useRef([]);          // [{source, content, kind}]
+  const pendingRef = useRef([]);           // lines waiting to be flushed
+  const lineBufferRef = useRef('');        // incomplete line at end of chunk
+  const flushTimerRef = useRef(null);
+  const [flushCount, setFlushCount] = useState(0);
+
+  // Detected sources so we can show toggles dynamically
+  const detectedSourcesRef = useRef(new Set(['build.log']));
+  const [detectedSources, setDetectedSources] = useState(new Set(['build.log']));
+  const [visibleSources, setVisibleSources] = useState(DEFAULT_VISIBLE_SOURCES);
+
   const [status, setStatus] = useState('connecting');
   const [buildInfo, setBuildInfo] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [analyzedErrors, setAnalyzedErrors] = useState([]);
   const [isCompleted, setIsCompleted] = useState(false);
   const wsRef = useRef(null);
-  const logEndRef = useRef(null);
   const logContainerRef = useRef(null);
   const [autoScroll, setAutoScroll] = useState(true);
+
+  // Batch incoming lines and flush to allLinesRef every 100ms
+  const scheduleFlush = useCallback(() => {
+    if (flushTimerRef.current) return;
+    flushTimerRef.current = setTimeout(() => {
+      flushTimerRef.current = null;
+      const newLines = pendingRef.current.splice(0);
+      if (newLines.length === 0) return;
+      allLinesRef.current.push(...newLines);
+      // Check for newly discovered sources
+      let hadNew = false;
+      for (const l of newLines) {
+        if (!detectedSourcesRef.current.has(l.source)) {
+          detectedSourcesRef.current.add(l.source);
+          hadNew = true;
+        }
+      }
+      if (hadNew) setDetectedSources(new Set(detectedSourcesRef.current));
+      setFlushCount((c) => c + 1);
+    }, 100);
+  }, []);
+
+  const appendLogChunk = useCallback((chunk) => {
+    lineBufferRef.current += chunk;
+    const parts = lineBufferRef.current.split('\n');
+    lineBufferRef.current = parts.pop(); // keep incomplete last fragment
+    if (parts.length === 0) return;
+    const parsed = parts.map((raw) => {
+      const { source, content } = parseRawLine(raw);
+      return { source, content, kind: classifyLogLine(content) };
+    });
+    pendingRef.current.push(...parsed);
+    scheduleFlush();
+  }, [scheduleFlush]);
 
   useEffect(() => {
     // Determine WebSocket URL
@@ -167,10 +236,25 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
           if (data.completed) {
             setIsCompleted(true);
           }
+          // analyzed_errors is also embedded here as a guarantee
+          if (data.analyzed_errors && data.analyzed_errors.length > 0) {
+            setAnalyzedErrors(data.analyzed_errors);
+          }
+          break;
+
+        case 'clear_log':
+          allLinesRef.current = [];
+          pendingRef.current = [];
+          lineBufferRef.current = '';
+          detectedSourcesRef.current = new Set(['build.log']);
+          setDetectedSources(new Set(['build.log']));
+          setAnalyzedErrors([]);
+          setErrorMessage('');
+          setFlushCount((c) => c + 1);
           break;
 
         case 'log':
-          setLog((prev) => prev + data.data);
+          appendLogChunk(data.data);
           break;
 
         case 'error_message':
@@ -184,7 +268,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
         case 'error':
           console.error('WebSocket error:', data.message);
           setStatus('error');
-          setLog((prev) => prev + `\nError: ${data.message}\n`);
+          appendLogChunk(`\nError: ${data.message}\n`);
           break;
 
         default:
@@ -207,22 +291,43 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
         ws.close();
       }
     };
-  }, [packageId]);
+  }, [packageId, appendLogChunk]);
 
-  // Auto-scroll to bottom when new log content arrives
+  // Filtered lines — recomputed only when flush fires or source filter changes
+  const filteredLines = useMemo(
+    () => allLinesRef.current.filter((l) => visibleSources.has(l.source)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [flushCount, visibleSources]
+  );
+
+  // Virtual list — renders only ~50 rows regardless of total count
+  const rowVirtualizer = useVirtualizer({
+    count: filteredLines.length,
+    getScrollElement: () => logContainerRef.current,
+    estimateSize: () => 20,   // 20px per line (text-xs, leading-5)
+    overscan: 80,
+  });
+
+  // Auto-scroll: when new lines arrive and user is at the bottom, jump to end
   useEffect(() => {
-    if (autoScroll && logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (autoScroll && logContainerRef.current && filteredLines.length > 0) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, [log, autoScroll]);
+  }, [filteredLines.length, autoScroll]);
 
-  // Check if user has scrolled away from bottom
   const handleScroll = () => {
     if (!logContainerRef.current) return;
-    
     const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
-    setAutoScroll(isAtBottom);
+    setAutoScroll(scrollHeight - scrollTop - clientHeight < 60);
+  };
+
+  const toggleSource = (source) => {
+    setVisibleSources((prev) => {
+      const next = new Set(prev);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
+      return next;
+    });
   };
 
   const getStatusColor = () => {
@@ -286,7 +391,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
         {/* Content */}
         <div className="flex-1 overflow-hidden flex flex-col p-4">
           {errorMessage && (
-            <div className="mb-4 p-3 bg-red-900/20 border border-red-700 rounded-lg">
+            <div className="mb-4 p-3 bg-red-900/20 border border-red-700 rounded-lg flex-shrink-0">
               <div className="flex items-start gap-2">
                 <AlertTriangle className="h-5 w-5 text-red-400 flex-shrink-0 mt-0.5" />
                 <div>
@@ -299,32 +404,64 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
 
           {/* Analyzed errors section */}
           {analyzedErrors.length > 0 && (
-            <ErrorAnalysisPanel errors={analyzedErrors} />
+            <div className="flex-shrink-0">
+              <ErrorAnalysisPanel errors={analyzedErrors} />
+            </div>
           )}
 
-          {/* Log container */}
+          {/* Log source filter toggles */}
+          {detectedSources.size > 0 && (
+            <div className="mb-2 flex items-center gap-2 flex-wrap flex-shrink-0">
+              <span className="text-xs text-gray-400">Show:</span>
+              {[...detectedSources].map((src) => (
+                <button
+                  key={src}
+                  onClick={() => toggleSource(src)}
+                  className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                    visibleSources.has(src)
+                      ? (SOURCE_COLORS[src] || 'bg-blue-600 hover:bg-blue-500') + ' text-white'
+                      : 'bg-gray-800 text-gray-500 hover:bg-gray-700 hover:text-gray-300'
+                  }`}
+                >
+                  {SOURCE_LABELS[src] || src}
+                </button>
+              ))}
+              <span className="ml-auto text-xs text-gray-500">
+                {filteredLines.length.toLocaleString()} / {allLinesRef.current.length.toLocaleString()} lines
+              </span>
+            </div>
+          )}
+
+          {/* Virtualized log container */}
           <div
             ref={logContainerRef}
             onScroll={handleScroll}
-            className="flex-1 bg-black rounded-lg p-4 overflow-auto font-mono text-xs"
+            className="flex-1 min-h-0 bg-black rounded-lg overflow-auto font-mono text-xs"
           >
-            {log ? (
-              <>
-                <div className="space-y-0">
-                  {log.split('\n').map((line, idx) => {
-                    const kind = classifyLogLine(line);
-                    return (
-                      <div
-                        key={idx}
-                        className={`whitespace-pre-wrap leading-5 px-1 rounded-sm ${LOG_LINE_COLORS[kind]}`}
-                      >
-                        {line || '\u00a0'}
-                      </div>
-                    );
-                  })}
-                </div>
-                <div ref={logEndRef} />
-              </>
+            {filteredLines.length > 0 ? (
+              <div
+                style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: 'relative' }}
+              >
+                {rowVirtualizer.getVirtualItems().map((vRow) => {
+                  const line = filteredLines[vRow.index];
+                  return (
+                    <div
+                      key={vRow.index}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${vRow.start}px)`,
+                        height: `${vRow.size}px`,
+                      }}
+                      className={`flex items-center px-4 leading-5 whitespace-pre ${LOG_LINE_COLORS[line.kind]}`}
+                    >
+                      {line.content || '\u00a0'}
+                    </div>
+                  );
+                })}
+              </div>
             ) : (
               <div className="text-center py-12 text-gray-500">
                 <Terminal className="h-12 w-12 mx-auto mb-3 opacity-50 animate-pulse" />
@@ -332,6 +469,22 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
               </div>
             )}
           </div>
+
+          {!autoScroll && filteredLines.length > 0 && (
+            <div className="mt-2 text-center">
+              <button
+                onClick={() => {
+                  setAutoScroll(true);
+                  if (logContainerRef.current) {
+                    logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+                  }
+                }}
+                className="px-3 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700"
+              >
+                ↓ Scroll to bottom
+              </button>
+            </div>
+          )}
 
           {/* Build artifacts */}
           {isCompleted && (buildInfo?.srpm_path || buildInfo?.rpm_path) && (
@@ -392,20 +545,6 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
                   </div>
                 )}
               </div>
-            </div>
-          )}
-
-          {!autoScroll && (
-            <div className="mt-2 text-center">
-              <button
-                onClick={() => {
-                  setAutoScroll(true);
-                  logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-                }}
-                className="px-3 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700"
-              >
-                ↓ Scroll to bottom
-              </button>
             </div>
           )}
         </div>

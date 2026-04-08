@@ -331,21 +331,39 @@ class ProjectViewSet(viewsets.ModelViewSet):
         
         GET /api/projects/{id}/packages/
         """
-        from backend.apps.packages.models import Package
+        from django.db.models import Count, Prefetch, Q, Case, When, Value, BooleanField
+        from backend.apps.packages.models import Package, PackageDependency, PackageExtra
         from backend.apps.packages.serializers import PackageListSerializer
         
         project = self.get_object()
         
-        # Get direct and transitive dependencies separately
-        direct_packages = Package.objects.filter(
-            project=project, 
-            is_direct_dependency=True
-        ).prefetch_related('dependencies', 'dependents', 'dependents__package', 'extras').order_by('name')
+        # Optimize query with annotations, deferred fields, and efficient prefetches
+        # Defer large text fields that aren't needed in list view
+        base_queryset = Package.objects.filter(project=project).select_related('project').defer(
+            'build_log'  # Don't load build logs in list view - can be 100s of KB per package
+        ).annotate(
+            dependency_count=Count('dependencies', distinct=True),
+            spec_files_count=Count('spec_revisions', distinct=True),
+            # Annotate has_build_log without loading the field
+            _has_build_log=Case(
+                When(build_log='', then=Value(False)),
+                When(build_log__isnull=True, then=Value(False)),
+                default=Value(True),
+                output_field=BooleanField()
+            )
+        ).prefetch_related(
+            Prefetch('dependencies', queryset=PackageDependency.objects.select_related('depends_on').only(
+                'id', 'package_id', 'depends_on_id', 'depends_on__name', 'depends_on__build_status'
+            )),
+            Prefetch('dependents', queryset=PackageDependency.objects.select_related('package').only(
+                'id', 'package_id', 'depends_on_id', 'package__name'
+            )),
+            Prefetch('extras', queryset=PackageExtra.objects.only('id', 'package_id', 'name', 'enabled'))
+        ).order_by('name')
         
-        transitive_packages = Package.objects.filter(
-            project=project, 
-            is_direct_dependency=False
-        ).prefetch_related('dependencies', 'dependents', 'dependents__package', 'extras').order_by('name')
+        # Get direct and transitive dependencies separately
+        direct_packages = base_queryset.filter(is_direct_dependency=True)
+        transitive_packages = base_queryset.filter(is_direct_dependency=False)
         
         # Serialize both lists
         direct_serializer = PackageListSerializer(direct_packages, many=True)
@@ -428,7 +446,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='build-all-packages')
     def build_all_packages(self, request, pk=None):
         """
-        Build all packages in the project.
+        Build all packages in the project that are in 'failed' or 'not_built' state.
 
         Packages whose PackageDependency links are all satisfied (completed /
         not_required) are set to 'pending' and dispatched immediately.
@@ -456,20 +474,21 @@ class ProjectViewSet(viewsets.ModelViewSet):
             id__in=SpecFileRevision.objects.values('package_id').distinct()
         ).prefetch_related('dependencies__depends_on')
 
-        # Get all packages that are ready to build (have specs and sources)
-        direct_packages = [p for p in packages_with_specs if p.source_fetched and p.build_status != 'completed']
+        # Get all packages that need building (failed or not_built)
+        rebuild_statuses = ['failed', 'not_built']
+        direct_packages = [p for p in packages_with_specs if p.source_fetched and p.build_status in rebuild_statuses]
         
         # Include transitive dependencies if requested
         if include_transitive:
             packages = list(self._get_all_transitive_dependencies(direct_packages))
             # Filter again for packages with specs and sources (some deps might not have them)
-            packages = [p for p in packages if p.source_fetched and p.build_status != 'completed']
+            packages = [p for p in packages if p.source_fetched and p.build_status in rebuild_statuses]
         else:
             packages = direct_packages
 
         if not packages:
             return Response(
-                {'detail': 'No packages need building (all packages are either missing specs/sources or already built)'},
+                {'detail': 'No packages need rebuilding (all packages are either missing specs/sources, already built, or not in failed/not_built state)'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 

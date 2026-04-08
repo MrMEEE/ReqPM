@@ -203,6 +203,21 @@ class SpecFileGenerator:
             spec_content
         )
         
+        # Fix %autosetup -n to use PyPI normalized directory names
+        # PyPI tarballs unpack to directories with underscores
+        # PyPI normalization: replace hyphens AND dots with underscores
+        # Examples: flit-core -> flit_core, awx-plugins.interfaces -> awx_plugins_interfaces
+        spec_content = re.sub(
+            r'(%autosetup\s+-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
+            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_')}{m.group(3)}",
+            spec_content
+        )
+        spec_content = re.sub(
+            r'(%setup\s+-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
+            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_')}{m.group(3)}",
+            spec_content
+        )
+        
         # Add packager information if not present
         if '%changelog' in spec_content and 'ReqPM' not in spec_content:
             date = datetime.now().strftime("%a %b %d %Y")
@@ -233,12 +248,115 @@ class SpecFileGenerator:
         
         rpm_name = self._normalize_package_name(package_name)
         pypi_name = python_name if python_name else package_name
+        # For Source0, use PyPI-normalized name (underscores) to match actual tarball filename
+        pypi_source_name = pypi_name.replace('-', '_').replace('.', '_')
+        
+        # For packages with dots/hyphens, RPM/Mock will look for files with hyphens
+        # based on the package name, so we need to:
+        # 1. Use underscored name in Source0 (the actual tarball filename from PyPI)  
+        # 2. Use fallback %prep logic to find the correct extracted directory
+        has_special_chars = '.' in pypi_name or '-' in pypi_name
+        if has_special_chars:
+            # Use PyPI-normalized (underscored) name - this is the actual file
+            source_line = f"Source0:        {pypi_source_name}-%{{version}}.tar.gz"
+        else:
+            source_line = f"Source0:        %{{pypi_source {pypi_name}}}"
+        
         version = version or "0.0.1"
         date = datetime.now().strftime("%a %b %d %Y")
         
         # Determine Python version suffix (empty for "default")
         py_suffix = "" if python_version == "default" else python_version
         py_macro = "3" if python_version == "default" else python_version.replace(".", "")
+        
+        # Create appropriate %prep section based on package naming
+        if has_special_chars:
+            # For packages with dots/hyphens, use manual extraction with fallback logic
+            prep_section = f"""# Extract and cd into correct directory (with fallback for naming variations)
+cd %{{_builddir}}
+rm -rf *-%{{version}} 2>/dev/null || true
+tar -xzf %{{SOURCE0}}
+# Try underscored directory first (PyPI normalized), then hyphenated, then any match
+if [ -d \"{pypi_source_name}-%{{version}}\" ]; then
+    cd \"{pypi_source_name}-%{{version}}\"
+elif [ -d \"{pypi_name}-%{{version}}\" ]; then
+    cd \"{pypi_name}-%{{version}}\"
+else
+    EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name \"*-%{{version}}\" -printf \"%f\\n\" | head -1)
+    if [ -n \"$EXTRACTED_DIR\" ]; then
+        cd \"$EXTRACTED_DIR\"
+    else
+        echo \"ERROR: Could not find extracted directory matching *-%{{version}}\"
+        exit 1
+    fi
+fi
+
+# Handle packages where pyproject.toml/setup.py might be in a subdirectory
+if [ ! -f pyproject.toml ] && [ ! -f setup.py ]; then
+    # Look for build files in subdirectories
+    BUILD_SUBDIR=$(find . -maxdepth 2 -name pyproject.toml -o -name setup.py | head -1 | xargs dirname 2>/dev/null)
+    if [ -n \"$BUILD_SUBDIR\" ] && [ \"$BUILD_SUBDIR\" != \".\" ]; then
+        echo \"Found build files in subdirectory: $BUILD_SUBDIR\"
+        cd \"$BUILD_SUBDIR\"
+    fi
+fi"""
+        else:
+            # For normal packages, use standard %setup
+            prep_section = f"%setup -q -n {pypi_source_name}-%{{version}}"
+        
+        # Create appropriate %generate_buildrequires section
+        if has_special_chars:
+            # For packages with special chars, ensure we're in the package directory
+            generate_buildrequires = f"""cd %{{_builddir}}
+# Find the extracted package directory
+PKG_DIR=$(find . -maxdepth 1 -type d -name "*-%{{version}}" -printf \"%f\" | head -1)
+if [ -n \"$PKG_DIR\" ]; then
+    cd \"$PKG_DIR\"
+    # Check for build files in subdirectories
+    if [ ! -f pyproject.toml ] && [ ! -f setup.py ]; then
+        BUILD_SUBDIR=$(find . -maxdepth 2 -name pyproject.toml -o -name setup.py | head -1 | xargs dirname 2>/dev/null)
+        if [ -n \"$BUILD_SUBDIR\" ] && [ \"$BUILD_SUBDIR\" != \".\" ]; then
+            cd \"$BUILD_SUBDIR\"
+        fi
+    fi
+fi
+%pyproject_buildrequires"""
+        else:
+            generate_buildrequires = "%pyproject_buildrequires"
+        
+        # Create appropriate %build and %install sections
+        if has_special_chars:
+            # For packages with special chars, navigate to package directory first
+            build_section = f"""cd %{{_builddir}}
+PKG_DIR=$(find . -maxdepth 1 -type d -name "*-%{{version}}" -printf \"%f\" | head -1)
+if [ -n \"$PKG_DIR\" ]; then
+    cd \"$PKG_DIR\"
+    if [ ! -f pyproject.toml ] && [ ! -f setup.py ]; then
+        BUILD_SUBDIR=$(find . -maxdepth 2 -name pyproject.toml -o -name setup.py | head -1 | xargs dirname 2>/dev/null)
+        if [ -n \"$BUILD_SUBDIR\" ] && [ \"$BUILD_SUBDIR\" != \".\" ]; then
+            cd \"$BUILD_SUBDIR\"
+        fi
+    fi
+fi
+%pyproject_wheel"""
+            
+            install_section = f"""cd %{{_builddir}}
+PKG_DIR=$(find . -maxdepth 1 -type d -name "*-%{{version}}" -printf \"%f\" | head -1)
+if [ -n \"$PKG_DIR\" ]; then
+    cd \"$PKG_DIR\"
+    if [ ! -f pyproject.toml ] && [ ! -f setup.py ]; then
+        BUILD_SUBDIR=$(find . -maxdepth 2 -name pyproject.toml -o -name setup.py | head -1 | xargs dirname 2>/dev/null)
+        if [ -n \"$BUILD_SUBDIR\" ] && [ \"$BUILD_SUBDIR\" != \".\" ]; then
+            cd \"$BUILD_SUBDIR\"
+        fi
+    fi
+fi
+%pyproject_install
+%pyproject_save_files {pypi_name.replace('-', '_')}"""
+        else:
+            build_section = "%pyproject_wheel"
+            install_section = f"""%pyproject_install
+%pyproject_save_files {pypi_name.replace('-', '_')}"""
         
         spec_content = f"""Name:           {rpm_name}
 Version:        {version}
@@ -247,7 +365,7 @@ Summary:        Python package {pypi_name}
 
 License:        Unknown
 URL:            https://pypi.org/project/{pypi_name}
-Source0:        %{{pypi_source {pypi_name}}}
+{source_line}
 
 BuildArch:      noarch
 BuildRequires:  python{py_suffix}-devel
@@ -257,17 +375,16 @@ BuildRequires:  pyproject-rpm-macros
 Python package {pypi_name}
 
 %prep
-%autosetup -n {pypi_name}-%{{version}}
+{prep_section}
 
 %generate_buildrequires
-%pyproject_buildrequires
+{generate_buildrequires}
 
 %build
-%pyproject_wheel
+{build_section}
 
 %install
-%pyproject_install
-%pyproject_save_files {pypi_name.replace('-', '_')}
+{install_section}
 
 %files -f %{{pyproject_files}}
 

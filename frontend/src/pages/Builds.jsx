@@ -5,6 +5,7 @@ import { Boxes, Search, Filter, Play, XCircle, CheckCircle, Clock, Loader, Trash
 import { buildsAPI } from '../lib/api';
 import SystemHealthBanner from '../components/SystemHealthBanner';
 import ConfirmDialog from '../components/ConfirmDialog';
+import { useToast } from '../contexts/ToastContext';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -35,6 +36,7 @@ export default function Builds() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [buildToDelete, setBuildToDelete] = useState(null);
   const queryClient = useQueryClient();
+  const toast = useToast();
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['builds', currentPage, statusFilter, search],
@@ -64,7 +66,7 @@ export default function Builds() {
       queryClient.invalidateQueries({ queryKey: ['builds'] });
     },
     onError: (error) => {
-      alert(`Failed to delete build: ${error.response?.data?.detail || error.message}`);
+      toast.error(`Failed to delete build: ${error.response?.data?.detail || error.message}`);
     },
   });
 

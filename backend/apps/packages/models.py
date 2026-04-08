@@ -120,6 +120,7 @@ class Package(models.Model):
     build_started_at = models.DateTimeField(null=True, blank=True)
     build_completed_at = models.DateTimeField(null=True, blank=True)
     build_log = models.TextField(blank=True)
+    build_root_log = models.TextField(blank=True)
     build_error_message = models.TextField(blank=True)
     analyzed_errors = models.JSONField(default=list, blank=True, help_text=_('Parsed build error analysis'))
     build_system = models.CharField(

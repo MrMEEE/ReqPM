@@ -110,7 +110,8 @@ class BuildErrorAnalyzer:
             'source_not_found': {
                 'pattern': r'Bad file: .+: No such file or directory',
                 'category': 'Source File Missing',
-                'suggestion': 'Run fetch_source to download source files, or check Source0 URL in spec'
+                'suggestion': 'Run fetch_source to download source files, or check Source0 URL in spec',
+                'capture_items': False,
             },
             'macro_error': {
                 'pattern': r'Macro .+ has illegal name',
@@ -138,9 +139,10 @@ class BuildErrorAnalyzer:
                 'suggestion': 'Resolve file conflicts between packages'
             },
             'unpackaged_files': {
-                'pattern': r'Installed .+ but unpackaged .+ :\s+(.+)',
+                'pattern': r'Installed \(but unpackaged\) file\(s\) found:',
                 'category': 'Unpackaged Files',
-                'suggestion': 'Add missing files to %files section in spec'
+                'suggestion': 'Add missing files to %files section in spec',
+                'capture_items': False,
             },
             'scriplet_error': {
                 'pattern': r'(Bad exit status from|error: %[a-z]+ scriptlet failed)',

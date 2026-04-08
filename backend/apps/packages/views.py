@@ -292,31 +292,8 @@ class PackageViewSet(viewsets.ModelViewSet):
             })
         
         # All deps ready, trigger build immediately
-        build_single_package_task.delay(package.id)
-        
-        return Response({
-            'detail': 'Package build triggered',
-            'package_id': package.id
-        })
-    
-    @action(detail=True, methods=['post'])
-    def cancel_build(self, request, pk=None):
-        """
-        Cancel a waiting/pending build
-        
-        POST /api/packages/{id}/cancel_build/
-        """
-        package = self.get_object()
-        
-        if package.build_status not in ['waiting_for_deps', 'pending']:
-            return Response(
-                {'detail': f'Cannot cancel build in state: {package.build_status}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        package.build_status = 'not_built'
-        package.build_started_at = None
-        package.build_completed_at = None
+        # Set status to pending before dispatching task
+        package.build_status = 'pending'
         package.build_error_message = ''
         package.build_log = ''
         package.save()
@@ -324,9 +301,77 @@ class PackageViewSet(viewsets.ModelViewSet):
         from backend.apps.packages.tasks import send_package_update
         send_package_update(package.id)
         
+        build_single_package_task.delay(package.id)
+        
+        return Response({
+            'detail': 'Package build triggered',
+            'package_id': package.id,
+            'status': 'pending'
+        })
+    
+    @action(detail=True, methods=['post'])
+    def cancel_build(self, request, pk=None):
+        """
+        Cancel a waiting/pending/building package
+        
+        POST /api/packages/{id}/cancel_build/
+        
+        For waiting/pending builds: sets status to not_built
+        For actively building builds: attempts to revoke the Celery task and marks as failed
+        """
+        package = self.get_object()
+        
+        if package.build_status not in ['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building']:
+            return Response(
+                {'detail': f'Cannot cancel build in state: {package.build_status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # For actively building packages, try to terminate the Celery task
+        if package.build_status == 'building':
+            from celery import current_app
+            from django.utils import timezone
+            
+            # Revoke all running tasks for this package
+            # Note: This requires the worker to have been started with --pool=solo or --pool=threads
+            # and may not immediately stop the build process, but will prevent retry
+            inspect = current_app.control.inspect()
+            active_tasks = inspect.active()
+            
+            if active_tasks:
+                for worker, tasks in active_tasks.items():
+                    for task in tasks:
+                        # Check if this task is building our package
+                        if task.get('name') == 'backend.apps.packages.tasks.build_single_package_task':
+                            args = task.get('args', [])
+                            if args and len(args) > 0 and args[0] == package.id:
+                                # Revoke the task
+                                current_app.control.revoke(task['id'], terminate=True, signal='SIGKILL')
+            
+            package.build_status = 'failed'
+            package.build_completed_at = timezone.now()
+            package.build_error_message = 'Build cancelled by user'
+            if not package.build_log:
+                package.build_log = 'Build cancelled by user'
+            else:
+                package.build_log += '\n\n=== Build cancelled by user ==='
+        else:
+            # For waiting/pending builds, just reset to not_built
+            package.build_status = 'not_built'
+            package.build_started_at = None
+            package.build_completed_at = None
+            package.build_error_message = ''
+            package.build_log = ''
+        
+        package.save()
+        
+        from backend.apps.packages.tasks import send_package_update
+        send_package_update(package.id)
+        
         return Response({
             'detail': 'Build cancelled',
-            'package_id': package.id
+            'package_id': package.id,
+            'status': package.build_status
         })
     
     @action(detail=True, methods=['post'])
@@ -355,11 +400,21 @@ class PackageViewSet(viewsets.ModelViewSet):
             )
         
         # Trigger build (no dependency check for rebuild)
+        # Set status to pending before dispatching task
+        package.build_status = 'pending'
+        package.build_error_message = ''
+        package.build_log = ''
+        package.save()
+        
+        from backend.apps.packages.tasks import send_package_update
+        send_package_update(package.id)
+        
         build_single_package_task.delay(package.id)
         
         return Response({
             'detail': 'Package rebuild triggered',
-            'package_id': package.id
+            'package_id': package.id,
+            'status': 'pending'
         })
 
     @action(detail=True, methods=['post'])
