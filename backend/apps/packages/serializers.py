@@ -63,6 +63,7 @@ class PackageListSerializer(serializers.ModelSerializer):
     source_path = serializers.CharField(read_only=True)
     has_build_log = serializers.SerializerMethodField()
     waiting_for_dep_names = serializers.SerializerMethodField()
+    failed_dep_names = serializers.SerializerMethodField()
     dep_blocking_items = serializers.SerializerMethodField()
     
     class Meta:
@@ -76,7 +77,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
             'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
-            'has_build_log', 'waiting_for_dep_names', 'dep_blocking_items',
+            'has_build_log', 'waiting_for_dep_names', 'failed_dep_names', 'dep_blocking_items',
             'created_at', 'updated_at', 'last_built_at'
         ]
         read_only_fields = [
@@ -95,7 +96,7 @@ class PackageListSerializer(serializers.ModelSerializer):
         return bool(obj.build_log)
 
     def get_waiting_for_dep_names(self, obj):
-        """Names of unbuilt direct deps when the package is in waiting_for_deps state."""
+        """Names of pending/building direct deps (excludes failed) when package is waiting_for_deps."""
         if obj.build_status != 'waiting_for_deps':
             return []
         # Use prefetched data to avoid additional queries
@@ -103,7 +104,19 @@ class PackageListSerializer(serializers.ModelSerializer):
             return [
                 dep.depends_on.name
                 for dep in obj.dependencies.all()
-                if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
+                if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required', 'failed')
+            ]
+        return []
+
+    def get_failed_dep_names(self, obj):
+        """Names of failed direct deps blocking this package from building."""
+        if obj.build_status != 'waiting_for_deps':
+            return []
+        if hasattr(obj, '_prefetched_objects_cache') and 'dependencies' in obj._prefetched_objects_cache:
+            return [
+                dep.depends_on.name
+                for dep in obj.dependencies.all()
+                if dep.depends_on and dep.depends_on.build_status == 'failed'
             ]
         return []
 

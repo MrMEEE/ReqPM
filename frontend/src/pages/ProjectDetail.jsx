@@ -1113,11 +1113,14 @@ export default function ProjectDetail() {
                             )}
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
-                                className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : 'Waiting for dependencies to be built'}
+                                className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
+                                title={[
+                                  pkg.failed_dep_names?.length ? `Blocked by failed dep(s):\n${pkg.failed_dep_names.join('\n')}` : '',
+                                  pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : '',
+                                ].filter(Boolean).join('\n\n') || 'Waiting for dependencies to be built'}
                               >
                                 <Clock className="h-3 w-3" />
-                                Waiting for deps
+                                {(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'Dep Failed' : 'Waiting for deps'}
                               </span>
                             )}
                             {pkg.build_status === 'dep_build_pending' && (
@@ -1501,11 +1504,14 @@ export default function ProjectDetail() {
                             )}
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
-                                className="px-2 py-1 bg-orange-900/30 text-orange-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : 'Waiting for dependencies to be built'}
+                                className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
+                                title={[
+                                  pkg.failed_dep_names?.length ? `Blocked by failed dep(s):\n${pkg.failed_dep_names.join('\n')}` : '',
+                                  pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : '',
+                                ].filter(Boolean).join('\n\n') || 'Waiting for dependencies to be built'}
                               >
                                 <Clock className="h-3 w-3" />
-                                Waiting for deps
+                                {(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'Dep Failed' : 'Waiting for deps'}
                               </span>
                             )}
                             {pkg.build_status === 'dep_build_pending' && (

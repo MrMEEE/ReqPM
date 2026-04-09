@@ -173,6 +173,16 @@ class BuildErrorAnalyzer:
                 'suggestion': 'Add gcc-c++ as BuildRequires',
                 'capture_items': False,
             },
+            'wrong_module_glob': {
+                'pattern': r'Globs did not match any module: (\S+)',
+                'category': 'Wrong Module Glob',
+                'suggestion': 'Replace %pyproject_save_files module name with +auto (namespace package — reads dist-info RECORD without glob matching)',
+            },
+            'namespace_glob_dot': {
+                'pattern': r'Attempted to use a namespaced package with \. in the glob: (\S+)',
+                'category': 'Wrong Module Glob',
+                'suggestion': 'Replace %pyproject_save_files module name with +auto (namespace package — reads dist-info RECORD without glob matching)',
+            },
         }
 
     # Common English words that mock/dnf may echo back verbatim from error

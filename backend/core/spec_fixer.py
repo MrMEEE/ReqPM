@@ -26,6 +26,7 @@ AUTO_FIXABLE_CATEGORIES = {
     'Invalid Pyproject License',
     'Missing Setup.py',
     'Unpackaged Files',
+    'Wrong Module Glob',
 }
 
 
@@ -106,6 +107,10 @@ class SpecFixer:
                 # Extract file list from error items or log
                 # This will be filled in by extracting from build log
                 content, applied = self._fix_unpackaged_files(content, error)
+                fixes.extend(applied)
+
+            elif category == 'Wrong Module Glob':
+                content, applied = self._fix_wrong_module_glob(content, items)
                 fixes.extend(applied)
 
         return content, fixes
@@ -355,6 +360,57 @@ class SpecFixer:
                 )
                 applied.append('Added %pyproject_buildrequires to %generate_buildrequires section')
         
+        return content, applied
+
+    def _fix_wrong_module_glob(self, spec: str, items: list) -> tuple:
+        """
+        Replace a bad %pyproject_save_files <module> glob with +auto when the
+        generated module name doesn't match the actual installed directory.
+
+        Example: poetry-core installs as poetry/core/ (namespace pkg),
+        not poetry_core/. Using +auto reads the dist-info RECORD directly
+        without glob matching, which handles namespace packages correctly.
+
+        NOTE: do NOT use bare * here — in the %install shell scriptlet, *
+        is shell-expanded to the CWD's file listing before pyproject_save_files
+        receives it (e.g. "README.md" gets passed and triggers a separate error).
+        +auto is the officially supported way to skip glob-based detection.
+        """
+        applied = []
+        content = spec
+
+        for bad_name in items:
+            # Replace the specific bad name (but not if already set to +auto)
+            pattern = r'(%pyproject_save_files\s+)' + re.escape(bad_name) + r'(\b[^\n]*)'
+            if re.search(pattern, content):
+                content = re.sub(pattern, r'\1+auto', content, count=1)
+                applied.append(
+                    f'Replaced %pyproject_save_files {bad_name} with +auto '
+                    f'(namespace package — module dir name differs from dist-info name)'
+                )
+
+        # Fallback: if items were empty but category matched, replace any non-+auto glob
+        # This also catches the previous bad fix of bare * (shell-expanded by bash)
+        if not applied:
+            pattern_any = r'(%pyproject_save_files\s+)(?!\+auto)([^\s\n]+)'
+            if re.search(pattern_any, content):
+                content = re.sub(pattern_any, r'\1+auto', content, count=1)
+                applied.append(
+                    'Replaced %pyproject_save_files <module> with +auto '
+                    '(module dir name differs from dist-info name)'
+                )
+
+        # When +auto is now in effect, strip any hardcoded /usr/lib/python*/site-packages/
+        # paths that a previous unpackaged-files fix may have appended to %files.
+        # +auto already generates those entries via %{pyproject_files}; keeping them causes
+        # "File listed twice" RPM warnings.
+        if applied:
+            content = re.sub(
+                r'\n/usr/lib/python[^\n]+(?:\n/usr/lib/python[^\n]+)*',
+                '',
+                content,
+            )
+
         return content, applied
 
     def _fix_unpackaged_files(self, spec: str, error: dict) -> tuple:

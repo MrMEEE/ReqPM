@@ -1174,31 +1174,98 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         # Modify the %files section to include the unpackaged files
         spec_content = current_spec.content
 
-        # If the spec uses %pyproject_save_files, site-packages files are already
-        # covered by %{pyproject_files}. Only add files outside that scope (e.g. /usr/bin/).
-        uses_pyproject_save = '%pyproject_save_files' in spec_content
+        # If the spec uses %pyproject_save_files +auto, all site-packages files
+        # are already covered by %{pyproject_files} via the RECORD.
+        # If it uses %pyproject_save_files <module_name> (not +auto), the explicit
+        # module glob may not catch sibling packages installed by the same dist
+        # (e.g. setuptools also installs pkg_resources and _distutils_hack).
+        # In that case we extract the top-level module names from unpackaged paths
+        # and add them to the %pyproject_save_files line.
+        pyproject_save_line = ''
+        if '%pyproject_save_files' in spec_content:
+            m_ps = re.search(r'%pyproject_save_files[^\n]*', spec_content)
+            if m_ps:
+                pyproject_save_line = m_ps.group(0)
+        uses_pyproject_save_auto = '%pyproject_save_files' in spec_content and '+auto' in pyproject_save_line
+        uses_pyproject_save_named = '%pyproject_save_files' in spec_content and not uses_pyproject_save_auto
+
+        # Already-listed module names in %pyproject_save_files (for de-dup)
+        existing_save_modules = set()
+        if uses_pyproject_save_named and pyproject_save_line:
+            for token in pyproject_save_line.split()[1:]:   # skip the macro name itself
+                existing_save_modules.add(token)
 
         # Convert file paths to RPM macros where applicable
+        # Also collect top-level site-packages module names that are missing from save_files
         files_to_add = []
+        missing_save_modules = []        # new module names to inject into %pyproject_save_files
+        sitelib_pth_files = []           # loose .pth files in site-packages (not modules)
+        _seen_missing_modules = set()
+
+        _sitelib_re = re.compile(r'^/usr/lib/python[^/]+/site-packages/')
+
         for file_path in unpackaged_files:
             if file_path.startswith('/usr/bin/'):
-                # Use RPM macro for /usr/bin
                 script_name = file_path[len('/usr/bin/'):]
                 files_to_add.append(f'%{{_bindir}}/{script_name}')
-            elif file_path.startswith('/usr/lib/python') and uses_pyproject_save:
-                # Already handled by %pyproject_save_files — skip to avoid "listed twice"
-                logger.info(f"Skipping site-packages path already covered by %pyproject_save_files: {file_path}")
+
+            elif _sitelib_re.match(file_path) and uses_pyproject_save_auto:
+                # +auto already covers all RECORD entries — skip to avoid "listed twice"
+                logger.info(f"Skipping site-packages path already covered by %pyproject_save_files +auto: {file_path}")
                 continue
+
+            elif _sitelib_re.match(file_path) and uses_pyproject_save_named:
+                # Named save_files — extract the top-level module/package to add
+                rel = _sitelib_re.sub('', file_path)    # strip /usr/lib/pythonX.Y/site-packages/
+                top = rel.split('/')[0]                  # first path component
+                if top.endswith('.pth'):
+                    # Loose .pth file — needs explicit %files entry
+                    sitelib_pth_files.append(file_path)
+                elif top not in existing_save_modules and top not in _seen_missing_modules:
+                    missing_save_modules.append(top)
+                    _seen_missing_modules.add(top)
+                    logger.info(f"Will add module '{top}' to %pyproject_save_files for {package_id}")
+                # else: already listed or already queued
+
             elif file_path.startswith('/usr/lib/'):
-                # Keep as-is or use appropriate macro
                 files_to_add.append(file_path)
+
             elif file_path.startswith('/usr/share/'):
-                # Use RPM macro for /usr/share
                 rel_path = file_path[len('/usr/share/'):]
                 files_to_add.append(f'%{{_datadir}}/{rel_path}')
+
             else:
-                # Keep as-is for other paths
                 files_to_add.append(file_path)
+
+        # Add explicit entries for loose .pth files to %files
+        files_to_add.extend(sitelib_pth_files)
+
+        # If named %pyproject_save_files misses some site-packages siblings,
+        # add the missing module names to the %pyproject_save_files line.
+        if missing_save_modules and uses_pyproject_save_named:
+            logger.info(f"Adding missing modules to %pyproject_save_files: {missing_save_modules}")
+            log_package(package_id, 'info',
+                        f'Adding missing modules to %%pyproject_save_files: {missing_save_modules}')
+            new_save_line = pyproject_save_line + ' ' + ' '.join(missing_save_modules)
+            new_spec_content = spec_content.replace(pyproject_save_line, new_save_line, 1)
+            # Also add any loose .pth files to %files if needed
+            if sitelib_pth_files:
+                pth_entries = '\n'.join(sitelib_pth_files)
+                files_pattern_inner = r'(%files\s+-f\s+%\{pyproject_files\})'
+                if re.search(files_pattern_inner, new_spec_content):
+                    new_spec_content = re.sub(
+                        files_pattern_inner,
+                        f'%files -f %{{pyproject_files}}\n{pth_entries}',
+                        new_spec_content,
+                    )
+            package = Package.objects.get(id=package_id)
+            SpecFileRevision.objects.create(
+                package=package,
+                content=new_spec_content,
+                commit_message=f'Auto-fixed: Added {missing_save_modules} to %%pyproject_save_files'
+            )
+            logger.info(f"Updated %%pyproject_save_files with missing modules for {package.name}")
+            return True
         
         # Find and replace the %files section
         # Current: %files -f %{pyproject_files}
@@ -1206,7 +1273,7 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         files_pattern = r'(%files\s+-f\s+%\{pyproject_files\})'
 
         if not files_to_add:
-            logger.info(f"All unpackaged files already covered by %pyproject_save_files for {package_id}")
+            logger.info(f"All unpackaged files already covered or handled for {package_id}")
             return False
 
         if re.search(files_pattern, spec_content):

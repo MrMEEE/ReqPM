@@ -16,19 +16,16 @@ logger = logging.getLogger(__name__)
 
 def normalize_package_name(name: str) -> str:
     """
-    Normalize a package name to prevent duplicates.
-    Converts to lowercase for case-insensitive comparison.
+    Normalize a package name per PEP 503 to prevent duplicates.
+    Lowercases and replaces hyphens, underscores, and dots with a single hyphen.
     
-    PyPI package names are case-insensitive, so 'Django' and 'django' 
-    are the same package. This function ensures consistent storage.
-    
-    Args:
-        name: Package name to normalize
-        
-    Returns:
-        Normalized package name (lowercase)
+    This means 'typing-extensions', 'typing_extensions', and 'Typing.Extensions'
+    all normalize to 'typing-extensions'.
     """
-    return name.lower() if name else name
+    import re
+    if not name:
+        return name
+    return re.sub(r'[-_.]+', '-', name.lower())
 
 
 def log_project(project_id: int, level: str, message: str):

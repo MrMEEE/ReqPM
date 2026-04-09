@@ -37,10 +37,15 @@ class Command(BaseCommand):
         else:
             self.stdout.write('Checking all projects...')
         
-        # Group packages by (project, lowercase_name)
+        # Group packages by (project, pep503_normalized_name)
+        # PEP 503: lowercase and map hyphens/underscores/dots to a single hyphen.
+        import re
+        def pep503(n):
+            return re.sub(r'[-_.]+', '-', n.lower()) if n else n
+
         package_groups = defaultdict(list)
         for package in packages_qs.select_related('project').order_by('project_id', 'name'):
-            key = (package.project_id, package.name.lower())
+            key = (package.project_id, pep503(package.name))
             package_groups[key].append(package)
         
         # Find duplicates
