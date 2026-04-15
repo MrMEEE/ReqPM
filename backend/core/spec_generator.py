@@ -264,7 +264,18 @@ class SpecFileGenerator:
         
         version = version or "0.0.1"
         date = datetime.now().strftime("%a %b %d %Y")
-        
+
+        # Resolve the correct SPDX license from PyPI metadata
+        license_str = "Unknown"
+        try:
+            from backend.core.pypi_client import PyPIClient
+            _pypi = PyPIClient()
+            _pkg_info = _pypi.get_package_info(pypi_name, version)
+            if _pkg_info and _pkg_info.license and _pkg_info.license != 'Unknown':
+                license_str = _pkg_info.license
+        except Exception as _e:
+            logger.debug(f"Could not resolve license for {pypi_name}: {_e}")
+
         # Determine Python version suffix (empty for "default")
         py_suffix = "" if python_version == "default" else python_version
         py_macro = "3" if python_version == "default" else python_version.replace(".", "")
@@ -363,7 +374,7 @@ Version:        {version}
 Release:        1%{{?dist}}
 Summary:        Python package {pypi_name}
 
-License:        Unknown
+License:        {license_str}
 URL:            https://pypi.org/project/{pypi_name}
 {source_line}
 

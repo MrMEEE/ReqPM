@@ -793,6 +793,10 @@ def build_single_package_task(self, package_id: int):
                     fixed = True
                 elif _detect_and_fix_wrong_module_glob(package_id, rpm_result.log_output or ''):
                     fixed = True
+                elif _detect_and_fix_missing_header_files(package_id, rpm_result.log_output or ''):
+                    fixed = True
+                elif _detect_and_fix_spec_errors(package_id, rpm_result.log_output or ''):
+                    fixed = True
                 
                 if fixed:
                     # Spec file was regenerated, retry the build from SRPM
@@ -1201,6 +1205,7 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         missing_save_modules = []        # new module names to inject into %pyproject_save_files
         sitelib_pth_files = []           # loose .pth files in site-packages (not modules)
         _seen_missing_modules = set()
+        unpkgd_sitelib_rels = []         # sitelib-relative paths missed by +auto (namespace pkgs)
 
         _sitelib_re = re.compile(r'^/usr/lib/python[^/]+/site-packages/')
 
@@ -1210,9 +1215,14 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
                 files_to_add.append(f'%{{_bindir}}/{script_name}')
 
             elif _sitelib_re.match(file_path) and uses_pyproject_save_auto:
-                # +auto already covers all RECORD entries — skip to avoid "listed twice"
-                logger.info(f"Skipping site-packages path already covered by %pyproject_save_files +auto: {file_path}")
-                continue
+                # +auto uses the wheel RECORD to detect packages.  Namespace
+                # packages (e.g. coherent/licensed/) live 2 levels deep: the
+                # top-level namespace dir has no __init__.py and isn't in the
+                # RECORD, so +auto misses them.  Collect for directory-level
+                # processing below instead of silently skipping.
+                rel = _sitelib_re.sub('', file_path)
+                unpkgd_sitelib_rels.append(rel)
+                logger.info(f"Queuing sitelib path missed by +auto: {file_path}")
 
             elif _sitelib_re.match(file_path) and uses_pyproject_save_named:
                 # Named save_files — extract the top-level module/package to add
@@ -1239,6 +1249,42 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
 
         # Add explicit entries for loose .pth files to %files
         files_to_add.extend(sitelib_pth_files)
+
+        # Process sitelib paths missed by +auto (namespace packages).
+        # Group by top-level component, then find the minimal directory entry:
+        # - If all files under a top-level namespace share a single 2nd-level
+        #   directory (e.g. coherent/licensed/*), use that as the entry so we
+        #   don't grab the entire namespace (coherent/) — that could conflict
+        #   with other coherent.* packages.
+        # - Otherwise fall back to the top-level directory.
+        if unpkgd_sitelib_rels:
+            from collections import defaultdict
+            by_top: dict = defaultdict(set)
+            for rel in unpkgd_sitelib_rels:
+                parts = [p for p in rel.split('/') if p]
+                if not parts:
+                    continue
+                top = parts[0]
+                level2 = parts[1] if len(parts) > 1 else None
+                by_top[top].add(level2)
+
+            for top, level2_set in by_top.items():
+                if top.endswith('.dist-info') or top.endswith('.pth'):
+                    # dist-info and .pth files are already handled by +auto/pyproject_files
+                    continue
+                # Real sub-directories at level 2 (no extension, not __pycache__)
+                real_dirs = {
+                    p for p in level2_set
+                    if p and '.' not in p and not p.startswith('__')
+                }
+                if len(real_dirs) == 1:
+                    sub = real_dirs.pop()
+                    entry = f'%{{python3_sitelib}}/{top}/{sub}/'
+                else:
+                    entry = f'%{{python3_sitelib}}/{top}/'
+                if entry not in files_to_add:
+                    files_to_add.append(entry)
+                    logger.info(f"Adding namespace dir to %%files for +auto package: {entry}")
 
         # If named %pyproject_save_files misses some site-packages siblings,
         # add the missing module names to the %pyproject_save_files line.
@@ -1308,6 +1354,97 @@ def _detect_and_fix_unpackaged_files(package_id: int, build_log: str):
         return False
 
 
+def _detect_and_fix_spec_errors(package_id: int, build_log: str) -> bool:
+    """
+    General-purpose catch-all: run the build log through SpecFixer.apply_fixes()
+    and create a new spec revision if any AUTO_FIXABLE_CATEGORIES errors are found
+    and the fixer makes at least one change.
+
+    Covers categories not handled by the more specific detectors above:
+    - Invalid Pyproject License
+    - Architecture Mismatch (noarch binary)
+    - Ambiguous Python Shebang
+    - Empty Debug Info
+    - Missing GCC (gcc missing)
+    - Missing G++ Compiler
+
+    Returns True when a new spec revision was created.
+    """
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.error_analyzer import BuildErrorAnalyzer
+    from backend.core.spec_fixer import SpecFixer, AUTO_FIXABLE_CATEGORIES
+
+    # Quick guard: at least one fixable keyword must appear in the log before
+    # paying the cost of a full analysis + DB round-trip.
+    _FAST_KEYWORDS = [
+        'invalid pyproject.toml config',
+        'arch dependent binaries in noarch',
+        'ambiguous python shebang',
+        'empty debuginfo',
+        'empty %files file',
+        "command 'gcc' failed",
+        "FileNotFoundError.*'g\\+\\+'",
+    ]
+    if not any(kw.lower() in build_log.lower() for kw in [
+        'invalid pyproject.toml config',
+        'arch dependent binaries in noarch',
+        'ambiguous python shebang',
+        'empty debuginfo',
+        "command 'gcc' failed",
+        "command 'g++' failed",
+        'filenotfounderror',
+    ]):
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+
+        analyzer = BuildErrorAnalyzer()
+        errors = analyzer.analyze(build_log)
+        fixable = [
+            {'category': e.category, 'items': e.items, 'message': e.message, 'suggestion': e.suggestion}
+            for e in errors
+            if e.category in AUTO_FIXABLE_CATEGORIES
+            # Skip categories handled by dedicated detectors
+            and e.category not in (
+                'Missing Header Files',
+                'Missing Packages',
+                'Missing Dependencies',
+                'Missing Python Modules',
+                'Missing Python Wheel',
+                'Unpackaged Files',
+                'Wrong Module Glob',
+                'Missing Setup.py',
+            )
+        ]
+        if not fixable:
+            return False
+
+        current_spec = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        fixer = SpecFixer()
+        new_spec, applied = fixer.apply_fixes(current_spec.content, fixable)
+        if not applied:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_spec,
+            commit_message=f'Auto-fix: {"; ".join(applied)}'
+        )
+        log_package(package_id, 'info', f'Auto-fixed spec: {"; ".join(applied)}')
+        logger.info(f'Auto-fixed spec errors for {package.name}: {applied}')
+        return True
+
+    except Exception as e:
+        logger.error(f'Error in _detect_and_fix_spec_errors for {package_id}: {e}')
+        return False
+
+
 def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
     """
     Detect the 'Globs did not match any module: <name>' error from
@@ -1367,6 +1504,146 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
 
     except Exception as e:
         logger.error(f"Error in wrong_module_glob fix for package {package_id}: {e}")
+        return False
+
+
+def _lookup_devel_package_via_mock(target: str, item: str) -> str | None:
+    """
+    Query the mock chroot's dnf to find which RPM package provides a header
+    file or pkg-config library.  Uses the shared bootstrap chroot with
+    --no-clean so no fresh chroot initialisation is required.
+
+    item may be a bare header filename ('ffi.h') or a pkg-config name ('libffi').
+    Returns the provider package name, or None if the lookup fails / times out.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    mock_bin = _shutil.which('mock') or '/usr/bin/mock'
+    if not os.path.exists(mock_bin):
+        return None
+
+    # Build the dnf whatprovides expression
+    if item.endswith('.h'):
+        query = f'*/{item}'
+    else:
+        # pkg-config provides — RPM dependency syntax
+        query = f'pkgconfig({item})'
+
+    if os.geteuid() != 0:
+        cmd = ['sudo', '-n', mock_bin]
+    else:
+        cmd = [mock_bin]
+    cmd += [
+        '-r', target, '--no-clean', '--shell',
+        f'dnf repoquery --whatprovides "{query}" --qf "%{{name}}" 2>/dev/null'
+        f' | grep -v "^$" | head -1'
+    ]
+
+    try:
+        env = os.environ.copy()
+        env.update({'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8'})
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+        if result.returncode == 0 and result.stdout.strip():
+            # Filter out mock INFO/WARNING lines
+            lines = [
+                l.strip() for l in result.stdout.split('\n')
+                if l.strip() and not l.startswith('INFO') and not l.startswith('WARNING')
+            ]
+            if lines:
+                pkg = lines[0]
+                # Sanity-check: must look like an RPM package name
+                if re.match(r'^[a-zA-Z][a-zA-Z0-9._+-]+$', pkg):
+                    return pkg
+    except Exception as e:
+        logger.debug(f"mock dnf lookup for {item!r} failed: {e}")
+    return None
+
+
+def _detect_and_fix_missing_header_files(package_id: int, build_log: str) -> bool:
+    """
+    Detect 'Missing Header Files' errors (missing headers or pkg-config libraries)
+    and add the corresponding -devel packages as BuildRequires in the spec.
+
+    Uses a static HEADER_TO_DEVEL map for the most common libraries; falls back
+    to a dnf repoquery lookup inside the mock chroot for unknown items.
+
+    Returns True when a new spec revision was created (triggers a rebuild).
+    """
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.error_analyzer import BuildErrorAnalyzer
+    from backend.core.spec_fixer import SpecFixer, HEADER_TO_DEVEL
+
+    try:
+        package = Package.objects.get(id=package_id)
+
+        analyzer = BuildErrorAnalyzer()
+        errors = analyzer.analyze(build_log)
+        header_errors = [e for e in errors if e.category == 'Missing Header Files']
+        if not header_errors:
+            return False
+
+        all_items = []
+        for e in header_errors:
+            all_items.extend(e.items)
+        if not all_items:
+            return False
+
+        # De-duplicate while preserving order
+        seen_items: set = set()
+        unique_items = [i for i in all_items if not (i in seen_items or seen_items.add(i))]
+
+        packages_to_add = []
+        unknown = []
+        for item in unique_items:
+            pkg = HEADER_TO_DEVEL.get(item)
+            if pkg:
+                packages_to_add.append(pkg)
+            else:
+                unknown.append(item)
+
+        # For items not in the static map, try a live mock lookup
+        if unknown:
+            target = f"rhel-{package.project.rhel_version}-x86_64"
+            for item in unknown:
+                pkg = _lookup_devel_package_via_mock(target, item)
+                if pkg:
+                    logger.info(f"mock dnf resolved {item!r} \u2192 {pkg!r} for {package.name}")
+                    packages_to_add.append(pkg)
+                else:
+                    logger.debug(f"No devel package found for header/pc: {item!r}")
+
+        if not packages_to_add:
+            logger.info(f"No devel packages mapped for {package.name}'s missing headers: {unique_items}")
+            return False
+
+        # De-duplicate
+        seen_pkgs: set = set()
+        packages_to_add = [p for p in packages_to_add if not (p in seen_pkgs or seen_pkgs.add(p))]
+
+        current_spec = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        fixer = SpecFixer()
+        new_spec, applied = fixer._add_buildrequires_items(current_spec.content, packages_to_add)
+        if not applied:
+            logger.info(f"All devel packages already present in spec for {package.name}")
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_spec,
+            commit_message=f'Auto-fix: add missing devel packages ({"; ".join(applied)})'
+        )
+        log_package(package_id, 'info', f'Auto-fixed spec: {"; ".join(applied)}')
+        logger.info(f"Fixed missing devel packages for {package.name}: {applied}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in _detect_and_fix_missing_header_files for {package_id}: {e}")
         return False
 
 

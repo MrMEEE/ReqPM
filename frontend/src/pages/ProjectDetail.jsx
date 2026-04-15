@@ -1,6 +1,6 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GitBranch, Package, AlertCircle, AlertTriangle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, ChevronsUpDown, Hammer, Download, X, Terminal, FileCode, Wrench } from 'lucide-react';
+import { ArrowLeft, GitBranch, Package, AlertCircle, AlertTriangle, CheckCircle, Clock, XCircle, Edit2, RefreshCw, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, ChevronsUpDown, Hammer, Download, X, Terminal, FileCode, Wrench, Network } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
@@ -737,6 +737,14 @@ export default function ProjectDetail() {
           )}
         </div>
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => navigate(`/projects/${id}/dependency-map`)}
+            className="flex items-center gap-2 px-4 py-2 bg-teal-700 text-white rounded-lg hover:bg-teal-600 transition-colors"
+            title="View dependency map for this project"
+          >
+            <Network className="h-4 w-4" />
+            Dependency Map
+          </button>
           {project.status === 'ready' && (
             <>
               <button

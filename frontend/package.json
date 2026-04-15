@@ -12,6 +12,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.90.19",
     "@tanstack/react-virtual": "^3.13.23",
+    "@xyflow/react": "^12.10.2",
     "autoprefixer": "^10.4.23",
     "axios": "^1.13.2",
     "lucide-react": "^0.563.0",

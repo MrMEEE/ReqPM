@@ -13,6 +13,153 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_CLASSIFIER_TO_SPDX = {
+    'MIT License': 'MIT',
+    'MIT': 'MIT',
+    'Apache Software License': 'Apache-2.0',
+    'BSD License': 'BSD-3-Clause',
+    'BSD 2-Clause "Simplified" License': 'BSD-2-Clause',
+    'BSD 3-Clause "New" or "Revised" License': 'BSD-3-Clause',
+    'GNU General Public License v2 (GPLv2)': 'GPL-2.0-only',
+    'GNU General Public License v2 or later (GPLv2+)': 'GPL-2.0-or-later',
+    'GNU General Public License v3 (GPLv3)': 'GPL-3.0-only',
+    'GNU General Public License v3 or later (GPLv3+)': 'GPL-3.0-or-later',
+    'GNU Lesser General Public License v2 (LGPLv2)': 'LGPL-2.0-only',
+    'GNU Lesser General Public License v2 or later (LGPLv2+)': 'LGPL-2.0-or-later',
+    'GNU Lesser General Public License v3 (LGPLv3)': 'LGPL-3.0-only',
+    'GNU Lesser General Public License v3 or later (LGPLv3+)': 'LGPL-3.0-or-later',
+    'Mozilla Public License 2.0 (MPL 2.0)': 'MPL-2.0',
+    'Mozilla Public License 1.1 (MPL 1.1)': 'MPL-1.1',
+    'ISC License (ISCL)': 'ISC',
+    'ISC': 'ISC',
+    'Python Software Foundation License': 'PSF-2.0',
+    'Creative Commons Attribution 4.0': 'CC-BY-4.0',
+    'The Unlicense (Unlicense)': 'Unlicense',
+    'Boost Software License 1.0 (BSL-1.0)': 'BSL-1.0',
+    'Eclipse Public License 2.0 (EPL-2.0)': 'EPL-2.0',
+    'Eclipse Public License 1.0 (EPL-1.0)': 'EPL-1.0',
+    'European Union Public Licence 1.2 (EUPL 1.2)': 'EUPL-1.2',
+    'Academic Free License (AFL)': 'AFL-3.0',
+    'Artistic License': 'Artistic-2.0',
+    'zlib/libpng License': 'Zlib',
+    'OSI Approved': None,  # too vague
+}
+
+# Non-SPDX strings that appear in the `license` field of older packages.
+_LICENSE_TEXT_TO_SPDX = {
+    'mit': 'MIT',
+    'apache-2.0': 'Apache-2.0',
+    'apache 2.0': 'Apache-2.0',
+    'apache software license': 'Apache-2.0',
+    'bsd': 'BSD-3-Clause',
+    'bsd-2-clause': 'BSD-2-Clause',
+    'bsd-3-clause': 'BSD-3-Clause',
+    'bsd 2-clause': 'BSD-2-Clause',
+    'bsd 3-clause': 'BSD-3-Clause',
+    'gpl': 'GPL-2.0-or-later',
+    'gpl-2': 'GPL-2.0-only',
+    'gpl-2.0': 'GPL-2.0-only',
+    'gplv2': 'GPL-2.0-only',
+    'gplv2+': 'GPL-2.0-or-later',
+    'gpl-3': 'GPL-3.0-only',
+    'gpl-3.0': 'GPL-3.0-only',
+    'gplv3': 'GPL-3.0-only',
+    'gplv3+': 'GPL-3.0-or-later',
+    'lgpl': 'LGPL-2.1-or-later',
+    'lgpl-2.1': 'LGPL-2.1-only',
+    'lgpl-3.0': 'LGPL-3.0-only',
+    'lgplv2': 'LGPL-2.0-only',
+    'lgplv2+': 'LGPL-2.0-or-later',
+    'lgplv3': 'LGPL-3.0-only',
+    'lgplv3+': 'LGPL-3.0-or-laterly',
+    'lgplv2': 'LGPL-2.0-only',
+    'lgplv2+': 'LGPL-2.0-or-later',
+    'lgplv3': 'LGPL-3.0-only',
+    'lgplv3+': 'LGPL-3.0-or-laterly',
+    'lgplv2': 'LGPL-2.0-only',
+    'lgplv2+': 'LGPL-2.0-or-later',
+    'lgplv3': 'LGPL-3.0-only',
+    'lgplv3+': 'LGPL-3.0-or-later',
+    'mpl-2.0': 'MPL-2.0',
+    'mpl2': 'MPL-2.0',
+    'isc': 'ISC',
+    'psf': 'PSF-2.0',
+    'psf-2.0': 'PSF-2.0',
+    'python software foundation': 'PSF-2.0',
+    'unlicense': 'Unlicense',
+    'cc0': 'CC0-1.0',
+    'cc0-1.0': 'CC0-1.0',
+    'zlib': 'Zlib',
+    'bsl-1.0': 'BSL-1.0',
+    'epl-2.0': 'EPL-2.0',
+    'epl-1.0': 'EPL-1.0',
+    'eupl-1.2': 'EUPL-1.2',
+    'artistic': 'Artistic-2.0',
+    'artistic-2.0': 'Artistic-2.0',
+    '2-clause bsd': 'BSD-2-Clause',
+    '3-clause bsd': 'BSD-3-Clause',
+    'new bsd': 'BSD-3-Clause',
+    'modified bsd': 'BSD-3-Clause',
+    'simplified bsd': 'BSD-2-Clause',
+    'dual mit/bsd': 'MIT AND BSD-3-Clause',
+    'mit/x11': 'MIT',
+    'mit license': 'MIT',
+    'the mit license': 'MIT',
+    'mozilla public license 2.0': 'MPL-2.0',
+    'mozilla public license 1.1': 'MPL-1.1',
+    'gnu gpl': 'GPL-2.0-or-later',
+    'gnu lgpl': 'LGPL-2.1-or-later',
+}
+
+# SPDX identifier regex: short token, no newlines, typical punctuation
+_SPDX_RE = re.compile(
+    r'^[A-Za-z][A-Za-z0-9.+\-]+(?:\s+(?:AND|OR|WITH)\s+[A-Za-z][A-Za-z0-9.+\-]+)*$'
+)
+
+
+def resolve_license_spdx(license_str: Optional[str],
+                         license_expression: Optional[str],
+                         classifiers: List[str]) -> str:
+    """
+    Return the best available SPDX license expression for a PyPI package.
+
+    Resolution order:
+    1. ``license_expression``  — already SPDX (PEP 639 compliant, new packages)
+    2. ``license``             — may be SPDX-like or a freeform string
+    3. ``classifiers``         — ``License :: OSI Approved :: X`` entries
+    4. ``'Unknown'``           — fallback when nothing else works
+    """
+    # 1. license_expression — trust it immediately
+    if license_expression and license_expression.strip():
+        return license_expression.strip()
+
+    # 2. license field normalization
+    if license_str and license_str.strip():
+        raw = license_str.strip()
+        # Reject full-text license bodies (multi-line or very long)
+        if '\n' not in raw and len(raw) <= 120:
+            lower = raw.lower()
+            # Direct map hit
+            mapped = _LICENSE_TEXT_TO_SPDX.get(lower)
+            if mapped:
+                return mapped
+            # Already looks like a valid SPDX expression
+            if _SPDX_RE.match(raw):
+                return raw
+
+    # 3. Classifiers
+    for c in classifiers:
+        parts = [p.strip() for p in c.split('::')]
+        if 'License' in parts and 'OSI Approved' in parts:
+            leaf = parts[-1] if len(parts) > 2 else None
+            if leaf:
+                spdx = _CLASSIFIER_TO_SPDX.get(leaf)
+                if spdx:
+                    return spdx
+
+    return 'Unknown'
+
+
 @dataclass
 class PackageInfo:
     """Information about a Python package"""
@@ -21,6 +168,7 @@ class PackageInfo:
     summary: str
     description: str
     license: str
+    license_expression: Optional[str]
     home_page: str
     author: str
     author_email: str
@@ -94,18 +242,24 @@ class PyPIClient:
             if not source_url and urls:
                 source_url = urls[0].get('url')
             
+            classifiers = info.get('classifiers', []) or []
             return PackageInfo(
                 name=info.get('name', package_name),
                 version=info.get('version', version or 'unknown'),
                 summary=info.get('summary', ''),
                 description=info.get('description', ''),
-                license=info.get('license', 'Unknown'),
+                license=resolve_license_spdx(
+                    info.get('license'),
+                    info.get('license_expression'),
+                    classifiers,
+                ),
+                license_expression=info.get('license_expression'),
                 home_page=info.get('home_page', ''),
                 author=info.get('author', ''),
                 author_email=info.get('author_email', ''),
                 requires_python=info.get('requires_python'),
                 requires_dist=info.get('requires_dist', []) or [],
-                classifiers=info.get('classifiers', []),
+                classifiers=classifiers,
                 download_url=info.get('download_url', ''),
                 source_url=source_url
             )

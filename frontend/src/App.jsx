@@ -9,6 +9,7 @@ import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import Projects from './pages/Projects';
 import ProjectDetail from './pages/ProjectDetail';
+import DependencyMap from './pages/DependencyMap';
 import Packages from './pages/Packages';
 import PackageDetail from './pages/PackageDetail';
 import Builds from './pages/Builds';
@@ -69,6 +70,15 @@ function App() {
               }
             />
             
+            <Route
+              path="/projects/:id/dependency-map"
+              element={
+                <ProtectedRoute>
+                  <DependencyMap />
+                </ProtectedRoute>
+              }
+            />
+
             <Route
               path="/packages"
               element={

@@ -51,6 +51,18 @@ class BuildErrorAnalyzer:
                 'category': 'Missing Header Files',
                 'suggestion': 'Install development packages for required libraries'
             },
+            'missing_pkgconfig': {
+                # e.g.: Package 'libffi', required by 'virtual:world', not found
+                'pattern': r"Package '([^']+)'.*not found",
+                'category': 'Missing Header Files',
+                'suggestion': 'Install development packages for required libraries',
+            },
+            'missing_pkgconfig_meson': {
+                # e.g.: Dependency "ffi" not found, tried pkgconfig
+                'pattern': r'Dependency "([^"]+)" not found, tried pkgconfig',
+                'category': 'Missing Header Files',
+                'suggestion': 'Install development packages for required libraries',
+            },
             'ambiguous_shebang': {
                 'pattern': r'ambiguous python shebang',
                 'category': 'Ambiguous Python Shebang',

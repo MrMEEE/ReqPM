@@ -20,6 +20,7 @@ AUTO_FIXABLE_CATEGORIES = {
     'Missing Python Wheel',
     'Missing GCC',
     'Missing G++ Compiler',
+    'Missing Header Files',
     'Ambiguous Python Shebang',
     'Empty Debug Info',
     'Architecture Mismatch',
@@ -27,6 +28,149 @@ AUTO_FIXABLE_CATEGORIES = {
     'Missing Setup.py',
     'Unpackaged Files',
     'Wrong Module Glob',
+}
+
+# Maps header filenames and pkg-config names → their RPM -devel package.
+# Keys are bare filenames (e.g. 'ffi.h'), full include paths ('openssl/ssl.h'),
+# or pkg-config module names ('libffi').
+HEADER_TO_DEVEL = {
+    # libffi
+    'ffi.h': 'libffi-devel',
+    'ffitarget.h': 'libffi-devel',
+    'libffi': 'libffi-devel',
+    # zlib
+    'zlib.h': 'zlib-devel',
+    'zlib': 'zlib-devel',
+    # OpenSSL
+    'openssl/ssl.h': 'openssl-devel',
+    'openssl/evp.h': 'openssl-devel',
+    'openssl/crypto.h': 'openssl-devel',
+    'openssl/err.h': 'openssl-devel',
+    'openssl/rsa.h': 'openssl-devel',
+    'openssl/x509.h': 'openssl-devel',
+    'openssl': 'openssl-devel',
+    'libssl': 'openssl-devel',
+    'libcrypto': 'openssl-devel',
+    # libcurl
+    'curl/curl.h': 'libcurl-devel',
+    'libcurl': 'libcurl-devel',
+    # libxml2
+    'libxml/xmlversion.h': 'libxml2-devel',
+    'libxml/xpath.h': 'libxml2-devel',
+    'libxml/parser.h': 'libxml2-devel',
+    'libxml2': 'libxml2-devel',
+    'libxml-2.0': 'libxml2-devel',
+    # libxslt
+    'libxslt/xslt.h': 'libxslt-devel',
+    'libxslt': 'libxslt-devel',
+    # libyaml
+    'yaml.h': 'libyaml-devel',
+    'yaml-0.1': 'libyaml-devel',
+    'libyaml-0': 'libyaml-devel',
+    # lz4
+    'lz4.h': 'lz4-devel',
+    'lz4frame.h': 'lz4-devel',
+    'liblz4': 'lz4-devel',
+    # xz / lzma
+    'lzma.h': 'xz-devel',
+    'lzma/lzma.h': 'xz-devel',
+    'liblzma': 'xz-devel',
+    # bzip2
+    'bzlib.h': 'bzip2-devel',
+    'bzip2': 'bzip2-devel',
+    # zstd
+    'zstd.h': 'libzstd-devel',
+    'libzstd': 'libzstd-devel',
+    'zstd': 'libzstd-devel',
+    # libsodium
+    'sodium.h': 'libsodium-devel',
+    'sodium': 'libsodium-devel',
+    'libsodium': 'libsodium-devel',
+    # libevent
+    'event.h': 'libevent-devel',
+    'event2/event.h': 'libevent-devel',
+    'libevent': 'libevent-devel',
+    # snappy
+    'snappy.h': 'snappy-devel',
+    'snappy-c.h': 'snappy-devel',
+    'snappy': 'snappy-devel',
+    # readline
+    'readline/readline.h': 'readline-devel',
+    'readline': 'readline-devel',
+    # openldap
+    'ldap.h': 'openldap-devel',
+    'ldap': 'openldap-devel',
+    # cyrus-sasl
+    'sasl/sasl.h': 'cyrus-sasl-devel',
+    # libuuid
+    'uuid/uuid.h': 'libuuid-devel',
+    'uuid': 'libuuid-devel',
+    # glib2
+    'glib.h': 'glib2-devel',
+    'glib/glib.h': 'glib2-devel',
+    'gio/gio.h': 'glib2-devel',
+    'glib-2.0': 'glib2-devel',
+    'gio-2.0': 'glib2-devel',
+    'gmodule-2.0': 'glib2-devel',
+    'gobject-2.0': 'glib2-devel',
+    # dbus
+    'dbus/dbus.h': 'dbus-devel',
+    'dbus-1': 'dbus-devel',
+    # expat
+    'expat.h': 'expat-devel',
+    'expat': 'expat-devel',
+    # libjpeg
+    'jpeglib.h': 'libjpeg-turbo-devel',
+    'libjpeg': 'libjpeg-turbo-devel',
+    # libpng
+    'png.h': 'libpng-devel',
+    'libpng': 'libpng-devel',
+    'libpng16': 'libpng-devel',
+    # libtiff
+    'tiff.h': 'libtiff-devel',
+    'libtiff-4': 'libtiff-devel',
+    # freetype
+    'ft2build.h': 'freetype-devel',
+    'freetype/freetype.h': 'freetype-devel',
+    'freetype2': 'freetype-devel',
+    # sqlite
+    'sqlite3.h': 'sqlite-devel',
+    'sqlite3': 'sqlite-devel',
+    # postgresql
+    'libpq-fe.h': 'postgresql-devel',
+    'libpq': 'postgresql-devel',
+    'postgres.h': 'postgresql-devel',
+    # mysql
+    'mysql/mysql.h': 'mysql-devel',
+    'mysql.h': 'mysql-devel',
+    'mysqlclient': 'mysql-devel',
+    # pcre
+    'pcre.h': 'pcre-devel',
+    'pcre': 'pcre-devel',
+    'pcre2.h': 'pcre2-devel',
+    'pcre2': 'pcre2-devel',
+    # nettle
+    'nettle/nettle-types.h': 'nettle-devel',
+    'nettle': 'nettle-devel',
+    'hogweed': 'nettle-devel',
+    # brotli
+    'brotli/decode.h': 'brotli-devel',
+    'libbrotlicommon': 'brotli-devel',
+    'libbrotlienc': 'brotli-devel',
+    'libbrotlidec': 'brotli-devel',
+    # cairo
+    'cairo.h': 'cairo-devel',
+    'cairo': 'cairo-devel',
+    # pango
+    'pango/pango.h': 'pango-devel',
+    'pango': 'pango-devel',
+    # gtk3
+    'gtk/gtk.h': 'gtk3-devel',
+    'gdk/gdk.h': 'gtk3-devel',
+    'gtk+-3.0': 'gtk3-devel',
+    # python3
+    'Python.h': 'python3-devel',
+    'python3': 'python3-devel',
 }
 
 
@@ -77,6 +221,10 @@ class SpecFixer:
 
             elif category == 'Missing GCC':
                 content, applied = self._add_buildrequires_items(content, ['gcc'])
+                fixes.extend(applied)
+
+            elif category == 'Missing Header Files':
+                content, applied = self._fix_missing_headers(content, items)
                 fixes.extend(applied)
 
             elif category == 'Ambiguous Python Shebang':
@@ -165,6 +313,28 @@ class SpecFixer:
             logger.debug(f'SpecFixer: added BuildRequires: {item}')
 
         return content, applied
+
+    def _fix_missing_headers(self, spec: str, items: list) -> tuple:
+        """
+        Map missing header files / pkg-config names to their -devel packages
+        and add them as BuildRequires.
+        """
+        packages = []
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            pkg = HEADER_TO_DEVEL.get(item)
+            if pkg:
+                packages.append(pkg)
+            else:
+                logger.debug(f'SpecFixer: no devel mapping for header/pc: {item!r}')
+        if packages:
+            # De-duplicate while preserving order
+            seen = set()
+            unique = [p for p in packages if not (p in seen or seen.add(p))]
+            return self._add_buildrequires_items(spec, unique)
+        return spec, []
 
     def _fix_shebang(self, spec: str) -> tuple:
         """
