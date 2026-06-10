@@ -848,7 +848,8 @@ def build_single_package_task(self, package_id: int):
                                 output_dir=str(build_dir / 'RPMS'),
                                 target=target,
                                 arch=arch,
-                                unique_ext=f"pkg{package_id}"
+                                unique_ext=f"pkg{package_id}",
+                                local_repo_dir=local_repo_dir,
                             )
                             
                             # If it still fails after retry, fall through to normal error handling

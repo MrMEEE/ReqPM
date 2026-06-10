@@ -42,7 +42,7 @@ pyyaml==6.0.1
 # Mock Python dependencies (for Ubuntu/Debian systems where mock is installed via .deb)
 backoff==2.2.1
 templated-dictionary==1.2
-rpmautospec-core==0.14
+rpmautospec-core==0.1.5
 
 # Development tools
 black==23.12.1

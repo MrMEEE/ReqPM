@@ -14,10 +14,10 @@ on:
 
 jobs:
   build-deb:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
-        ubuntu_version: ['22.04', '24.04', '25.10']
+        ubuntu_version: ['24.04', '26.04']
     
     steps:
       - name: Checkout repository
