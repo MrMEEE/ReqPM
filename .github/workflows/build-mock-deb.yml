@@ -15,6 +15,8 @@ on:
 jobs:
   build-deb:
     runs-on: ubuntu-26.04
+    permissions:
+      contents: write
     strategy:
       matrix:
         ubuntu_version: ['24.04', '26.04']
