@@ -19,7 +19,7 @@ jobs:
       contents: write
     strategy:
       matrix:
-        ubuntu_version: ['24.04', '26.04']
+        ubuntu_version: ['26.04']
     
     steps:
       - name: Checkout repository

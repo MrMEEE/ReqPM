@@ -139,6 +139,11 @@ override_dh_auto_install:
 	mkdir -p debian/mock/usr/lib/python3/dist-packages
 	cp -a mock/py/mockbuild debian/mock/usr/lib/python3/dist-packages/
 	
+	# Bundle templated_dictionary - not available in Ubuntu apt repos
+	pip3 install --no-deps --target=debian/mock/usr/lib/python3/dist-packages templated-dictionary
+	# Remove pip metadata that isn't needed at runtime
+	rm -rf debian/mock/usr/lib/python3/dist-packages/templated_dictionary-*.dist-info
+	
 	# Patch constants.py to use correct paths on Debian/Ubuntu
 	sed -i 's|SYSCONFDIR = os.path.join(os.path.dirname(os.path.realpath(sys.argv\[0\])), "..", "etc")|SYSCONFDIR = "/etc"|g' debian/mock/usr/lib/python3/dist-packages/mockbuild/constants.py
 	
