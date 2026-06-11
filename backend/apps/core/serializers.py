@@ -18,10 +18,21 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             'auto_sync_projects',
             'sync_interval_hours',
             'repository_sync_interval_minutes',
+            'ai_fixer_enabled',
+            'ai_fixer_backend',
+            'ai_fixer_model',
+            'ai_fixer_base_url',
+            'ai_fixer_api_key',
+            'ai_fixer_timeout',
+            'ai_fixer_max_attempts',
+            'ai_fixer_max_concurrent',
             'created_at',
             'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'ai_fixer_api_key': {'write_only': True},
+        }
     
     def validate_max_concurrent_builds(self, value):
         """Validate max_concurrent_builds"""

@@ -208,7 +208,31 @@ export default function ProjectDetail() {
   const [transitiveSort, setTransitiveSort] = useState({ key: null, dir: 'asc' });
   const [wsConnected, setWsConnected] = useState(false);
   const [generatingSpecPackages, setGeneratingSpecPackages] = useState(new Set());
+  const [buildStatusFilter, setBuildStatusFilter] = useState(null);
   const wsRef = useRef(null);
+
+  // Build status → actual build_status values to match
+  const STATUS_FILTER_MAP = {
+    completed:        ['completed'],
+    building:         ['building'],
+    failed:           ['failed', 'missing_packages'],
+    pending:          ['pending'],
+    waiting_for_deps: ['waiting_for_deps'],
+    dep_build_pending:['dep_build_pending'],
+    not_built:        ['not_built'],
+  };
+
+  const handleStatusFilterClick = (key) => {
+    setBuildStatusFilter(prev => prev === key ? null : key);
+    setDirectPage(1);
+    setTransitivePage(1);
+  };
+
+  const applyBuildStatusFilter = (list) => {
+    if (!buildStatusFilter) return list;
+    const allowed = STATUS_FILTER_MAP[buildStatusFilter] || [];
+    return list.filter(p => allowed.includes(p.build_status));
+  };
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: ['project', id],
@@ -232,6 +256,24 @@ export default function ProjectDetail() {
     enabled: !!project,
   });
 
+  // Track package statuses for change notifications
+  const prevPkgStatusRef = useRef({});
+  const pkgStatusInitializedRef = useRef(false);
+
+  // Initialize status tracking when package data first loads
+  useEffect(() => {
+    if (!packagesData || pkgStatusInitializedRef.current) return;
+    const allPkgs = [
+      ...(packagesData.packages || []),
+      ...(packagesData.direct_dependencies || []),
+      ...(packagesData.transitive_dependencies || []),
+    ];
+    allPkgs.forEach(pkg => {
+      prevPkgStatusRef.current[pkg.id] = pkg.build_status;
+    });
+    pkgStatusInitializedRef.current = true;
+  }, [packagesData]);
+
   // WebSocket connection for real-time updates
   useEffect(() => {
     if (!id) return;
@@ -253,6 +295,22 @@ export default function ProjectDetail() {
         console.log('WebSocket message:', data);
 
         if (data.type === 'package_update') {
+          const updatedPkg = data.package;
+          const prevStatus = prevPkgStatusRef.current[updatedPkg.id];
+
+          if (pkgStatusInitializedRef.current) {
+            if (prevStatus === undefined) {
+              toast.info(`Dependency added: ${updatedPkg.name}`);
+            } else if (prevStatus !== updatedPkg.build_status) {
+              if (updatedPkg.build_status === 'failed') {
+                toast.error(`Package failed: ${updatedPkg.name}`);
+              } else if (updatedPkg.build_status === 'completed') {
+                toast.success(`Built: ${updatedPkg.name}`);
+              }
+            }
+          }
+          prevPkgStatusRef.current[updatedPkg.id] = updatedPkg.build_status;
+
           // Update the package in cache across all arrays
           queryClient.setQueryData(['project-packages', id], (oldData) => {
             if (!oldData) return oldData;
@@ -817,6 +875,64 @@ export default function ProjectDetail() {
         </div>
       </div>
 
+      {/* Build Stats Bar */}
+      {packagesData?.packages?.length > 0 && (() => {
+        const all = packagesData.packages;
+        const count = (statuses) => all.filter(p => statuses.includes(p.build_status)).length;
+        const total = all.length;
+        const stats = [
+          { key: 'completed',         label: 'Built',            n: count(['completed']),                          color: 'text-green-400',  ring: 'ring-green-500',  bg: 'bg-green-500/10',  dot: 'bg-green-400' },
+          { key: 'building',          label: 'Building',         n: count(['building']),                           color: 'text-blue-400',   ring: 'ring-blue-500',   bg: 'bg-blue-500/10',   dot: 'bg-blue-400', pulse: true },
+          { key: 'failed',            label: 'Failed',           n: count(['failed', 'missing_packages']),          color: 'text-red-400',    ring: 'ring-red-500',    bg: 'bg-red-500/10',    dot: 'bg-red-400' },
+          { key: 'pending',           label: 'Pending',          n: count(['pending']),                            color: 'text-gray-400',   ring: 'ring-gray-500',   bg: 'bg-gray-500/10',   dot: 'bg-gray-400' },
+          { key: 'waiting_for_deps',  label: 'Waiting for deps', n: count(['waiting_for_deps']),                   color: 'text-amber-400',  ring: 'ring-amber-500',  bg: 'bg-amber-500/10',  dot: 'bg-amber-400' },
+          { key: 'dep_build_pending', label: 'Blocked by deps',  n: count(['dep_build_pending']),                  color: 'text-orange-400', ring: 'ring-orange-500', bg: 'bg-orange-500/10', dot: 'bg-orange-400' },
+          { key: 'not_built',         label: 'Not built',        n: count(['not_built']),                          color: 'text-gray-500',   ring: 'ring-gray-600',   bg: 'bg-gray-600/10',   dot: 'bg-gray-500' },
+        ];
+        // Progress bar: completed / total
+        const builtPct = total ? Math.round((count(['completed']) / total) * 100) : 0;
+        return (
+          <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+            {/* Progress bar */}
+            <div className="flex items-center gap-3 mb-3">
+              <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-green-500 transition-all duration-500"
+                  style={{ width: `${builtPct}%` }}
+                />
+              </div>
+              <span className="text-xs text-gray-400 shrink-0">{builtPct}% built ({count(['completed'])}/{total})</span>
+              {buildStatusFilter && (
+                <button
+                  onClick={() => { setBuildStatusFilter(null); setDirectPage(1); setTransitivePage(1); }}
+                  className="text-xs text-gray-400 hover:text-white underline shrink-0"
+                >
+                  Clear filter
+                </button>
+              )}
+            </div>
+            {/* Stat cards */}
+            <div className="flex flex-wrap gap-2">
+              {stats.filter(s => s.n > 0).map(s => (
+                <button
+                  key={s.key}
+                  onClick={() => handleStatusFilterClick(s.key)}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all text-sm ${
+                    buildStatusFilter === s.key
+                      ? `${s.bg} border-current ring-1 ${s.ring} ${s.color}`
+                      : 'bg-gray-900/50 border-gray-700 text-gray-300 hover:border-gray-500'
+                  }`}
+                >
+                  <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot} ${s.pulse ? 'animate-pulse' : ''}`} />
+                  <span className={`font-semibold ${buildStatusFilter === s.key ? s.color : ''}`}>{s.n}</span>
+                  <span className={`${buildStatusFilter === s.key ? s.color : 'text-gray-400'}`}>{s.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Error Message */}
       {project.status === 'failed' && project.status_message && (
         <div className="bg-red-50 border border-red-200 rounded-lg p-4">
@@ -973,9 +1089,11 @@ export default function ProjectDetail() {
             {/* Direct Dependencies */}
             {packagesData.direct_dependencies && packagesData.direct_dependencies.length > 0 && (() => {
               const searchLower = packageSearch.toLowerCase();
-              const filteredDirect = packageSearch
-                ? packagesData.direct_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
-                : packagesData.direct_dependencies;
+              const filteredDirect = applyBuildStatusFilter(
+                packageSearch
+                  ? packagesData.direct_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
+                  : packagesData.direct_dependencies
+              );
               const sortedDirect = sortPackages(filteredDirect, directSort);
               const startIdx = (directPage - 1) * pageSize;
               const endIdx = startIdx + pageSize;
@@ -986,7 +1104,7 @@ export default function ProjectDetail() {
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  📋 Direct Dependencies ({packageSearch ? `${filteredDirect.length} of ` : ''}{packagesData.direct_count || packagesData.direct_dependencies.length})
+                  📋 Direct Dependencies ({(packageSearch || buildStatusFilter) ? `${filteredDirect.length} of ` : ''}{packagesData.direct_count || packagesData.direct_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Packages from requirements files
                   </span>
@@ -1351,9 +1469,11 @@ export default function ProjectDetail() {
             {/* Transitive Dependencies */}
             {packagesData.transitive_dependencies && packagesData.transitive_dependencies.length > 0 && (() => {
               const searchLower = packageSearch.toLowerCase();
-              const filteredTransitive = packageSearch
-                ? packagesData.transitive_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
-                : packagesData.transitive_dependencies;
+              const filteredTransitive = applyBuildStatusFilter(
+                packageSearch
+                  ? packagesData.transitive_dependencies.filter(p => p.name.toLowerCase().includes(searchLower))
+                  : packagesData.transitive_dependencies
+              );
               const sortedTransitive = sortPackages(filteredTransitive, transitiveSort);
               const startIdx = (transitivePage - 1) * pageSize;
               const endIdx = startIdx + pageSize;
@@ -1364,7 +1484,7 @@ export default function ProjectDetail() {
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  🔗 Transitive Dependencies ({packageSearch ? `${filteredTransitive.length} of ` : ''}{packagesData.transitive_count || packagesData.transitive_dependencies.length})
+                  🔗 Transitive Dependencies ({(packageSearch || buildStatusFilter) ? `${filteredTransitive.length} of ` : ''}{packagesData.transitive_count || packagesData.transitive_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Dependencies of dependencies
                   </span>

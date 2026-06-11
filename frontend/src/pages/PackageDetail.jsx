@@ -1,9 +1,10 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download } from 'lucide-react';
+import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download, Terminal, Wrench } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useToast } from '../contexts/ToastContext';
+import LivePackageBuildLog from '../components/LivePackageBuildLog';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -26,13 +27,26 @@ const StatusBadge = ({ status }) => {
 export default function PackageDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
+
+  // Poll for live updates when package is in an active build state
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const pkg = queryClient.getQueryData(['package', id])
+      if (['building', 'pending', 'waiting_for_deps', 'dep_build_pending'].includes(pkg?.build_status)) {
+        queryClient.invalidateQueries({ queryKey: ['package', id] })
+        queryClient.invalidateQueries({ queryKey: ['package-specs', id] })
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [id]);
   const toast = useToast();
   
   const [editingSpec, setEditingSpec] = useState(null);
   const [specContent, setSpecContent] = useState('');
   const [commitMessage, setCommitMessage] = useState('');
   const [regenerating, setRegenerating] = useState(false);
+  const [showBuildLog, setShowBuildLog] = useState(false);
 
   const { data: pkg, isLoading, error } = useQuery({
     queryKey: ['package', id],
@@ -120,6 +134,67 @@ export default function PackageDetail() {
     },
     onError: (error) => {
       toast.error(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const buildPackageMutation = useMutation({
+    mutationFn: async () => {
+      const response = await packagesAPI.buildPackage(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['package', id]);
+      queryClient.invalidateQueries(['package-builds', id]);
+      queryClient.invalidateQueries(['package-logs', id]);
+      setShowBuildLog(true);
+    },
+    onError: (error) => {
+      toast.error(`Failed to build package: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const rebuildPackageMutation = useMutation({
+    mutationFn: async () => {
+      const response = await packagesAPI.rebuildPackage(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['package', id]);
+      queryClient.invalidateQueries(['package-builds', id]);
+      queryClient.invalidateQueries(['package-logs', id]);
+      setShowBuildLog(true);
+    },
+    onError: (error) => {
+      toast.error(`Failed to rebuild package: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const cancelBuildMutation = useMutation({
+    mutationFn: async () => {
+      const response = await packagesAPI.cancelBuild(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['package', id]);
+    },
+    onError: (error) => {
+      toast.error(`Failed to cancel build: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const fixAndRebuildMutation = useMutation({
+    mutationFn: async () => {
+      const response = await packagesAPI.fixAndRebuild(id);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries(['package', id]);
+      queryClient.invalidateQueries(['package-builds', id]);
+      queryClient.invalidateQueries(['package-logs', id]);
+      setShowBuildLog(true);
+    },
+    onError: (error) => {
+      toast.error(`Failed to fix & rebuild: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -226,7 +301,105 @@ export default function PackageDetail() {
             )}
           </div>
         </div>
-        <StatusBadge status={pkg.status} />
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          <StatusBadge status={pkg.status} />
+
+          {/* Live Log — only while building */}
+          {pkg.build_status === 'building' && (
+            <button
+              onClick={() => setShowBuildLog(true)}
+              className="px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-1.5 text-sm animate-pulse"
+              title="View live build log"
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              Live Log
+            </button>
+          )}
+
+          {/* Log — when there is something to show and not actively building */}
+          {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) &&
+            (pkg.has_build_log || pkg.build_error_message ||
+              ['completed', 'failed', 'missing_packages', 'dep_build_pending'].includes(pkg.build_status) ||
+              ['built', 'failed'].includes(pkg.status) ||
+              builds?.some(b => b.build_log)) && (
+            <button
+              onClick={() => setShowBuildLog(true)}
+              className="px-3 py-1.5 bg-gray-700 text-white rounded-lg hover:bg-gray-600 flex items-center gap-1.5 text-sm"
+              title="View build log"
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              Log
+            </button>
+          )}
+
+          {/* Gen Spec */}
+          <button
+            onClick={handleRegenerateSpec}
+            disabled={regenerating}
+            className="px-3 py-1.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+            title={regenerating ? 'Generating spec…' : 'Generate / refresh SPEC file'}
+          >
+            <FileCode className="h-3.5 w-3.5" />
+            {regenerating ? 'Generating…' : 'Gen Spec'}
+          </button>
+
+          {/* Fetch Source */}
+          <button
+            onClick={() => fetchSourceMutation.mutate()}
+            disabled={fetchSourceMutation.isPending || !specFiles || specFiles.length === 0}
+            className="px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+            title={!specFiles || specFiles.length === 0 ? 'Generate spec file first' : 'Fetch source files'}
+          >
+            <Download className="h-3.5 w-3.5" />
+            {fetchSourceMutation.isPending ? 'Fetching…' : 'Fetch'}
+          </button>
+
+          {/* Cancel / Build / Rebuild */}
+          {['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status) ? (
+            <button
+              onClick={() => cancelBuildMutation.mutate()}
+              disabled={cancelBuildMutation.isPending}
+              className="px-3 py-1.5 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+              title={pkg.build_status === 'building' ? 'Cancel running build' : 'Cancel waiting build'}
+            >
+              <X className="h-3.5 w-3.5" />
+              Cancel
+            </button>
+          ) : pkg.build_status === 'not_built' ? (
+            <button
+              onClick={() => buildPackageMutation.mutate()}
+              disabled={!pkg.source_fetched || !specFiles?.length || buildPackageMutation.isPending}
+              className="px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+              title={!pkg.source_fetched ? 'Fetch source first' : !specFiles?.length ? 'Generate spec file first' : 'Build package'}
+            >
+              <Hammer className="h-3.5 w-3.5" />
+              Build
+            </button>
+          ) : (
+            <button
+              onClick={() => rebuildPackageMutation.mutate()}
+              disabled={!pkg.source_fetched || !specFiles?.length || rebuildPackageMutation.isPending || pkg.build_status === 'building'}
+              className="px-3 py-1.5 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+              title="Rebuild package"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Rebuild
+            </button>
+          )}
+
+          {/* Fix & Rebuild */}
+          {['missing_packages', 'failed'].includes(pkg.build_status) && pkg.source_fetched && specFiles?.length > 0 && (
+            <button
+              onClick={() => fixAndRebuildMutation.mutate()}
+              disabled={fixAndRebuildMutation.isPending}
+              className="px-3 py-1.5 bg-teal-600 text-white rounded-lg hover:bg-teal-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
+              title="Apply auto-fixes to spec and rebuild"
+            >
+              <Wrench className="h-3.5 w-3.5" />
+              Fix &amp; Rebuild
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -362,6 +535,11 @@ export default function PackageDetail() {
                           {spec.git_commit_hash.substring(0, 7)}
                         </span>
                       )}
+                      {spec.commit_message?.startsWith('AI-fixed:') && (
+                        <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-purple-900/50 text-purple-300 border border-purple-700">
+                          AI fixed
+                        </span>
+                      )}
                     </div>
                     <button
                       onClick={() => handleEditSpec(spec)}
@@ -371,7 +549,21 @@ export default function PackageDetail() {
                       Edit
                     </button>
                   </div>
-                  <p className="text-sm text-gray-400 mb-2">{spec.commit_message}</p>
+                  {spec.commit_message?.startsWith('AI-fixed:') ? (() => {
+                    const actions = spec.commit_message.slice('AI-fixed:'.length).split(';').map(s => s.trim()).filter(Boolean);
+                    return (
+                      <ul className="mt-1 mb-2 space-y-1">
+                        {actions.map((action, i) => (
+                          <li key={i} className="flex items-start gap-2 text-sm text-gray-300">
+                            <span className="text-purple-400 mt-0.5 shrink-0">•</span>
+                            {action}
+                          </li>
+                        ))}
+                      </ul>
+                    );
+                  })() : (
+                    <p className="text-sm text-gray-400 mb-2">{spec.commit_message}</p>
+                  )}
                   {spec.content && (
                     <details className="mt-2">
                       <summary className="text-sm text-indigo-400 cursor-pointer hover:text-indigo-300">
@@ -724,6 +916,15 @@ export default function PackageDetail() {
           </div>
         )}
       </div>
+
+      {/* Build Log Modal */}
+      {showBuildLog && (
+        <LivePackageBuildLog
+          packageId={parseInt(id)}
+          packageName={pkg.name}
+          onClose={() => setShowBuildLog(false)}
+        />
+      )}
     </div>
   );
 }

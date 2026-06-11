@@ -52,6 +52,63 @@ class SystemSettings(models.Model):
         help_text="Minutes between repository metadata syncs"
     )
     
+    # AI fixer settings
+    AI_BACKEND_CHOICES = [
+        ('builtin', 'Built-in (llama.cpp, no external services)'),
+        ('ollama', 'Ollama'),
+        ('openai', 'OpenAI-compatible API'),
+    ]
+    
+    ai_fixer_enabled = models.BooleanField(
+        default=False,
+        help_text="Use an LLM as fallback when rule-based build fixers fail"
+    )
+    
+    ai_fixer_backend = models.CharField(
+        max_length=20,
+        choices=AI_BACKEND_CHOICES,
+        default='builtin',
+        help_text="LLM backend to use"
+    )
+    
+    ai_fixer_model = models.CharField(
+        max_length=200,
+        default='qwen2.5-coder-3b',
+        help_text="Model key (builtin) or model name (ollama/openai)"
+    )
+    
+    ai_fixer_base_url = models.CharField(
+        max_length=500,
+        default='http://localhost:11434',
+        blank=True,
+        help_text="Base URL for ollama/openai backends"
+    )
+    
+    ai_fixer_api_key = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text="API key for OpenAI-compatible backends"
+    )
+    
+    ai_fixer_timeout = models.IntegerField(
+        default=300,
+        validators=[MinValueValidator(30), MaxValueValidator(1800)],
+        help_text="LLM request timeout in seconds"
+    )
+
+    ai_fixer_max_attempts = models.IntegerField(
+        default=3,
+        validators=[MinValueValidator(1), MaxValueValidator(10)],
+        help_text="Maximum number of AI fix attempts per package before giving up"
+    )
+
+    ai_fixer_max_concurrent = models.IntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(10)],
+        help_text="Maximum number of packages the AI fixer may work on simultaneously"
+    )
+    
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

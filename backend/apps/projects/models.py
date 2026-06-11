@@ -111,8 +111,7 @@ class Project(models.Model):
     
     def __str__(self):
         return self.name
-    
-    @property
+
     def git_ref(self):
         """Get the git reference to checkout (tag, branch, or commit)"""
         return self.git_tag or self.git_branch or 'main'

@@ -47,6 +47,25 @@ def log_project(project_id: int, level: str, message: str):
         logger.error(f"Failed to create project log: {e}")
 
 
+def send_project_update(project_id: int):
+    """Push a project status update to the WebSocket channel group."""
+    try:
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+        project = Project.objects.get(id=project_id)
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f'project_{project_id}',
+            {
+                'type': 'project_update',
+                'status': project.status,
+                'status_message': project.status_message or '',
+            }
+        )
+    except Exception as e:
+        logger.error(f"Failed to send project WS update for {project_id}: {e}")
+
+
 
 @shared_task(bind=True, max_retries=3)
 def clone_project_task(self, project_id: int):

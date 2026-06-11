@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Boxes, Search, Filter, Play, XCircle, CheckCircle, Clock, Loader, Trash2 } from 'lucide-react';
@@ -35,7 +35,18 @@ export default function Builds() {
   const [currentPage, setCurrentPage] = useState(1);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [buildToDelete, setBuildToDelete] = useState(null);
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
+
+  // Poll build-jobs list when any job is active
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const jobs = queryClient.getQueryData(['build-jobs']) || []
+      if (jobs.some(j => ['building', 'pending', 'queued'].includes(j.status))) {
+        queryClient.invalidateQueries({ queryKey: ['build-jobs'] })
+      }
+    }, 5000)
+    return () => clearInterval(interval)
+  }, []);
   const toast = useToast();
 
   const { data, isLoading, error } = useQuery({

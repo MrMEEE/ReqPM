@@ -221,6 +221,8 @@ class PackageDetailSerializer(serializers.ModelSerializer):
     spec_files = SpecFileRevisionSerializer(many=True, read_only=True, source='spec_revisions')
     extras = PackageExtraSerializer(many=True, read_only=True)
     latest_spec = serializers.SerializerMethodField()
+    source_fetched = serializers.BooleanField(read_only=True)
+    has_build_log = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
@@ -228,15 +230,24 @@ class PackageDetailSerializer(serializers.ModelSerializer):
             'id', 'name', 'version', 'package_type',
             'status', 'build_order', 'description', 'license', 'homepage',
             'build_system',
+            'build_status', 'build_error_message', 'analyzed_errors',
+            'source_fetched', 'has_build_log',
             'project', 'project_name', 'dependencies', 'builds',
             'spec_files', 'extras', 'latest_spec',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'project_name', 'dependencies', 'builds',
-            'spec_files', 'extras', 'latest_spec', 'created_at', 'updated_at'
+            'spec_files', 'extras', 'latest_spec', 'created_at', 'updated_at',
+            'build_status', 'build_error_message', 'analyzed_errors',
+            'source_fetched', 'has_build_log',
         ]
     
+    def get_has_build_log(self, obj):
+        if hasattr(obj, '_has_build_log'):
+            return obj._has_build_log
+        return bool(obj.build_log)
+
     def get_latest_spec(self, obj):
         """Get latest spec file revision"""
         latest = obj.spec_revisions.order_by('-created_at').first()

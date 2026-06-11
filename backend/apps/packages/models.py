@@ -312,7 +312,17 @@ class SpecFileRevision(models.Model):
     
     content = models.TextField()
     commit_message = models.TextField()
-    
+
+    # Context stored when an AI fix is applied — used to retrieve similar past
+    # fixes as few-shot examples for future LLM calls.
+    # Schema: {"error_keywords": [...], "error_excerpt": "...", "actions": [...]}
+    fix_context = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Error fingerprint + actions stored for AI few-shot retrieval"
+    )
+
     # Git information (if pushed to spec repo)
     git_commit_hash = models.CharField(max_length=40, blank=True)
     git_commit_url = models.URLField(max_length=500, blank=True)

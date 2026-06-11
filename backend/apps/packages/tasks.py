@@ -778,17 +778,19 @@ def build_single_package_task(self, package_id: int):
                 local_repo_dir=local_repo_dir,
             )
             
-            if not rpm_result.success:
-                # Check for auto-fixable errors
+            # Fixer loop — keep applying rule-based and AI fixes until the build
+            # succeeds, no fixer applies, or SRPM reconstruction fails.
+            # _ai_fix_count tracks AI attempts this rebuild; AI's own max_attempts
+            # setting caps how many AI revisions are created per build run.
+            _ai_fix_count = 0
+            _fix_attempt = 0
+            _MAX_FIX_ATTEMPTS = 10  # safety cap
+            while not rpm_result.success and _fix_attempt < _MAX_FIX_ATTEMPTS:
                 fixed = False
-                
-                # Check if this is a directory mismatch error that can be auto-fixed
                 if _detect_and_fix_directory_mismatch(package_id, rpm_result.log_output or ''):
                     fixed = True
-                # Check if build files (pyproject.toml/setup.py) are missing
                 elif _detect_and_fix_missing_build_files(package_id, rpm_result.log_output or ''):
                     fixed = True
-                # Check if there are unpackaged files that need to be added to %files
                 elif _detect_and_fix_unpackaged_files(package_id, rpm_result.log_output or ''):
                     fixed = True
                 elif _detect_and_fix_wrong_module_glob(package_id, rpm_result.log_output or ''):
@@ -797,103 +799,107 @@ def build_single_package_task(self, package_id: int):
                     fixed = True
                 elif _detect_and_fix_spec_errors(package_id, rpm_result.log_output or ''):
                     fixed = True
-                
-                if fixed:
-                    # Spec file was regenerated, retry the build from SRPM
-                    logger.info(f"Retrying build for {package.name} after auto-fix")
-                    log_package(package_id, 'info', 'Retrying full build with regenerated spec file...')
-                    
-                    # Clear build log and old disk log files before retry
-                    package.build_log = ''
-                    package.save()
-                    _delete_build_log_files(build_dir)
-                    
-                    # Re-fetch the package and spec
-                    package.refresh_from_db()
-                    spec_revision = SpecFileRevision.objects.filter(
-                        package=package
-                    ).order_by('-created_at').first()
-                    
-                    if spec_revision:
-                        # Write the new spec file
-                        spec_file = build_dir / f"{package.name}.spec"
-                        spec_file.write_text(spec_revision.content)
-                        logger.info(f"Updated spec file for {package.name}")
-                        
-                        # Debug: Verify spec content
-                        if 'BUILD_SUBDIR' in spec_revision.content:
-                            logger.info(f"✓ Spec has BUILD_SUBDIR subdirectory search logic")
-                            log_package(package_id, 'info', 'Using spec with subdirectory search logic')
-                        else:
-                            logger.warning(f"✗ Spec does NOT have BUILD_SUBDIR logic!")
-                            log_package(package_id, 'warning', 'Spec missing subdirectory search logic')
-                        
-                        # Rebuild both SRPM and RPM with new spec
-                        logger.info(f"Rebuilding SRPM for {package.name} from {spec_file}")
-                        log_package(package_id, 'info', "Rebuilding SRPM with fixed spec...")
-                        
-                        srpm_result = builder.build_srpm(
-                            spec_file=str(spec_file),
-                            sources_dir=str(build_dir),
-                            output_dir=str(build_dir / 'SRPMS'),
-                            target=target
-                        )
-                        
-                        if srpm_result.success:
-                            logger.info(f"Rebuilding RPM for {package.name}")
-                            log_package(package_id, 'info', "Rebuilding RPM...")
-                            
-                            rpm_result = builder.build_rpm(
-                                srpm_path=srpm_result.srpm_path,
-                                output_dir=str(build_dir / 'RPMS'),
-                                target=target,
-                                arch=arch,
-                                unique_ext=f"pkg{package_id}",
-                                local_repo_dir=local_repo_dir,
-                            )
-                            
-                            # If it still fails after retry, fall through to normal error handling
-                            if not rpm_result.success:
-                                logger.warning(f"RPM build still failed after auto-fix for {package.name}")
-                        else:
-                            logger.warning(f"SRPM rebuild failed after auto-fix for {package.name}")
-                            rpm_result.success = False
-                
-                # If still failing (or wasn't an auto-fixable error), handle as normal error
+                # Last resort: AI-assisted fix (only if enabled in settings)
+                elif _detect_and_fix_with_ai(package_id, rpm_result.log_output or '',
+                                             rpm_result.root_log_output or '', _ai_fix_count):
+                    fixed = True
+                    _ai_fix_count += 1
+
+                if not fixed:
+                    break
+
+                _fix_attempt += 1
+                logger.info(f"Retrying build for {package.name} after auto-fix (attempt {_fix_attempt})")
+                log_package(package_id, 'info', f'Retrying full build with regenerated spec file (attempt {_fix_attempt})...')
+
+                # Clear build log and old disk log files before retry
+                package.build_log = ''
+                package.save()
+                _delete_build_log_files(build_dir)
+
+                # Re-fetch the package and spec
+                package.refresh_from_db()
+                spec_revision = SpecFileRevision.objects.filter(
+                    package=package
+                ).order_by('-created_at').first()
+
+                if not spec_revision:
+                    break
+
+                # Write the new spec file
+                spec_file = build_dir / f"{package.name}.spec"
+                spec_file.write_text(spec_revision.content)
+                logger.info(f"Updated spec file for {package.name}")
+
+                if 'BUILD_SUBDIR' in spec_revision.content:
+                    logger.info(f"✓ Spec has BUILD_SUBDIR subdirectory search logic")
+                    log_package(package_id, 'info', 'Using spec with subdirectory search logic')
+                else:
+                    logger.warning(f"✗ Spec does NOT have BUILD_SUBDIR logic!")
+                    log_package(package_id, 'warning', 'Spec missing subdirectory search logic')
+
+                logger.info(f"Rebuilding SRPM for {package.name} from {spec_file}")
+                log_package(package_id, 'info', "Rebuilding SRPM with fixed spec...")
+                srpm_result = builder.build_srpm(
+                    spec_file=str(spec_file),
+                    sources_dir=str(build_dir),
+                    output_dir=str(build_dir / 'SRPMS'),
+                    target=target
+                )
+
+                if not srpm_result.success:
+                    logger.warning(f"SRPM rebuild failed after auto-fix for {package.name}")
+                    rpm_result.success = False
+                    break
+
+                logger.info(f"Rebuilding RPM for {package.name}")
+                log_package(package_id, 'info', "Rebuilding RPM...")
+                rpm_result = builder.build_rpm(
+                    srpm_path=srpm_result.srpm_path,
+                    output_dir=str(build_dir / 'RPMS'),
+                    target=target,
+                    arch=arch,
+                    unique_ext=f"pkg{package_id}",
+                    local_repo_dir=local_repo_dir,
+                )
                 if not rpm_result.success:
-                    package.build_completed_at = timezone.now()
-                    package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
-                    package.build_log = rpm_result.log_output
-                    package.build_root_log = rpm_result.root_log_output
-                    # Analyze build log for structured errors (combine build.log + root.log)
+                    logger.warning(f"RPM build still failed after auto-fix attempt {_fix_attempt} for {package.name}")
+
+            # If still failing after all fix attempts, handle as normal error
+            if not rpm_result.success:
+                package.build_completed_at = timezone.now()
+                package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
+                package.build_log = rpm_result.log_output
+                package.build_root_log = rpm_result.root_log_output
+                # Analyze build log for structured errors (combine build.log + root.log)
+                try:
+                    analyzer = BuildErrorAnalyzer()
+                    combined_log = (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or '')
+                    errors = analyzer.analyze(combined_log)
+                    package.analyzed_errors = [
+                        {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
+                        for e in errors
+                    ]
+                except Exception as analyze_err:
+                    logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
+                    package.analyzed_errors = []
+                # Use specific status if missing packages were detected
+                missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
+                if any(e.get('category') in missing_cats for e in package.analyzed_errors):
+                    package.build_status = _resolve_missing_dep_status(package, project)
+                    # Auto-add missing dependencies to transitive dependency list
                     try:
-                        analyzer = BuildErrorAnalyzer()
-                        combined_log = (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or '')
-                        errors = analyzer.analyze(combined_log)
-                        package.analyzed_errors = [
-                            {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
-                            for e in errors
-                        ]
-                    except Exception as analyze_err:
-                        logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
-                        package.analyzed_errors = []
-                    # Use specific status if missing packages were detected
-                    missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
-                    if any(e.get('category') in missing_cats for e in package.analyzed_errors):
-                        package.build_status = _resolve_missing_dep_status(package, project)
-                        # Auto-add missing dependencies to transitive dependency list
-                        try:
-                            auto_add_missing_dependencies(package_id)
-                        except Exception as auto_add_err:
-                            logger.warning(f"Error auto-adding dependencies for {package.name}: {auto_add_err}")
-                    else:
-                        package.build_status = 'failed'
-                    package.save()
-                    send_package_update(package_id)
-                    log_project(project.id, 'error', f"Build failed for {package.name}: RPM build failed")
-                    log_package(package_id, 'error', f"RPM build failed: {rpm_result.error_message}")
-                    logger.error(f"RPM build failed for {package.name}: {rpm_result.error_message}")
-                    return
+                        auto_add_missing_dependencies(package_id)
+                    except Exception as auto_add_err:
+                        logger.warning(f"Error auto-adding dependencies for {package.name}: {auto_add_err}")
+                else:
+                    package.build_status = 'failed'
+                package.save()
+                send_package_update(package_id)
+                log_project(project.id, 'error', f"Build failed for {package.name}: RPM build failed")
+                log_package(package_id, 'error', f"RPM build failed: {rpm_result.error_message}")
+                logger.error(f"RPM build failed for {package.name}: {rpm_result.error_message}")
+                return
             
             # Update package with success
             rpm_file = rpm_result.rpm_paths[0] if rpm_result.rpm_paths else None
@@ -1648,6 +1654,30 @@ def _detect_and_fix_missing_header_files(package_id: int, build_log: str) -> boo
         return False
 
 
+def _detect_and_fix_with_ai(package_id: int, build_log: str, root_log: str = '', ai_attempt: int = 0) -> bool:
+    """
+    Last-resort fixer: ask the configured LLM (see settings.REQPM['AI_FIXER'])
+    to propose structured fix actions for an unrecognized build failure.
+    Returns True if a new spec revision was created (caller retries build).
+    No-op when AI_FIXER is disabled.
+    """
+    try:
+        from backend.core.ai_fixer import attempt_ai_fix, is_enabled
+        if not is_enabled():
+            return False
+        log_package(package_id, 'info', 'Rule-based fixers exhausted, trying AI fixer...')
+        result = attempt_ai_fix(package_id, build_log, root_log, ai_attempt=ai_attempt)
+        send_package_update(package_id)
+        if result:
+            log_package(package_id, 'info', 'AI fixer proposed a spec fix, retrying build')
+        else:
+            log_package(package_id, 'info', 'AI fixer could not propose a fix')
+        return result
+    except Exception as e:
+        logger.warning(f"Error in _detect_and_fix_with_ai for {package_id}: {e}")
+        return False
+
+
 def _update_project_local_repo(project_id: int, rpm_paths: list, rhel_version: int = None) -> str:
     """
     Copy newly built RPMs into a per-project, per-RHEL-version local DNF repo
@@ -1767,6 +1797,26 @@ def _find_project_packages_for_items(project, missing_items):
     return list(Package.objects.filter(project=project).filter(q))
 
 
+def _built_for_rhel(pkg, rhel_version) -> bool:
+    """
+    Check whether a 'completed' package was actually built for the given RHEL
+    version. When a project's rhel_version changes (e.g. 9 -> 10), previously
+    built packages keep build_status='completed' but their RPMs only exist in
+    the old el<N> repo, so dependent builds fail with missing packages.
+    Detected via the dist tag in the RPM filename (e.g. '.el9.noarch.rpm').
+    """
+    import re
+    if not rhel_version:
+        return True
+    rpm_name = os.path.basename(pkg.rpm_path or '')
+    if not rpm_name:
+        return True  # Can't verify — assume OK
+    m = re.search(r'\.el(\d+)[._]', rpm_name)
+    if not m:
+        return True
+    return int(m.group(1)) == int(rhel_version)
+
+
 def _resolve_missing_dep_status(package, project):
     """
     Decide between 'dep_build_pending' and 'missing_packages' based on whether
@@ -1788,8 +1838,24 @@ def _resolve_missing_dep_status(package, project):
     matched = _find_project_packages_for_items(project, missing_items)
     # If any of the missing deps exist in the project as unbuilt packages → dep_build_pending
     unbuilt_matches = [p for p in matched if p.build_status not in ('completed', 'not_required') and p.id != package.id]
-    if unbuilt_matches:
-        names = ', '.join(p.name for p in unbuilt_matches)
+
+    # Packages marked 'completed' but built for a different RHEL version are
+    # stale (e.g. project switched from RHEL 9 to 10) — requeue them.
+    stale_matches = [
+        p for p in matched
+        if p.build_status == 'completed' and p.id != package.id
+        and not _built_for_rhel(p, project.rhel_version)
+    ]
+    for p in stale_matches:
+        log_package(p.id, 'info',
+            f"Rebuild queued: previously built for a different RHEL version, "
+            f"project now targets RHEL {project.rhel_version}")
+        p.build_status = 'pending'
+        p.save(update_fields=['build_status'])
+        build_single_package_task.delay(p.id)
+
+    if unbuilt_matches or stale_matches:
+        names = ', '.join(p.name for p in unbuilt_matches + stale_matches)
         log_package(package.id, 'info',
             f"Missing deps found as unbuilt project packages: {names} — waiting for them")
         return 'dep_build_pending'
@@ -2054,6 +2120,7 @@ def trigger_waiting_builds(completed_package_id: int):
                     f"{completed_pkg.name} is now built — all blockers resolved, starting build...")
                 pkg.build_status = 'pending'
                 pkg.save()
+                send_package_update(pkg.id)
                 build_single_package_task.delay(pkg.id)
             else:
                 remaining = ', '.join(p.name for p in unresolved)
@@ -2086,6 +2153,7 @@ def fix_and_rebuild_task(self, package_id: int):
             log_package(package_id, 'error', 'No spec file found — cannot apply fixes')
             return
 
+        send_package_update(package_id)
         errors = package.analyzed_errors or []
 
         if has_auto_fix(errors):

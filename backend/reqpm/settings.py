@@ -279,6 +279,21 @@ REQPM = {
     'REPOSITORY_PLUGINS': {
         'createrepo_c': 'backend.plugins.repositories.createrepo.CreateRepoManager',
     },
+
+    # AI-assisted build failure fixer (fallback after rule-based fixers).
+    # Works with a local Ollama instance (CPU-only is fine) or any
+    # OpenAI-compatible API.
+    'AI_FIXER': {
+        'ENABLED': os.getenv('AI_FIXER_ENABLED', 'false').lower() in ('true', '1', 'yes'),
+        'BACKEND': os.getenv('AI_FIXER_BACKEND', 'ollama'),  # 'ollama' or 'openai'
+        'BASE_URL': os.getenv('AI_FIXER_BASE_URL', 'http://localhost:11434'),
+        'MODEL': os.getenv('AI_FIXER_MODEL', 'qwen2.5-coder:7b'),
+        'API_KEY': os.getenv('AI_FIXER_API_KEY', ''),
+        'TIMEOUT': int(os.getenv('AI_FIXER_TIMEOUT', '300')),
+        'MAX_ATTEMPTS': int(os.getenv('AI_FIXER_MAX_ATTEMPTS', '3')),
+        'MAX_CONCURRENT': int(os.getenv('AI_FIXER_MAX_CONCURRENT', '1')),
+        'MAX_LOG_LINES': int(os.getenv('AI_FIXER_MAX_LOG_LINES', '120')),
+    },
 }
 
 # Logging configuration

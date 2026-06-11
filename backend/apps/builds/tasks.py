@@ -10,6 +10,7 @@ import logging
 from backend.plugins.builders import get_builder
 from backend.plugins.builders.base import BuildResult
 from backend.apps.builds.concurrency import limiter
+from backend.apps.builds.websocket_utils import send_build_job_update, send_queue_item_update
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ def build_package_task(self, build_queue_id: int):
                 queue_item.error_message = ''
                 queue_item.analyzed_errors = []
                 queue_item.save()
+                send_queue_item_update(queue_item.id)
+                send_build_job_update(queue_item.build_job_id)
                 
                 package = queue_item.package
                 build_job = queue_item.build_job
@@ -55,6 +58,8 @@ def build_package_task(self, build_queue_id: int):
                         "See docs/MOCK_SETUP.md for complete setup instructions."
                     )
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     logger.error(f"Mock builder not available for build {build_queue_id}")
                     return
                 
@@ -67,6 +72,8 @@ def build_package_task(self, build_queue_id: int):
                     queue_item.status = 'failed'
                     queue_item.error_message = "No spec file found"
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     logger.error(f"No spec file for package {package.id}")
                     return
                 
@@ -88,6 +95,8 @@ def build_package_task(self, build_queue_id: int):
                     queue_item.status = 'failed'
                     queue_item.error_message = f"Source directory not found: {sources_dir}. Sources must be fetched at project level before building."
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     
                     # Log to package logs
                     from backend.apps.packages.tasks import log_package
@@ -107,6 +116,8 @@ def build_package_task(self, build_queue_id: int):
                     queue_item.status = 'failed'
                     queue_item.error_message = f"Failed to copy sources: {str(e)}"
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     
                     # Log to package logs
                     from backend.apps.packages.tasks import log_package
@@ -143,6 +154,8 @@ def build_package_task(self, build_queue_id: int):
                     queue_item.build_log = srpm_result.log_output
                     queue_item.analyze_build_log()
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     
                     # Log to package logs
                     from backend.apps.packages.tasks import log_package
@@ -168,6 +181,8 @@ def build_package_task(self, build_queue_id: int):
                     queue_item.build_log = rpm_result.log_output
                     queue_item.analyze_build_log()
                     queue_item.save()
+                    send_queue_item_update(queue_item.id)
+                    send_build_job_update(queue_item.build_job_id)
                     
                     # Log to package logs
                     from backend.apps.packages.tasks import log_package
@@ -203,6 +218,8 @@ def build_package_task(self, build_queue_id: int):
                 queue_item.srpm_path = srpm_result.srpm_path
                 queue_item.rpm_path = rpm_file
                 queue_item.save()
+                send_queue_item_update(queue_item.id)
+                send_build_job_update(queue_item.build_job_id)
                 
                 # Log success to package logs
                 from backend.apps.packages.tasks import log_package
@@ -357,6 +374,7 @@ def check_build_job_completion(build_job_id: int):
             build_job.failed_packages = failed
             build_job.progress = int((completed + failed) / total * 100)
             build_job.save()
+            send_build_job_update(build_job_id)
         
         # Check if all builds are done
         if pending == 0 and building == 0:
@@ -367,6 +385,7 @@ def check_build_job_completion(build_job_id: int):
             
             build_job.completed_at = timezone.now()
             build_job.save()
+            send_build_job_update(build_job_id)
             
             logger.info(f"Build job {build_job_id} completed: {completed} successful, {failed} failed")
         else:
