@@ -559,6 +559,41 @@ class SpecFixer:
                     f'(namespace package — module dir name differs from dist-info name)'
                 )
 
+        # If a previous fix left an extra glob after +auto, normalize it away.
+        # Use only horizontal whitespace after +auto so we never swallow a
+        # newline and accidentally merge with the next spec directive.
+        content, cleaned = re.subn(
+            r'(%pyproject_save_files\s+\+auto)[ \t]+[^\n\s]+',
+            r'\1',
+            content,
+            count=1,
+        )
+        if cleaned:
+            applied.append('Normalized %pyproject_save_files +auto to remove trailing glob')
+
+        # Repair malformed lines where %files arguments were accidentally
+        # appended to %pyproject_save_files.
+        content, repaired = re.subn(
+            r'^%pyproject_save_files\s+\+auto\s+(?:-f\s+)?%\{pyproject_files\}\s*$',
+            '%pyproject_save_files +auto\n\n%files -f %{pyproject_files}',
+            content,
+            flags=re.MULTILINE,
+            count=1,
+        )
+        if repaired:
+            applied.append('Repaired malformed %pyproject_save_files/%files line split')
+
+        # If %files -f %{pyproject_files} disappeared entirely, restore it.
+        if '%pyproject_save_files +auto' in content and '%files -f %{pyproject_files}' not in content:
+            content = re.sub(
+                r'(^%pyproject_save_files\s+\+auto\s*$)',
+                r'\1\n\n%files -f %{pyproject_files}',
+                content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+            applied.append('Restored missing %files -f %{pyproject_files} section')
+
         # Fallback: if items were empty but category matched, replace any non-+auto glob
         # This also catches the previous bad fix of bare * (shell-expanded by bash)
         if not applied:

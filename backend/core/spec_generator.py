@@ -202,6 +202,20 @@ class SpecFileGenerator:
             r'python3dist(\1) \2',
             spec_content
         )
+
+        # Remove self-referential BuildRequires — a package must not require itself.
+        # pyp2spec sometimes emits this when PyPI metadata lists the package as its
+        # own dependency (common in packages that vendor their own dist-info).
+        # Normalize: awx-plugins-interfaces  ->  awx_plugins_interfaces
+        _norm_name = re.sub(r'[-.]', '_', package_name).lower()
+        # Also strip leading python3- / python- prefix that the RPM name may carry
+        _dist_name = re.sub(r'^python3?_', '', _norm_name)
+        spec_content = re.sub(
+            rf'^BuildRequires:\s+python3?dist\({re.escape(_dist_name)}\)[^\n]*\n',
+            '',
+            spec_content,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
         
         # Fix %autosetup -n to use PyPI normalized directory names
         # PyPI tarballs unpack to directories with underscores

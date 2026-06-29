@@ -195,6 +195,11 @@ class BuildErrorAnalyzer:
                 'category': 'Wrong Module Glob',
                 'suggestion': 'Replace %pyproject_save_files module name with +auto (namespace package — reads dist-info RECORD without glob matching)',
             },
+            'missing_module_glob': {
+                'pattern': r'At least one module glob needs to be provided to %pyproject_save_files(?:\. Alternatively, use -M to indicate no Python modules should be saved)?',
+                'category': 'Wrong Module Glob',
+                'suggestion': 'Replace %pyproject_save_files module name with +auto (namespace package — reads dist-info RECORD without glob matching)',
+            },
         }
 
     # Common English words that mock/dnf may echo back verbatim from error

@@ -5,6 +5,7 @@ import os
 from celery import Celery
 from celery.signals import setup_logging, worker_ready
 from celery.schedules import crontab
+from django.conf import settings
 
 # Set the default Django settings module for the 'celery' program.
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'backend.reqpm.settings')
@@ -93,6 +94,14 @@ app.conf.beat_schedule = {
         'schedule': 60.0,  # Every 60 seconds
     },
 }
+
+if settings.REQPM.get('EXTRAS_SCAN_ENABLED', True):
+    interval_seconds = int(settings.REQPM.get('EXTRAS_SCAN_INTERVAL_SECONDS', 3600))
+    if interval_seconds > 0:
+        app.conf.beat_schedule['scan-packages-for-missing-extras'] = {
+            'task': 'backend.apps.packages.tasks.scan_packages_for_missing_extras_task',
+            'schedule': float(interval_seconds),
+        }
 
 
 @app.task(bind=True, ignore_result=True)

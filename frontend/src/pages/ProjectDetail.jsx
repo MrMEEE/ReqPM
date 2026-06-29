@@ -210,6 +210,7 @@ export default function ProjectDetail() {
   const [generatingSpecPackages, setGeneratingSpecPackages] = useState(new Set());
   const [buildStatusFilter, setBuildStatusFilter] = useState(null);
   const wsRef = useRef(null);
+  const wsReconnectTimerRef = useRef(null);
 
   // Build status → actual build_status values to match
   const STATUS_FILTER_MAP = {
@@ -280,8 +281,15 @@ export default function ProjectDetail() {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/projects/${id}/`;
+    let disposed = false;
     
     const connectWebSocket = () => {
+      if (disposed) return;
+
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+        wsRef.current.close();
+      }
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -344,16 +352,32 @@ export default function ProjectDetail() {
       ws.onclose = () => {
         console.log('WebSocket closed for project', id);
         setWsConnected(false);
-        // Attempt to reconnect after 3 seconds
-        setTimeout(connectWebSocket, 3000);
+
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+
+        if (!disposed) {
+          // Attempt to reconnect after 3 seconds
+          wsReconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
+        }
       };
     };
 
     connectWebSocket();
 
     return () => {
+      disposed = true;
+
+      if (wsReconnectTimerRef.current) {
+        clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+
       if (wsRef.current) {
+        wsRef.current.onclose = null;
         wsRef.current.close();
+        wsRef.current = null;
       }
     };
   }, [id, queryClient]);
@@ -782,7 +806,7 @@ export default function ProjectDetail() {
             <ArrowLeft className="h-5 w-5 text-gray-600" />
           </button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">{project.name}</h1>
+            <h1 className="text-2xl font-bold text-white">{project.name}</h1>
             {project.description && (
               <p className="text-gray-600 mt-1">{project.description}</p>
             )}

@@ -363,7 +363,25 @@ def parse_actions(raw: str) -> list:
 
 # ─── Spec mutation (deterministic) ──────────────────────────────────────────
 
-def apply_actions(spec_content: str, actions: list) -> tuple:
+def _normalize_dependency_name(value: str) -> str:
+    return re.sub(r'[-.]', '_', value).lower()
+
+
+def _is_self_dependency(value: str, package_name: str) -> bool:
+    normalized_value = _normalize_dependency_name(value)
+    normalized_package = _normalize_dependency_name(package_name)
+    package_dist = re.sub(r'^python3?_', '', normalized_package)
+    value_dist = re.sub(r'^python3?_', '', normalized_value)
+    if value_dist in {normalized_package, package_dist}:
+        return True
+    if value_dist == f'python3dist({normalized_package})':
+        return True
+    if value_dist == f'python3dist({package_dist})':
+        return True
+    return False
+
+
+def apply_actions(spec_content: str, actions: list, package_name: str = '') -> tuple:
     """
     Apply validated actions to the spec content.
     Returns (new_content, descriptions). Raises ValueError if an action
@@ -385,6 +403,11 @@ def apply_actions(spec_content: str, actions: list) -> tuple:
             descriptions.append(f'added "{value}" to %files')
 
         elif op in ('add_buildrequires', 'add_requires'):
+            if package_name and _is_self_dependency(value, package_name):
+                logger.info(
+                    f'AI fixer: skipping self-dependency {value!r} for {package_name}'
+                )
+                continue
             tag = 'BuildRequires' if op == 'add_buildrequires' else 'Requires'
             if re.search(rf'^{tag}:\s*{re.escape(value)}\s*$', content, re.MULTILINE):
                 continue
@@ -678,6 +701,7 @@ def attempt_ai_fix(package_id: int, build_log: str, root_log: str = '', ai_attem
                 f"Package: {package.name} {package.version}\n\n"
                 f"## Build error excerpt\n{error_ctx}\n\n"
                 f"## Relevant spec sections\n{spec_ctx}\n"
+                f"\nRules: never add {package.name} itself as BuildRequires/Requires, and never invent a dependency that already comes from the package being built.\n"
                 + (f"\n{examples_section}\n" if examples_section else '')
             )
 
@@ -688,7 +712,7 @@ def attempt_ai_fix(package_id: int, build_log: str, root_log: str = '', ai_attem
                 logger.info(f'AI fixer: model proposed no fix for {package.name}')
                 return False
 
-            new_content, descriptions = apply_actions(current_spec.content, actions)
+            new_content, descriptions = apply_actions(current_spec.content, actions, package_name=package.name)
 
             if not validate_spec(new_content):
                 logger.warning(f'AI fixer: proposed spec failed validation for {package.name}')

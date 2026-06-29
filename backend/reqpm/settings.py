@@ -294,6 +294,15 @@ REQPM = {
         'MAX_CONCURRENT': int(os.getenv('AI_FIXER_MAX_CONCURRENT', '1')),
         'MAX_LOG_LINES': int(os.getenv('AI_FIXER_MAX_LOG_LINES', '120')),
     },
+
+    # Periodic extras backfill scanner.
+    # Runs from Celery beat and queues sync tasks for packages whose extras are
+    # missing compared to PyPI metadata.
+    'EXTRAS_SCAN_ENABLED': os.getenv('EXTRAS_SCAN_ENABLED', 'true').lower() in ('true', '1', 'yes'),
+    'EXTRAS_SCAN_INTERVAL_SECONDS': int(os.getenv('EXTRAS_SCAN_INTERVAL_SECONDS', '3600')),
+    'EXTRAS_SCAN_REQUEST_TIMEOUT': int(os.getenv('EXTRAS_SCAN_REQUEST_TIMEOUT', '8')),
+    # 0 means unlimited per scan run.
+    'EXTRAS_SCAN_MAX_REQUEUES': int(os.getenv('EXTRAS_SCAN_MAX_REQUEUES', '0')),
 }
 
 # Logging configuration
