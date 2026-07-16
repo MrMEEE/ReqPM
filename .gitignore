@@ -78,3 +78,4 @@ coverage.xml
 /frontend/build/
 /frontend/dist/
 /frontend/.next/
+dump.rdb
