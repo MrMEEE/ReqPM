@@ -455,6 +455,14 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
                 pkg_name = dist_m.group(1).replace('.', '-').replace('_', '-').lower()
                 value = f'python3-{pkg_name}'
                 logger.info(f'AI fixer: converted virtual provide to package name: {value!r}')
+            # For distro package names (python3-foo), keep only the package
+            # token and drop inline version constraints (e.g. ">= 3.0").
+            py_pkg_m = re.match(r'^(python3?-[A-Za-z0-9._+-]+)(?:\s*[<>=!~].*)?$', value)
+            if py_pkg_m:
+                normalized_pkg = py_pkg_m.group(1).lower()
+                if normalized_pkg != value:
+                    logger.info(f'AI fixer: normalized constrained dependency {value!r} -> {normalized_pkg!r}')
+                value = normalized_pkg
             tag = 'BuildRequires' if op == 'add_buildrequires' else 'Requires'
             if re.search(rf'^{tag}:\s*{re.escape(value)}\s*$', content, re.MULTILINE):
                 continue
