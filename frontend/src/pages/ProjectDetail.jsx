@@ -32,18 +32,26 @@ const VersionDropdown = ({ packageId, currentVersion, onVersionChange, toast }) 
   const [isOpen, setIsOpen] = useState(false);
   const [versions, setVersions] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [dropdownStyle, setDropdownStyle] = useState({});
+  const buttonRef = useRef(null);
 
   const handleClick = async () => {
-    if (!isOpen && versions.length === 0) {
-      setLoading(true);
-      try {
-        const response = await packagesAPI.getVersions(packageId);
-        setVersions(response.data.versions || []);
-      } catch (error) {
-        console.error('Failed to fetch versions:', error);
-        toast.error('Failed to fetch versions');
-      } finally {
-        setLoading(false);
+    if (!isOpen) {
+      if (buttonRef.current) {
+        const rect = buttonRef.current.getBoundingClientRect();
+        setDropdownStyle({ top: rect.bottom + 4, left: rect.left });
+      }
+      if (versions.length === 0) {
+        setLoading(true);
+        try {
+          const response = await packagesAPI.getVersions(packageId);
+          setVersions(response.data.versions || []);
+        } catch (error) {
+          console.error('Failed to fetch versions:', error);
+          toast.error('Failed to fetch versions');
+        } finally {
+          setLoading(false);
+        }
       }
     }
     setIsOpen(!isOpen);
@@ -59,6 +67,7 @@ const VersionDropdown = ({ packageId, currentVersion, onVersionChange, toast }) 
   return (
     <div className="relative">
       <button
+        ref={buttonRef}
         onClick={handleClick}
         className="text-blue-400 hover:text-blue-300 underline text-sm"
         disabled={loading}
@@ -68,10 +77,13 @@ const VersionDropdown = ({ packageId, currentVersion, onVersionChange, toast }) 
       {isOpen && (
         <>
           <div
-            className="fixed inset-0 z-10"
+            className="fixed inset-0 z-[999]"
             onClick={() => setIsOpen(false)}
           />
-          <div className="absolute z-20 mt-1 w-32 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col">
+          <div
+            className="fixed z-[1000] w-32 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col"
+            style={dropdownStyle}
+          >
             {versions.length === 0 ? (
               <div className="px-3 py-2 text-sm text-gray-400">No versions</div>
             ) : (
@@ -120,6 +132,8 @@ const BUILD_SYSTEM_COLORS = {
 
 const BuildSystemDropdown = ({ packageId, currentBuildSystem, onBuildSystemChange }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const [dropdownStyle, setDropdownStyle] = useState({});
+  const buttonRef = useRef(null);
   const current = BUILD_SYSTEMS.find(bs => bs.value === currentBuildSystem);
   const label = current ? current.label : (currentBuildSystem || 'unknown');
   const colorClass = BUILD_SYSTEM_COLORS[currentBuildSystem] || BUILD_SYSTEM_COLORS.unknown;
@@ -127,15 +141,26 @@ const BuildSystemDropdown = ({ packageId, currentBuildSystem, onBuildSystemChang
   return (
     <div className="relative">
       <button
-        onClick={(e) => { e.stopPropagation(); setIsOpen(!isOpen); }}
+        ref={buttonRef}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!isOpen && buttonRef.current) {
+            const rect = buttonRef.current.getBoundingClientRect();
+            setDropdownStyle({ top: rect.bottom + 4, left: rect.left });
+          }
+          setIsOpen(!isOpen);
+        }}
         className={`text-xs px-2 py-0.5 rounded border font-mono ${colorClass} hover:opacity-80`}
       >
         {label}
       </button>
       {isOpen && (
         <>
-          <div className="fixed inset-0 z-10" onClick={() => setIsOpen(false)} />
-          <div className="absolute z-20 mt-1 w-44 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col">
+          <div className="fixed inset-0 z-[999]" onClick={() => setIsOpen(false)} />
+          <div
+            className="fixed z-[1000] w-44 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col"
+            style={dropdownStyle}
+          >
             {BUILD_SYSTEMS.map((bs) => (
               <button
                 key={bs.value}
@@ -216,7 +241,8 @@ export default function ProjectDetail() {
   const STATUS_FILTER_MAP = {
     completed:        ['completed'],
     building:         ['building'],
-    failed:           ['failed', 'missing_packages'],
+    failed:           ['failed'],
+    missing_packages: ['missing_packages'],
     pending:          ['pending'],
     waiting_for_deps: ['waiting_for_deps'],
     dep_build_pending:['dep_build_pending'],
@@ -907,7 +933,8 @@ export default function ProjectDetail() {
         const stats = [
           { key: 'completed',         label: 'Built',            n: count(['completed']),                          color: 'text-green-400',  ring: 'ring-green-500',  bg: 'bg-green-500/10',  dot: 'bg-green-400' },
           { key: 'building',          label: 'Building',         n: count(['building']),                           color: 'text-blue-400',   ring: 'ring-blue-500',   bg: 'bg-blue-500/10',   dot: 'bg-blue-400', pulse: true },
-          { key: 'failed',            label: 'Failed',           n: count(['failed', 'missing_packages']),          color: 'text-red-400',    ring: 'ring-red-500',    bg: 'bg-red-500/10',    dot: 'bg-red-400' },
+          { key: 'failed',            label: 'Failed',           n: count(['failed']),                              color: 'text-red-400',    ring: 'ring-red-500',    bg: 'bg-red-500/10',    dot: 'bg-red-400' },
+          { key: 'missing_packages',  label: 'Missing deps',     n: count(['missing_packages']),                    color: 'text-amber-400',  ring: 'ring-amber-500',  bg: 'bg-amber-500/10',  dot: 'bg-amber-400' },
           { key: 'pending',           label: 'Pending',          n: count(['pending']),                            color: 'text-gray-400',   ring: 'ring-gray-500',   bg: 'bg-gray-500/10',   dot: 'bg-gray-400' },
           { key: 'waiting_for_deps',  label: 'Waiting for deps', n: count(['waiting_for_deps']),                   color: 'text-amber-400',  ring: 'ring-amber-500',  bg: 'bg-amber-500/10',  dot: 'bg-amber-400' },
           { key: 'dep_build_pending', label: 'Blocked by deps',  n: count(['dep_build_pending']),                  color: 'text-orange-400', ring: 'ring-orange-500', bg: 'bg-orange-500/10', dot: 'bg-orange-400' },

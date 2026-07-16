@@ -38,6 +38,10 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
+class AISlotTimeoutError(RuntimeError):
+    """Raised when AI fixer slot acquisition exceeds the configured wait budget."""
+
+
 # ─── Model catalog (builtin backend) ────────────────────────────────────────
 # Single-file GGUF quantizations suitable for CPU inference on 8-12 GB RAM.
 
@@ -109,6 +113,7 @@ def get_config() -> dict:
             'model': s.ai_fixer_model,
             'api_key': s.ai_fixer_api_key or env.get('API_KEY', ''),
             'timeout': s.ai_fixer_timeout,
+            'slot_wait_timeout': int(env.get('SLOT_WAIT_TIMEOUT', 45)),
             'max_attempts': s.ai_fixer_max_attempts,
             'max_concurrent': s.ai_fixer_max_concurrent,
             'max_log_lines': env.get('MAX_LOG_LINES', 120),
@@ -122,10 +127,20 @@ def get_config() -> dict:
             'model': env.get('MODEL', 'qwen2.5-coder-3b'),
             'api_key': env.get('API_KEY', ''),
             'timeout': env.get('TIMEOUT', 300),
+            'slot_wait_timeout': int(env.get('SLOT_WAIT_TIMEOUT', 45)),
             'max_attempts': int(env.get('MAX_ATTEMPTS', 3)),
             'max_concurrent': int(env.get('MAX_CONCURRENT', 1)),
             'max_log_lines': env.get('MAX_LOG_LINES', 120),
         }
+
+
+def get_slot_wait_timeout(cfg: dict | None = None) -> int:
+    """Return bounded AI slot wait timeout in seconds."""
+    cfg = cfg or get_config()
+    # Keep wait bounded so builds fail fast with current analyzed errors.
+    req_timeout = int(cfg.get('timeout') or 300)
+    slot_wait = int(cfg.get('slot_wait_timeout') or 45)
+    return max(1, min(req_timeout, slot_wait))
 
 
 def is_enabled() -> bool:
@@ -408,6 +423,38 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
                     f'AI fixer: skipping self-dependency {value!r} for {package_name}'
                 )
                 continue
+            # RPM package names/provides cannot encode extras in brackets.
+            # Normalize AI suggestions like python3-pyjwt[crypto] or
+            # python3dist(twisted[tls]) to their base dependency forms.
+            if '[' in value and ']' in value:
+                stripped = re.sub(r'\[[^\]]+\]', '', value)
+                if stripped != value:
+                    logger.info(f'AI fixer: stripped extras from dependency {value!r} -> {stripped!r}')
+                    value = stripped
+            # Reject file paths — they are never valid RPM package names
+            if value.startswith('/'):
+                logger.info(f'AI fixer: skipping file path as BuildRequires: {value!r}')
+                continue
+            # Reject known-invalid pseudo-packages
+            _INVALID_BR = {'/usr/bin/pathfix.py', 'pathfix', 'python3-pathfix',
+                           'pathfix.py', 'python3-toml', 'python3-tomllib',
+                           'python3-pip',   # pip is in the mock buildroot by default
+                           }
+            if value in _INVALID_BR:
+                logger.info(f'AI fixer: skipping known-invalid BuildRequires: {value!r}')
+                continue
+            # Reject version-specific Python dev libraries (e.g. libpython3.8-devel)
+            # — the correct package is always python3-devel for the active interpreter.
+            if re.match(r'^libpython3\.\d+-devel$', value):
+                logger.info(f'AI fixer: skipping version-specific python dev package: {value!r}')
+                continue
+            # python3dist(pkg) is a virtual Provides value, not an installable
+            # package name.  Convert it to the proper python3-<pkg> form.
+            dist_m = re.match(r'^python3?dist\(([^)]+)\)', value)
+            if dist_m:
+                pkg_name = dist_m.group(1).replace('.', '-').replace('_', '-').lower()
+                value = f'python3-{pkg_name}'
+                logger.info(f'AI fixer: converted virtual provide to package name: {value!r}')
             tag = 'BuildRequires' if op == 'add_buildrequires' else 'Requires'
             if re.search(rf'^{tag}:\s*{re.escape(value)}\s*$', content, re.MULTILINE):
                 continue
@@ -677,15 +724,14 @@ def attempt_ai_fix(package_id: int, build_log: str, root_log: str = '', ai_attem
 
         # Acquire a concurrency slot — block until one is free or timeout
         max_concurrent = cfg['max_concurrent']
-        # Use the LLM request timeout as the max wait; a slot should free up
-        # within roughly that window.
-        wait_timeout = cfg['timeout']
+        wait_timeout = get_slot_wait_timeout(cfg)
         if not _acquire_slot_blocking(max_concurrent, wait_timeout):
-            logger.warning(
+            msg = (
                 f'AI fixer: could not acquire a slot for {package.name} '
-                f'after {wait_timeout}s (limit={max_concurrent}), skipping'
+                f'after {wait_timeout}s (limit={max_concurrent})'
             )
-            return False
+            logger.warning(f'{msg}, skipping')
+            raise AISlotTimeoutError(msg)
 
         try:
             error_ctx = extract_error_context(build_log, root_log, cfg['max_log_lines'])
@@ -741,6 +787,9 @@ def attempt_ai_fix(package_id: int, build_log: str, root_log: str = '', ai_attem
     except requests.exceptions.ConnectionError:
         logger.warning('AI fixer: LLM backend unreachable, skipping')
         return False
+    except AISlotTimeoutError:
+        # Caller handles fail-fast UX/logging when slot wait budget is exceeded.
+        raise
     except Exception as e:
         logger.warning(f'AI fixer: failed for package {package_id}: {e}')
         return False

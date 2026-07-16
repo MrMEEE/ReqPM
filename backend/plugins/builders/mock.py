@@ -13,6 +13,7 @@ This allows multiple concurrent builds of the same target without conflicts.
 Based on patterns from https://github.com/MrMEEE/awx-rpm-v2
 """
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -41,6 +42,16 @@ class MockBuilder(BaseBuilder):
         self.gpg_keys_cache_dir = reqpm_config.get('GPG_KEYS_CACHE_DIR', '/var/cache/reqpm/distribution-gpg-keys')
         self.auto_update_gpg_keys = reqpm_config.get('AUTO_UPDATE_GPG_KEYS', True)
         self._gpg_keys_checked = False  # Track if we've checked keys in this session
+        # Per-build memory cap (physical RAM + swap) enforced via systemd-run cgroup.
+        # DB setting (SystemSettings.mock_memory_limit) takes priority; falls back to
+        # the MOCK_MEMORY_LIMIT env-var / settings.py value, then None (no limit).
+        env_limit = reqpm_config.get('MOCK_MEMORY_LIMIT', None)
+        try:
+            from backend.apps.core.models import SystemSettings
+            db_limit = SystemSettings.load().mock_memory_limit or None
+        except Exception:
+            db_limit = None
+        self.memory_limit = db_limit or env_limit or None
     
     @property
     def name(self) -> str:
@@ -165,24 +176,59 @@ class MockBuilder(BaseBuilder):
     def _run_mock_command(
         self,
         args: List[str],
-        timeout: int = 3600
+        timeout: int = 3600,
+        memory_limit: Optional[str] = None,
     ) -> tuple[int, str, str]:
         """
         Run a mock command with proper privileges
-        
+
         Args:
             args: Command arguments
             timeout: Command timeout in seconds
-        
+            memory_limit: cgroup MemoryMax value (e.g. '8G').  When set the
+                command is wrapped in ``systemd-run --scope`` so the kernel
+                enforces the limit on physical RAM + swap.  Ignored if
+                systemd-run is not found on PATH.
+
         Returns:
             Tuple of (returncode, stdout, stderr)
         """
-        # On Ubuntu/Debian, Mock needs to be run with sudo
-        # Check if we're running as root, if not, prepend sudo
+        # Build the base mock invocation (with sudo when not running as root).
         if os.geteuid() != 0:
-            cmd = ['sudo', '-n', self.mock_bin] + args
+            mock_cmd = ['sudo', '-n', self.mock_bin] + args
         else:
-            cmd = [self.mock_bin] + args
+            mock_cmd = [self.mock_bin] + args
+
+        # Optionally wrap with systemd-run to enforce a cgroup memory limit.
+        # systemd-run --scope creates a transient systemd scope unit; the
+        # kernel OOM-kills the build process if it exceeds MemoryMax.
+        #
+        # IMPORTANT: systemd-run must run as the *current user* (not via sudo)
+        # because the sudoers rule only permits `sudo mock`, not `sudo systemd-run`.
+        # The correct structure is therefore:
+        #   systemd-run --scope ... -- sudo -n mock ...
+        # so the scope is owned by the current user while mock itself still runs
+        # as root through the existing sudoers permission.
+        cmd = mock_cmd
+        if memory_limit:
+            import shutil
+            if shutil.which('systemd-run'):
+                # Use a transient user service so no polkit prompt is needed.
+                # --wait blocks until mock exits, preventing partial-log reads
+                # and premature fixer execution against an in-progress build.
+                scope_cmd = [
+                    'systemd-run', '--user', '--wait', '--collect',
+                    '-p', f'MemoryMax={memory_limit}',
+                    '-p', 'MemorySwapMax=0',
+                    '--',
+                ]
+                cmd = scope_cmd + mock_cmd
+                logger.info(f"Memory limit active: MemoryMax={memory_limit} (via systemd-run --user service)")
+            else:
+                logger.warning(
+                    "MOCK_MEMORY_LIMIT is set but systemd-run was not found; "
+                    "building without a memory limit"
+                )
             
         logger.debug(f"Running mock command: {' '.join(cmd)}")
         
@@ -206,6 +252,100 @@ class MockBuilder(BaseBuilder):
         except Exception as e:
             logger.error(f"Error running mock command: {e}")
             return -1, "", str(e)
+
+    def _detect_required_rustc_version(self, log_text: str) -> Optional[str]:
+        """
+        Detect rustc minimum version requirement from cargo/maturin failures.
+
+        Typical pattern:
+          error: rustc 1.92.0 is not supported ...
+            <crate>@<ver> requires rustc 1.94.0
+        """
+        text = log_text or ""
+        if "is not supported by the following packages" not in text or "requires rustc" not in text:
+            return None
+
+        versions = re.findall(r"requires\s+rustc\s+([0-9]+(?:\.[0-9]+){1,2})", text)
+        if not versions:
+            return None
+
+        def _vtuple(v: str):
+            parts = [int(x) for x in v.split('.')]
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts[:3])
+
+        return sorted(versions, key=_vtuple)[-1]
+
+    def _provision_newer_rust_toolchain(
+        self,
+        target: str,
+        arch: str,
+        unique_ext: str,
+        required_version: str,
+    ) -> bool:
+        """
+        Provision a newer Rust/Cargo toolchain inside the existing mock chroot.
+
+        Strategy:
+        1. Install rustup
+        2. Install and select required toolchain version
+        3. Point /usr/bin/{cargo,rustc} to rustup proxies for this chroot
+        """
+        logger.info(
+            f"Attempting rust toolchain upgrade in chroot {target}-{unique_ext} "
+            f"to rustc {required_version}"
+        )
+
+        # Install a chroot-global rustup toolchain under /opt so the build user
+        # can execute it (unlike /root/.cargo which can be permission-restricted).
+        chroot_cmds = [
+            "dnf -y install curl ca-certificates",
+            (
+                "mkdir -p /opt/reqpm-rustup /opt/reqpm-cargo && "
+                "export RUSTUP_HOME=/opt/reqpm-rustup CARGO_HOME=/opt/reqpm-cargo && "
+                "(dnf -y install rustup || true) && "
+                "if [ -x /usr/bin/rustup ]; then "
+                "  true; "
+                "else "
+                "  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none; "
+                "fi"
+            ),
+            (
+                "export RUSTUP_HOME=/opt/reqpm-rustup CARGO_HOME=/opt/reqpm-cargo && "
+                "if [ -x /usr/bin/rustup ]; then "
+                f"  /usr/bin/rustup toolchain install {required_version} --profile minimal && "
+                f"  /usr/bin/rustup default {required_version}; "
+                "else "
+                f"  /opt/reqpm-cargo/bin/rustup toolchain install {required_version} --profile minimal && "
+                f"  /opt/reqpm-cargo/bin/rustup default {required_version}; "
+                "fi"
+            ),
+            "chmod -R a+rX /opt/reqpm-rustup /opt/reqpm-cargo",
+            "ln -sf /opt/reqpm-cargo/bin/cargo /usr/bin/cargo",
+            "ln -sf /opt/reqpm-cargo/bin/rustc /usr/bin/rustc",
+            "cargo --version && rustc --version",
+        ]
+
+        for cmd in chroot_cmds:
+            args = [
+                '-r', target,
+                '--arch', arch,
+                '--uniqueext', unique_ext,
+                '--enable-network',
+                '--no-clean',
+                '--chroot', f"bash -lc '{cmd}'",
+            ]
+            rc, out, err = self._run_mock_command(args, timeout=1800, memory_limit=self.memory_limit)
+            if rc != 0:
+                logger.warning(
+                    "Failed to provision newer rust toolchain "
+                    f"(cmd={cmd}, rc={rc}): {(err or out or '').strip()[:500]}"
+                )
+                return False
+
+        logger.info(f"Provisioned rust toolchain {required_version} successfully")
+        return True
     
     def fetch_sources(
         self,
@@ -449,7 +589,7 @@ class MockBuilder(BaseBuilder):
         spec_file: str,
         sources_dir: str,
         output_dir: str,
-        target: str = None,
+        target: Optional[str] = None,
         **kwargs
     ) -> BuildResult:
         """
@@ -546,6 +686,19 @@ class MockBuilder(BaseBuilder):
         
         # Prepare output directory
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        # Prevent stale log reuse across repeated builds for the same package.
+        # This output directory is shared per package, so remove previous mock
+        # log files before starting a new rebuild.
+        stale_logs = ['build.log', 'root.log', 'state.log', 'hw_info.log']
+        for stale_name in stale_logs:
+            stale_path = Path(output_dir) / stale_name
+            if stale_path.exists() and stale_path.is_file():
+                try:
+                    stale_path.unlink()
+                    logger.debug(f"Removed stale log before rebuild: {stale_name}")
+                except Exception as e:
+                    logger.warning(f"Could not remove stale log {stale_name}: {e}")
         
         # Get unique extension for this build
         unique_ext = kwargs.get('unique_ext', f"build{int(time.time())}")
@@ -565,91 +718,151 @@ class MockBuilder(BaseBuilder):
 
         # Add project-local repo so already-built packages in this project are
         # available as build dependencies without needing to be in a remote repo.
+        # Guard against accidental cross-project contamination by ensuring the
+        # repo path belongs to the same project id when provided.
         local_repo_dir = kwargs.get('local_repo_dir')
+        project_id = kwargs.get('project_id')
         if local_repo_dir and Path(local_repo_dir).exists():
-            repo_url = f'file://{local_repo_dir}'
-            args += ['--addrepo', repo_url]
-            logger.info(f"Adding project local repo: {repo_url}")
+            resolved_repo = Path(local_repo_dir).resolve()
+            allow_repo = True
+
+            if project_id is not None:
+                try:
+                    expected_anchor = Path('projects') / str(int(project_id))
+                    allow_repo = expected_anchor in resolved_repo.parents or str(expected_anchor) in str(resolved_repo)
+                except Exception:
+                    allow_repo = False
+
+            if allow_repo:
+                repo_url = f'file://{resolved_repo}'
+                args += ['--addrepo', repo_url]
+                logger.info(f"Adding project local repo: {repo_url}")
+            else:
+                logger.warning(
+                    f"Skipping local repo outside project scope: {resolved_repo} (project_id={project_id})"
+                )
 
         args += ['--rebuild', srpm_path]
         
         logger.info(f"Building RPM with Mock: {target} {arch} (uniqueext={unique_ext})")
         
-        returncode, stdout, stderr = self._run_mock_command(args, timeout=7200)  # 2 hours
-        
-        build_duration = int(time.time() - start_time)
-        
-        # Read detailed logs from Mock's result directory
-        # Mock writes detailed logs to build.log and root.log files
         build_log_path = Path(output_dir) / "build.log"
         root_log_path = Path(output_dir) / "root.log"
         state_log_path = Path(output_dir) / "state.log"
-        
-        logger.info(f"Checking for Mock logs in: {output_dir}")
-        logger.info(f"build.log exists: {build_log_path.exists()}")
-        logger.info(f"root.log exists: {root_log_path.exists()}")
-        logger.info(f"state.log exists: {state_log_path.exists()}")
-        
-        # List all files in the output directory for debugging
-        try:
-            output_path = Path(output_dir)
-            if output_path.exists():
-                files = list(output_path.iterdir())
-                logger.info(f"Files in output dir: {[f.name for f in files]}")
-        except Exception as e:
-            logger.warning(f"Could not list output directory: {e}")
-        
-        # Store build.log in log_output and root.log in root_log_output.
-        # root.log is persisted so error analysis can detect missing dynamic
-        # BuildRequires that only appear there.
-        persisted_log_paths = [p for p in [build_log_path] if p.exists()]
-        detailed_log = merge_log_file_paths(persisted_log_paths, sort_by_time=False)
-        
-        # Read root.log for error analysis (may be large; capped at 1 MB)
-        root_log_content = ""
-        if root_log_path.exists():
-            try:
-                size = root_log_path.stat().st_size
-                logger.info(f"Read root.log: {size} bytes")
-                with open(root_log_path, 'r', errors='replace') as f:
-                    root_log_content = f.read(1024 * 1024)  # cap at 1 MB
-            except Exception as e:
-                logger.warning(f"Could not read root.log: {e}")
-        
-        # Log file sizes for debugging
-        for log_path in [build_log_path, state_log_path]:
-            if log_path.exists():
+
+        def _read_mock_logs(run_started_at: float) -> tuple[str, str]:
+            logger.info(f"Checking for Mock logs in: {output_dir}")
+            logger.info(f"build.log exists: {build_log_path.exists()}")
+            logger.info(f"root.log exists: {root_log_path.exists()}")
+            logger.info(f"state.log exists: {state_log_path.exists()}")
+
+            def _is_fresh(path: Path) -> bool:
                 try:
-                    size = log_path.stat().st_size
-                    logger.info(f"Read {log_path.name}: {size} bytes")
+                    return path.exists() and path.stat().st_mtime >= (run_started_at - 2)
+                except Exception:
+                    return False
+
+            try:
+                output_path = Path(output_dir)
+                if output_path.exists():
+                    files = list(output_path.iterdir())
+                    logger.info(f"Files in output dir: {[f.name for f in files]}")
+            except Exception as e:
+                logger.warning(f"Could not list output directory: {e}")
+
+            persisted_log_paths = [p for p in [build_log_path] if _is_fresh(p)]
+            detailed_log = merge_log_file_paths(persisted_log_paths, sort_by_time=False)
+
+            root_log_content = ""
+            if _is_fresh(root_log_path):
+                try:
+                    size = root_log_path.stat().st_size
+                    logger.info(f"Read root.log: {size} bytes")
+                    with open(root_log_path, 'r', errors='replace') as f:
+                        root_log_content = f.read(1024 * 1024)
                 except Exception as e:
-                    logger.warning(f"Could not stat {log_path.name}: {e}")
-        
-        log_output = detailed_log
-        root_log_output = root_log_content
-        
-        # Clean up both the build chroot and its bootstrap chroot to free disk space
-        logger.info(f"Cleaning up build chroot: {target} (uniqueext={unique_ext})")
-        for scrub_target in ('chroot', 'bootstrap'):
-            cleanup_args = [
-                '-r', target,
-                '--arch', arch,
-                '--uniqueext', unique_ext,
-                f'--scrub={scrub_target}',
-            ]
-            rc, _, _ = self._run_mock_command(cleanup_args, timeout=300)
-            if rc == 0:
-                logger.info(f"Cleaned up {scrub_target} for {unique_ext}")
+                    logger.warning(f"Could not read root.log: {e}")
+            elif root_log_path.exists():
+                logger.warning("Ignoring stale root.log from previous run")
+
+            for log_path in [build_log_path, state_log_path]:
+                if _is_fresh(log_path):
+                    try:
+                        size = log_path.stat().st_size
+                        logger.info(f"Read {log_path.name}: {size} bytes")
+                    except Exception as e:
+                        logger.warning(f"Could not stat {log_path.name}: {e}")
+                elif log_path.exists():
+                    logger.warning(f"Ignoring stale {log_path.name} from previous run")
+
+            return detailed_log, root_log_content
+
+        run_started_at = time.time()
+        returncode, stdout, stderr = self._run_mock_command(
+            args, timeout=7200, memory_limit=self.memory_limit
+        )
+        log_output, root_log_output = _read_mock_logs(run_started_at)
+
+        # Auto-retry path for modern Rust packages when distro rust/cargo is too old.
+        required_rust = self._detect_required_rustc_version(
+            (log_output or '') + "\n" + (root_log_output or '')
+        )
+        if returncode != 0 and required_rust:
+            logger.info(
+                f"Detected rustc minimum version requirement ({required_rust}) "
+                f"for {Path(srpm_path).name}; attempting toolchain upgrade + retry"
+            )
+            if self._provision_newer_rust_toolchain(target, arch, unique_ext, required_rust):
+                run_started_at = time.time()
+                returncode, stdout, stderr = self._run_mock_command(
+                    args, timeout=7200, memory_limit=self.memory_limit
+                )
+                log_output, root_log_output = _read_mock_logs(run_started_at)
             else:
-                logger.warning(f"Failed to clean up {scrub_target} for {unique_ext}")
-        
+                logger.warning("Rust toolchain provision failed; returning original build failure")
+
+        build_duration = int(time.time() - start_time)
+
+        # ------------------------------------------------------------------ #
+        # Chroot cleanup — scrub only the unique build chroot (not the shared  #
+        # bootstrap which is reused across concurrent builds).                 #
+        # ------------------------------------------------------------------ #
+        logger.info(f"Scrubbing build chroot: {target}-{unique_ext}")
+        scrub_args = [
+            '-r', target,
+            '--arch', arch,
+            '--uniqueext', unique_ext,
+            '--scrub=chroot',
+        ]
+        rc, _, _ = self._run_mock_command(scrub_args, timeout=300)
+        if rc == 0:
+            logger.info(f"Scrubbed build chroot for {unique_ext}")
+        else:
+            logger.warning(f"Failed to scrub build chroot for {unique_ext} (rc={rc})")
+
+        # ------------------------------------------------------------------ #
+        # Resultdir cleanup — keep RPMs/SRPMs only; everything else           #
+        # (build.log, root.log, state.log, hw_info.log, dnf*.log …) is        #
+        # already stored in the database via BuildResult and can be removed.  #
+        # ------------------------------------------------------------------ #
+        try:
+            for f in Path(output_dir).iterdir():
+                if f.is_file() and f.suffix != '.rpm':
+                    try:
+                        f.unlink()
+                        logger.debug(f"Removed build file: {f.name}")
+                    except Exception as _e:
+                        logger.warning(f"Could not remove {f.name}: {_e}")
+        except Exception as _e:
+            logger.warning(f"Resultdir cleanup failed: {_e}")
+
         if returncode == 0:
             # Find built RPMs (exclude SRPM)
             rpm_files = [
                 str(f) for f in Path(output_dir).glob('*.rpm')
                 if not f.name.endswith('.src.rpm')
             ]
-            
+
             return BuildResult(
                 success=True,
                 rpm_paths=rpm_files,

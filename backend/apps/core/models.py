@@ -19,6 +19,13 @@ class SystemSettings(models.Model):
         validators=[MinValueValidator(1), MaxValueValidator(20)],
         help_text="Maximum number of simultaneous builds (1-20)"
     )
+
+    mock_memory_limit = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        help_text="Per-build memory cap enforced via cgroup (e.g. 8G, 4096M). Leave empty to disable."
+    )
     
     # Cleanup settings
     cleanup_builds_after_days = models.IntegerField(

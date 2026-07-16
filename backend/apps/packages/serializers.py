@@ -76,7 +76,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'source_fetched', 'source_path',
             'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
-            'build_error_message', 'analyzed_errors', 'srpm_path', 'rpm_path',
+            'build_error_message', 'build_dependency_repo_url', 'analyzed_errors', 'srpm_path', 'rpm_path',
             'has_build_log', 'waiting_for_dep_names', 'failed_dep_names', 'dep_blocking_items',
             'created_at', 'updated_at', 'last_built_at'
         ]
@@ -84,7 +84,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'id', 'project_name', 'dependency_count', 'spec_files_count',
             'dependent_packages', 'extras', 'source_fetched', 'source_path',
             'build_status', 'build_started_at', 'build_completed_at',
-            'srpm_path', 'rpm_path', 'created_at', 'updated_at', 'last_built_at'
+            'build_dependency_repo_url', 'srpm_path', 'rpm_path', 'created_at', 'updated_at', 'last_built_at'
         ]
     
     def get_has_build_log(self, obj):

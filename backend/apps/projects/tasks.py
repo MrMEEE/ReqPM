@@ -263,6 +263,10 @@ def analyze_requirements_task(self, project_id: int):
         
         log_project(project_id, 'info', f"Analysis complete: {created_count} new packages, {len(all_requirements) - created_count} existing")
         logger.info(f"Analyzed requirements for project {project_id}: {created_count} packages created")
+
+        if created_count > 0:
+            from backend.apps.packages.tasks import refresh_missing_packages_state_task
+            refresh_missing_packages_state_task.delay(project_id)
         
         # Trigger spec file generation for all packages
         log_project(project_id, 'info', "Triggering spec file generation...")
@@ -345,7 +349,7 @@ def resolve_dependencies_task(self, project_id: int):
                     continue
                 seen.add(dep_name)
                 dep_info = pypi_client.get_package_info(dep_name)
-                dep_list.append((dep_name, dep_info.version if dep_info else None))
+                dep_list.append((dep_name, dep_info.version if dep_info else None, dep_req))
 
             pkg_resolved[package] = dep_list
 
@@ -357,12 +361,17 @@ def resolve_dependencies_task(self, project_id: int):
         dependency_tree: dict = {}
 
         with transaction.atomic():
-            # Wipe old links so re-runs are idempotent (stale extras gone too).
-            PackageDependency.objects.filter(package__project=project).delete()
+            # Rebuild only resolver-managed runtime links.
+            # Keep build links discovered from failed RPM builds (auto_add_missing_dependencies),
+            # otherwise they disappear on every dependency-resolution run.
+            PackageDependency.objects.filter(
+                package__project=project,
+                dependency_type=PackageDependency.DependencyType.RUNTIME,
+            ).delete()
 
             for package, dep_list in pkg_resolved.items():
                 dep_names = []
-                for dep_name, dep_version in dep_list:
+                for dep_name, dep_version, dep_req in dep_list:
                     # Normalize package name to prevent duplicates (case-insensitive)
                     normalized_dep_name = normalize_package_name(dep_name)
                     dep_names.append(normalized_dep_name)
@@ -389,11 +398,22 @@ def resolve_dependencies_task(self, project_id: int):
                         dep_package.version = dep_version
                         dep_package.save(update_fields=['version'])
 
-                    PackageDependency.objects.get_or_create(
+                    dep_rel, _ = PackageDependency.objects.get_or_create(
                         package=package,
                         depends_on=dep_package,
-                        defaults={'dependency_type': 'runtime'},
+                        defaults={
+                            'dependency_type': 'runtime',
+                            'version_constraint': (dep_req or '')[:255],
+                        },
                     )
+
+                    # Keep a compact copy of the original requirement string
+                    # so extras markers (e.g. pyjwt[crypto]) are available for
+                    # downstream dependency-blocking logic.
+                    normalized_req = (dep_req or '')[:255]
+                    if normalized_req and dep_rel.version_constraint != normalized_req:
+                        dep_rel.version_constraint = normalized_req
+                        dep_rel.save(update_fields=['version_constraint'])
 
                 dependency_tree[package.name] = dep_names
 
@@ -427,6 +447,9 @@ def resolve_dependencies_task(self, project_id: int):
             from backend.apps.packages.tasks import generate_spec_file_task
             for pkg_id in new_packages:
                 generate_spec_file_task.delay(pkg_id, force=True)
+
+            from backend.apps.packages.tasks import refresh_missing_packages_state_task
+            refresh_missing_packages_state_task.delay(project_id)
 
         log_project(project_id, 'info', f"Dependency resolution complete: {len(build_levels)} build levels, {len(new_packages)} new packages")
         logger.info(f"Resolved dependencies for project {project_id}: {len(build_levels)} build levels")

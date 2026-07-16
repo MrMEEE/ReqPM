@@ -13,6 +13,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'max_concurrent_builds',
+            'mock_memory_limit',
             'cleanup_builds_after_days',
             'cleanup_repos_after_days',
             'auto_sync_projects',
@@ -39,6 +40,15 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
         if value < 1 or value > 20:
             raise serializers.ValidationError("Must be between 1 and 20")
         return value
+
+    def validate_mock_memory_limit(self, value):
+        """Validate mock_memory_limit — must be empty or a valid systemd memory spec."""
+        import re
+        if value and not re.fullmatch(r'\d+(\.\d+)?[KMGTP]?(B|iB)?', value.strip()):
+            raise serializers.ValidationError(
+                "Must be a valid memory size (e.g. 8G, 4096M, 512K) or leave empty to disable."
+            )
+        return value.strip()
     
     def validate_cleanup_builds_after_days(self, value):
         """Validate cleanup_builds_after_days"""

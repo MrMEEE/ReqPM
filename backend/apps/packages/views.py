@@ -1,6 +1,7 @@
 """
 ViewSets for Packages app
 """
+import logging
 import os
 from django.http import FileResponse, Http404
 from rest_framework import viewsets, status, filters
@@ -22,6 +23,13 @@ from backend.apps.packages.serializers import (
 from backend.apps.packages.tasks import (
     generate_spec_file_task, update_package_metadata_task, sync_package_extras_task
 )
+from backend.apps.packages.artifact_cleanup import (
+    wipe_package_artifacts_for_rebuild,
+    reset_package_build_state,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class PackageViewSet(viewsets.ModelViewSet):
@@ -73,6 +81,30 @@ class PackageViewSet(viewsets.ModelViewSet):
             return PackageUpdateSerializer
         else:
             return PackageDetailSerializer
+
+    def perform_update(self, serializer):
+        """Run cleanup/reset pipeline when package version is changed via generic update APIs."""
+        package = serializer.instance
+        old_version = package.version
+        serializer.save()
+
+        new_version = serializer.validated_data.get('version')
+        if new_version and new_version != old_version:
+            cleanup = wipe_package_artifacts_for_rebuild(package, reason='generic-version-change')
+            reset_package_build_state(package)
+
+            from backend.apps.projects.tasks import resolve_dependencies_task
+
+            generate_spec_file_task.delay(package.id, force=True)
+            resolve_dependencies_task.delay(package.project.id)
+
+            logger.info(
+                "Updated %s version via generic update %s -> %s; cleanup=%s",
+                package.name,
+                old_version,
+                new_version,
+                cleanup,
+            )
     
     @action(detail=True, methods=['post'])
     def generate_spec(self, request, pk=None):
@@ -523,14 +555,24 @@ class PackageViewSet(viewsets.ModelViewSet):
             
             # Trigger spec file regeneration and dependency recalculation if extras changed
             if 'enabled' in request.data and old_enabled != extra.enabled:
-                from backend.apps.packages.tasks import generate_spec_file_task
                 from backend.apps.projects.tasks import resolve_dependencies_task
-                
+
+                cleanup = wipe_package_artifacts_for_rebuild(package, reason='extra-toggle')
+                reset_package_build_state(package)
+
                 # Regenerate spec file with new extras
                 generate_spec_file_task.delay(package.id, force=True)
-                
+
                 # Recalculate dependencies for the entire project since extras affect deps
                 resolve_dependencies_task.delay(package.project.id)
+
+                logger.info(
+                    "Extra toggle for %s (%s=%s) triggered cleanup=%s",
+                    package.name,
+                    extra.name,
+                    extra.enabled,
+                    cleanup,
+                )
             
             return Response(serializer.data)
         
@@ -589,10 +631,19 @@ class PackageViewSet(viewsets.ModelViewSet):
             )
         
         old_version = package.version
+
+        if new_version == old_version:
+            return Response({
+                'message': f'Package is already at version {new_version}',
+                'package': PackageListSerializer(package).data
+            })
+
+        cleanup = wipe_package_artifacts_for_rebuild(package, reason='change-version')
         
         # Update version
         package.version = new_version
-        package.save()
+        package.save(update_fields=['version'])
+        reset_package_build_state(package)
         
         # Trigger spec file regeneration with new version
         from backend.apps.packages.tasks import generate_spec_file_task
@@ -603,10 +654,14 @@ class PackageViewSet(viewsets.ModelViewSet):
         # Recalculate dependencies only for this package
         resolve_dependencies_task.delay(package.project.id)
         
-        logger.info(f"Changed version of {package.name} from {old_version} to {new_version}")
+        logger.info(
+            f"Changed version of {package.name} from {old_version} to {new_version}; "
+            f"cleanup={cleanup}"
+        )
         
         return Response({
             'message': f'Version changed from {old_version} to {new_version}',
+            'cleanup': cleanup,
             'package': PackageListSerializer(package).data
         })
     

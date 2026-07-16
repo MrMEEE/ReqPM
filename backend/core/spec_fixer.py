@@ -191,24 +191,123 @@ class SpecFixer:
         fixes = []
         content = spec_content
 
+        # --- Always-on cleanup: remove known-invalid BuildRequires lines ---
+        # These are leftover artefacts from earlier (buggy) fixer runs and must
+        # be removed unconditionally, regardless of the current error category.
+        _ALWAYS_REMOVE_BR = re.compile(
+            r'^\s*BuildRequires\s*:.*?'
+            r'(?:/usr/bin/pathfix\.py'
+            r'|python3?-pathfix'
+            r'|python3?-toml(?:lib)?'   # tomllib is built-in since Python 3.11
+            r'|python3?-pip'            # pip is already in the mock buildroot
+            r'|libpython3\.\d+-devel'   # version-specific; use python3-devel instead
+            r'|python3?-calver'         # calver not in RHEL 10; strip from pyproject.toml instead
+            r'|python3?-pytest[-_]runner'  # test-only dep, not needed for building
+            r'|python3?-poetry(?![-_]core)'  # full poetry not in RHEL 10 (poetry-core is handled separately)
+            r')\s*\n?',
+            re.MULTILINE | re.IGNORECASE,
+        )
+        cleaned, n_removed = _ALWAYS_REMOVE_BR.subn('', content)
+        if n_removed:
+            content = cleaned
+            fixes.append(f'Removed {n_removed} known-invalid BuildRequires line(s)')
+
+        # Remove bare pathfix.py calls left by old fixer
+        cleaned2, n2 = re.subn(
+            r'^\s*pathfix\.py\s+.*\n?',
+            '',
+            content,
+            flags=re.MULTILINE,
+        )
+        if n2:
+            content = cleaned2
+            fixes.append(f'Removed {n2} stale pathfix.py call(s)')
+
+        # Ensure %generate_buildrequires + %pyproject_buildrequires is present
+        # whenever %pyproject_wheel is used.  pyproject-rpm-macros ≥ 1.18 calls
+        # `python3 -m pip wheel` internally, so pip must be available.
+        # %pyproject_buildrequires generates `python3dist(pip) >= 19` as a
+        # dynamic BR which mock resolves to python3-pip from the project repo.
+        if '%pyproject_wheel' in content and '%generate_buildrequires' not in content:
+            content = re.sub(
+                r'^(%build\b)',
+                '%generate_buildrequires\n%pyproject_buildrequires\n\n\\1',
+                content,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            fixes.append('Added %generate_buildrequires/%pyproject_buildrequires (required for pip in mock)')
+        elif '%pyproject_wheel' in content and '%pyproject_buildrequires' not in content:
+            content = re.sub(
+                r'^(%generate_buildrequires\b)',
+                '\\1\n%pyproject_buildrequires',
+                content,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            fixes.append('Added %pyproject_buildrequires to existing %generate_buildrequires')
+
+        # VCS build tools that are not available in RHEL 10 standard repos.
+        # When these appear as missing packages the correct fix is to patch
+        # pyproject.toml in %prep to remove them and use a static version.
+        _VCS_TOOLS = {'hatch-vcs', 'hatch_vcs', 'python3-hatch-vcs',
+                      'setuptools-scm', 'setuptools_scm', 'python3-setuptools-scm',
+                      'flit-scm', 'flit_scm', 'python3-flit-scm',
+                      'calver', 'python3-calver',
+                      'versioneer'}
+        # Normalised bare names (lower, dash-normalised) for matching python3dist() items
+        _VCS_TOOL_BARE = {'hatch-vcs', 'hatch_vcs', 'setuptools-scm',
+                          'setuptools_scm', 'flit-scm', 'flit_scm',
+                          'calver', 'versioneer'}
+
         for error in analyzed_errors:
             category = error.get('category', '')
             items = error.get('items', [])
 
             if category in ('Missing Packages', 'Missing Dependencies'):
-                content, applied = self._add_buildrequires_items(content, items)
+                # Convert python3dist(pkgname) virtual-provide strings to the
+                # installable RPM package name (python3-pkgname).  Version
+                # constraints are dropped because static BuildRequires don't
+                # carry version pinning in the same way.
+                converted = []
+                for raw in items:
+                    raw = raw.strip().strip("'\"")
+                    m = re.match(r'^python3?dist\(([^)]+)\)', raw)
+                    if m:
+                        pkg_name = m.group(1).replace('.', '-').replace('_', '-').lower()
+                        # If this is a VCS build tool, apply the VCS fix instead
+                        if pkg_name in _VCS_TOOL_BARE:
+                            content, applied = self._fix_vcs_build_tool(content)
+                            fixes.extend(applied)
+                            continue
+                        converted.append(f'python3-{pkg_name}')
+                    else:
+                        bare = raw.replace('_', '-').lower()
+                        if raw in _VCS_TOOLS or bare in _VCS_TOOL_BARE:
+                            content, applied = self._fix_vcs_build_tool(content)
+                            fixes.extend(applied)
+                            continue
+                        converted.append(raw)
+                content, applied = self._add_buildrequires_items(content, converted)
                 fixes.extend(applied)
 
             elif category == 'Missing Python Modules':
-                # Convert module names to python3-<module> package names
+                # Convert module names to python3-<module> package names.
+                # Special case: X.version items mean the installed RPM for package X
+                # is missing its version.py submodule (a common hatch-vcs packaging gap).
+                # Adding 'python3-X-version' as a BuildRequires doesn't help — fix the
+                # installed package in-place inside %prep instead.
                 packages = []
                 for item in items:
-                    # Strip quotes, spaces
                     mod = item.strip().strip("'\"")
-                    # Skip 'packaging' — usually already present
                     if mod == 'packaging':
                         continue
-                    # e.g. numpy → python3-numpy
+                    # Detect 'X.version' (missing version submodule) pattern
+                    if re.fullmatch(r'[\w]+\.version', mod):
+                        parent = mod.split('.')[0]
+                        content, applied = self._fix_missing_version_submodule(content, parent)
+                        fixes.extend(applied)
+                        continue
                     pkg = f'python3-{mod.replace(".", "-").lower()}'
                     packages.append(pkg)
                 if packages:
@@ -283,6 +382,11 @@ class SpecFixer:
             'found.', 'packages', 'satisfied', 'no', 'is', 'the', 'and',
             'or', 'of', 'to', 'in', 'for', 'are', 'was', 'error', 'warning',
         }
+        # Known-invalid pseudo-package names that are never installable
+        _INVALID = {
+            '/usr/bin/pathfix.py', 'pathfix', 'python3-pathfix', 'pathfix.py',
+            'python3-toml',  # replaced by tomllib built-in in Python 3.11+
+        }
 
         for raw_item in items:
             item = raw_item.strip().strip("'\"")
@@ -291,6 +395,20 @@ class SpecFixer:
             # Reject obvious noise: plain English words or items containing spaces
             if item.lower() in _NOISE or item.endswith('.') or ' ' in item:
                 logger.debug(f'SpecFixer: skipping noise item: {item!r}')
+                continue
+            # Reject file paths — these are never valid RPM package names
+            if item.startswith('/'):
+                logger.debug(f'SpecFixer: skipping file path item: {item!r}')
+                continue
+            # Reject known-invalid pseudo-packages
+            if item in _INVALID or item.lower() in _INVALID:
+                logger.debug(f'SpecFixer: skipping known-invalid item: {item!r}')
+                continue
+            # Reject bare python3dist() virtual provides — they are Provides:
+            # values, not installable package names.  Callers should convert
+            # them to python3-<name> before calling this method.
+            if re.match(r'^python3?dist\(', item):
+                logger.debug(f'SpecFixer: skipping virtual provide: {item!r}')
                 continue
 
             # Skip if already present as a BuildRequires
@@ -314,6 +432,130 @@ class SpecFixer:
 
         return content, applied
 
+    def _fix_missing_version_submodule(self, spec: str, parent_pkg: str) -> tuple:
+        """
+        Fix 'No module named X.version' errors that occur when an RPM is built
+        without the hatch-vcs-generated version.py submodule.
+
+        Injects a sitecustomize shim into %generate_buildrequires so the missing
+        X.version module is synthesized before pyproject_buildrequires imports
+        the package (where this error usually happens).
+
+        This avoids writing into system site-packages (often read-only for the
+        build user inside mock) and instead uses PYTHONPATH to preload a tiny
+        compatibility shim for the current shell command.
+
+        Uses a shell heredoc (not ``python3 -c '...'``) so that the Python code
+        retains proper newlines — shell line-continuations in ``python3 -c``
+        strip all newlines and produce a SyntaxError.
+
+        This is idempotent: the snippet is a no-op if version.py already exists,
+        and will not be inserted again if a correct %generate_buildrequires
+        repair is already present.
+        """
+        marker = f'# reqpm: repair {parent_pkg}.version'
+        heredoc_tag = 'REQPM_REPAIR_EOF'
+
+        snippet = (
+            f'{marker}\n'
+            f"mkdir -p .reqpm_pyshim\n"
+            f"cat > .reqpm_pyshim/sitecustomize.py << '{heredoc_tag}'\n"
+            f'import importlib.metadata\n'
+            f'import re\n'
+            f'import sys\n'
+            f'import types\n'
+            f"_pkg = '{parent_pkg}'\n"
+            f"_mod = f'{parent_pkg}.version'\n"
+            f'if _mod not in sys.modules:\n'
+            f'    _shim = types.ModuleType(_mod)\n'
+            f'    try:\n'
+            f'        _ver = importlib.metadata.version(_pkg)\n'
+            f'    except Exception:\n'
+            f"        _ver = '0'\n"
+            f'    _parts = [int(p) for p in re.findall(r"\\d+", _ver)]\n'
+            f'    _ver_tuple = tuple(_parts) if _parts else (0,)\n'
+            f'    _shim.__version__ = _ver\n'
+            f'    _shim.version = _ver\n'
+            f'    _shim.__version_tuple__ = _ver_tuple\n'
+            f'    _shim.__version_info__ = _ver_tuple\n'
+            f'    sys.modules[_mod] = _shim\n'
+            f'{heredoc_tag}'
+            f"\nexport PYTHONPATH=\"$PWD/.reqpm_pyshim${{PYTHONPATH:+:$PYTHONPATH}}\""
+        )
+
+        generate_block_match = re.search(
+            r'%generate_buildrequires\b[\s\S]*?(?=\n%[a-zA-Z]|\Z)',
+            spec,
+            re.DOTALL,
+        )
+        generate_block = generate_block_match.group(0) if generate_block_match else ''
+        bad_files_present = bool(re.search(
+            r'^\s*(?:%\{python3_sitelib\}|/usr/lib/python[0-9.]+/site-packages)/'
+            + re.escape(parent_pkg)
+            + r'/version\.py\s*$',
+            spec,
+            re.MULTILINE,
+        ))
+
+        # Already correctly patched in the right section — nothing to do.
+        # Use '\n' suffix so we don't false-positive on REQPM_REPAIR_EOF that
+        # appears mid-line (e.g. as a prefix of "REQPM_REPAIR_EOF' || true").
+        if (
+            marker in generate_block
+            and (snippet + '\n' in generate_block or generate_block.endswith(snippet))
+            and not bad_files_present
+        ):
+            return spec, []
+
+        # Remove any existing marker snippet variants (old %prep placement,
+        # old python3 -c style, or malformed heredoc variants), then inject a
+        # clean snippet in %generate_buildrequires.
+        block_pattern = re.compile(
+            re.escape(marker) + r'[\s\S]*?^' + re.escape(heredoc_tag) + r'[ \t]*$\n?',
+            re.DOTALL | re.MULTILINE,
+        )
+        inline_pattern = re.compile(
+            re.escape(marker) + r'\npython3 -c "[\s\S]*?" \|\| true\n?',
+            re.DOTALL,
+        )
+
+        cleaned_spec = block_pattern.sub('', spec)
+        cleaned_spec = inline_pattern.sub('', cleaned_spec)
+
+        # Remove incorrect AI-suggested %files entries that reference a
+        # system site-packages version.py path for this package.  That path is
+        # outside buildroot and should not be listed in packaged files.
+        bad_files_pattern = re.compile(
+            r'^\s*(?:%\{python3_sitelib\}|/usr/lib/python[0-9.]+/site-packages)/'
+            + re.escape(parent_pkg)
+            + r'/version\.py\s*$\n?',
+            re.MULTILINE,
+        )
+        cleaned_spec = bad_files_pattern.sub('', cleaned_spec)
+        cleaned_spec = re.sub(r'\n{3,}', '\n\n', cleaned_spec)
+
+        # Insert at start of %generate_buildrequires, before
+        # pyproject_buildrequires executes.
+        new_spec = re.sub(
+            r'(%generate_buildrequires\b[^\n]*\n)',
+            lambda m: m.group(1) + snippet + '\n',
+            cleaned_spec,
+            count=1,
+        )
+
+        if new_spec == cleaned_spec:
+            # Fallback for specs without %generate_buildrequires: inject in %prep.
+            new_spec = re.sub(
+                r'(%prep\b[^\n]*\n)',
+                lambda m: m.group(1) + snippet + '\n',
+                cleaned_spec,
+                count=1,
+            )
+
+        if new_spec != spec:
+            return new_spec, [f'Auto-fixed missing {parent_pkg}.version before %generate_buildrequires']
+        return spec, []
+
     def _fix_missing_headers(self, spec: str, items: list) -> tuple:
         """
         Map missing header files / pkg-config names to their -devel packages
@@ -336,51 +578,142 @@ class SpecFixer:
             return self._add_buildrequires_items(spec, unique)
         return spec, []
 
-    def _fix_shebang(self, spec: str) -> tuple:
+    def _fix_vcs_build_tool(self, spec: str) -> tuple:
         """
-        Fix ambiguous Python shebangs (awx-rpm-v2 fixpythonshebangs):
-          1. Add `BuildRequires: /usr/bin/pathfix.py` before first BuildRequires
-          2. After %autosetup, add pathfix call for source tree
-          3. After %pyproject_save_files / end of %install, add pathfix for buildroot
+        Fix specs that depend on VCS build tools (hatch-vcs, setuptools-scm, etc.)
+        that are not available in RHEL 10.
+
+        Strategy:
+        1. Add a sed command in %prep to strip VCS build plugins from
+           pyproject.toml's build-system.requires so %generate_buildrequires
+           won't request them.
+        2. Patch any `version.source = "vcs"` line to use `version.source = "regex"`
+           with a static version file, so hatchling can still resolve the version.
+        3. Add SETUPTOOLS_SCM_PRETEND_VERSION to the %pyproject_wheel call in %build
+           as a belt-and-suspenders guard for other VCS tools.
+        4. Remove any stale `BuildRequires: hatch-vcs` / `python3-hatch-vcs` lines.
         """
         applied = []
         content = spec
 
-        # 1. Add BuildRequires: /usr/bin/pathfix.py
-        if '/usr/bin/pathfix.py' not in content:
-            content, a = self._add_buildrequires_items(content, ['/usr/bin/pathfix.py'])
-            applied.extend(a)
+        # --- remove any existing stale VCS build tool BRs ---
+        _vcs_br_pat = re.compile(
+            r'^\s*BuildRequires\s*:.*?\b(hatch[-_]vcs|setuptools[-_]scm|flit[-_]scm|versioneer|calver|poetry[-_]core)\b.*\n?',
+            re.MULTILINE | re.IGNORECASE,
+        )
+        cleaned, n = _vcs_br_pat.subn('', content)
+        if n:
+            content = cleaned
+            applied.append('Removed invalid VCS build tool BuildRequires')
 
-        # 2. After %autosetup line, add pathfix for source tree
-        if 'pathfix.py' not in content or '%autosetup' in content:
+        # --- build a composite sed command we will inject into %prep ---
+        VCS_PREP_MARKER = '# Remove VCS build plugins not available in RHEL 10'
+
+        # Only inject once
+        if VCS_PREP_MARKER not in content:
+            prep_patch = (
+                f'{VCS_PREP_MARKER}\n'
+                'if [ -f pyproject.toml ]; then\n'
+                '  sed -i \'/"hatch-vcs/d; /"setuptools-scm/d; /"flit-scm/d; /"versioneer/d\' pyproject.toml\n'
+                '  # Switch flit_scm requires entry and build backend to flit_core\n'
+                '  sed -i \'s|"flit_scm"|"flit_core"|g; s|flit_scm:buildapi|flit_core.buildapi|g; s|build-backend = "flit_scm"|build-backend = "flit_core.buildapi"|\' pyproject.toml\n'
+                '  # Switch VCS version source → regex source (reads __version__ from file)\n'
+                '  sed -i \'s/version\\.source = "vcs"/version.source = "regex"/g\' pyproject.toml\n'
+                '  # Also handle [tool.hatch.version] section style\n'
+                '  sed -i \'/^source = "vcs"$/s//source = "regex"/\' pyproject.toml\n'
+                '  # Ensure the version file exists (hatchling regex source default)\n'
+                '  VERSION_FILE=$(grep -r "version\\.path" pyproject.toml 2>/dev/null | head -1 | grep -oP \'(?<=path = ")[^"]+\')\n'
+                '  [ -z "$VERSION_FILE" ] && VERSION_FILE=$(find src -name "_version.py" -o -name "__version__.py" -o -name "version.py" 2>/dev/null | head -1)\n'
+                '  if [ -n "$VERSION_FILE" ] && [ ! -f "$VERSION_FILE" ]; then\n'
+                '    mkdir -p "$(dirname $VERSION_FILE)"\n'
+                '    echo "__version__ = \\"%{version}\\"" > "$VERSION_FILE"\n'
+                '  fi\n'
+                'fi\n'
+            )
+
+            # Insert at the end of the %prep section (before %build)
+            if '%setup' in content:
+                # Insert after the last line of %setup block
+                content = re.sub(
+                    r'(%setup[^\n]*\n(?:(?!%(?:build|install|check|files|changelog|package|description|prep))[^\n]*\n)*)',
+                    r'\1' + prep_patch + '\n',
+                    content,
+                    count=1,
+                )
+                applied.append('Added pyproject.toml VCS plugin removal in %prep')
+            elif '%prep' in content:
+                content = re.sub(
+                    r'(%prep\s*\n)',
+                    r'\1' + prep_patch + '\n',
+                    content,
+                    count=1,
+                )
+                applied.append('Added pyproject.toml VCS plugin removal in %prep')
+
+        # --- ensure SETUPTOOLS_SCM_PRETEND_VERSION in %build ---
+        if '%pyproject_wheel' in content and 'SETUPTOOLS_SCM_PRETEND_VERSION' not in content:
             content = re.sub(
-                r'(%autosetup\b[^\n]*)',
-                r'\1\npathfix.py -pni "%{__python3} %{py3_shbang_opts}" .',
+                r'^(%pyproject_wheel\b)',
+                r'SETUPTOOLS_SCM_PRETEND_VERSION=%{version} \1',
                 content,
+                flags=re.MULTILINE,
                 count=1,
             )
-            applied.append('Added pathfix.py call after %autosetup')
+            applied.append('Added SETUPTOOLS_SCM_PRETEND_VERSION to %pyproject_wheel')
 
-        # 3. After %pyproject_save_files (or last line of %install if no pyproject_save_files)
-        pathfix_buildroot = 'pathfix.py -pni "%{__python3} %{py3_shbang_opts}" %{buildroot} %{buildroot}%{_bindir}/*'
-        if pathfix_buildroot not in content:
-            if '%pyproject_save_files' in content:
-                content = re.sub(
-                    r'(%pyproject_save_files\b[^\n]*)',
-                    r'\1\n' + pathfix_buildroot,
-                    content,
-                    count=1,
-                )
-            else:
-                # Append at end of %install section (before next % section)
-                content = re.sub(
-                    r'(%install\b[^\n]*\n(?:(?!^%).)*)',
-                    r'\g<0>' + pathfix_buildroot + '\n',
-                    content,
-                    flags=re.MULTILINE | re.DOTALL,
-                    count=1,
-                )
-            applied.append('Added pathfix.py calls for buildroot')
+        return content, applied
+
+    def _fix_shebang(self, spec: str) -> tuple:
+        """
+        Fix ambiguous Python shebangs using the modern %py3_shebang_fix macro.
+
+        The old approach of adding `BuildRequires: /usr/bin/pathfix.py` is wrong:
+        /usr/bin/pathfix.py is a file, not an installable RPM package.  Modern
+        RHEL 10 pyproject-rpm-macros handle shebangs automatically via brp macros,
+        but when an explicit fix is still needed the correct approach is to call
+        %py3_shebang_fix (provided by python3-devel) in %install.
+        """
+        applied = []
+        content = spec
+
+        shebang_fix = '%py3_shebang_fix %{buildroot}%{_bindir}/* 2>/dev/null || true'
+
+        # Only insert if not already present
+        if shebang_fix not in content:
+            # Insert after %pyproject_install or %py3_install, before save_files
+            for anchor in ('%pyproject_install', '%py3_install'):
+                if anchor in content:
+                    content = re.sub(
+                        rf'({re.escape(anchor)}\b[^\n]*)',
+                        rf'\1\n{shebang_fix}',
+                        content,
+                        count=1,
+                    )
+                    applied.append('Added %py3_shebang_fix call in %install')
+                    break
+
+        # Remove any stale /usr/bin/pathfix.py BuildRequires lines left by
+        # old versions of this fixer — they reference a file path, not a package.
+        cleaned, n = re.subn(
+            r'^\s*BuildRequires\s*:.*?/usr/bin/pathfix\.py.*\n?',
+            '',
+            content,
+            flags=re.MULTILINE,
+        )
+        if n:
+            content = cleaned
+            applied.append('Removed invalid BuildRequires: /usr/bin/pathfix.py')
+
+        # Also remove bare pathfix calls added by old fixer runs
+        cleaned2, n2 = re.subn(
+            r'^\s*pathfix\.py\s+-pni[^\n]*\n?',
+            '',
+            content,
+            flags=re.MULTILINE,
+        )
+        if n2:
+            content = cleaned2
+            applied.append('Removed stale pathfix.py calls')
 
         return content, applied
 

@@ -122,6 +122,12 @@ class Package(models.Model):
     build_log = models.TextField(blank=True)
     build_root_log = models.TextField(blank=True)
     build_error_message = models.TextField(blank=True)
+    build_dependency_repo_url = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text=_('Local dependency repo URL used for this build (project-scoped)')
+    )
     analyzed_errors = models.JSONField(default=list, blank=True, help_text=_('Parsed build error analysis'))
     build_system = models.CharField(
         max_length=30,
@@ -137,6 +143,10 @@ class Package(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_built_at = models.DateTimeField(null=True, blank=True)
+    sources_fetched_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text=_('When sources were last successfully fetched')
+    )
     
     class Meta:
         db_table = 'packages'
@@ -165,12 +175,15 @@ class Package(models.Model):
     
     @property
     def source_fetched(self):
-        """Check if source file has been downloaded"""
+        """Check if source file has been downloaded."""
+        # Fast DB-backed path: if we have recorded a fetch timestamp, trust it.
+        if self.sources_fetched_at is not None:
+            return True
+        # Fallback: filesystem scan (covers packages fetched before this field existed).
         from pathlib import Path
         sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / self.name
         if not sources_dir.exists():
             return False
-        # Check for any archive file in the sources directory
         archive_extensions = ('.tar.gz', '.tar.bz2', '.zip', '.whl', '.tar.xz')
         for f in sources_dir.iterdir():
             if f.is_file() and any(f.name.endswith(ext) for ext in archive_extensions):

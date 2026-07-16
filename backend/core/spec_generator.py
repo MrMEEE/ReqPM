@@ -102,30 +102,41 @@ class SpecFileGenerator:
             
             if result.returncode != 0:
                 logger.error(f"pyp2spec failed for {package_name}: {result.stderr}")
-                return self._generate_fallback_spec(package_name, version, python_version, python_name)
+                fallback_spec = self._generate_fallback_spec(package_name, version, python_version, python_name)
+                return self._post_process_spec(fallback_spec, package_name, version, build_system, pypi_name)
             
             # pyp2spec prints the spec to stdout by default
             spec_content = result.stdout
             
             if not spec_content or len(spec_content.strip()) == 0:
                 logger.error(f"pyp2spec returned empty spec for {package_name}")
-                return self._generate_fallback_spec(package_name, version, python_version, python_name)
+                fallback_spec = self._generate_fallback_spec(package_name, version, python_version, python_name)
+                return self._post_process_spec(fallback_spec, package_name, version, build_system, pypi_name)
             
             logger.info(f"Successfully generated spec for {package_name}")
             
             # Post-process the spec file
-            spec_content = self._post_process_spec(spec_content, package_name, version, build_system)
+            spec_content = self._post_process_spec(spec_content, package_name, version, build_system, pypi_name)
             
             return spec_content
             
         except subprocess.TimeoutExpired:
             logger.error(f"pyp2spec timed out for {package_name}")
-            return self._generate_fallback_spec(package_name, version, python_version, python_name)
+            fallback_spec = self._generate_fallback_spec(package_name, version, python_version, python_name)
+            return self._post_process_spec(fallback_spec, package_name, version, build_system, pypi_name)
         except Exception as e:
             logger.error(f"Error generating spec for {package_name}: {e}")
-            return self._generate_fallback_spec(package_name, version, python_version, python_name)
+            fallback_spec = self._generate_fallback_spec(package_name, version, python_version, python_name)
+            return self._post_process_spec(fallback_spec, package_name, version, build_system, pypi_name)
     
-    def _post_process_spec(self, spec_content: str, package_name: str, version: Optional[str], build_system: str = 'unknown') -> str:
+    def _post_process_spec(
+        self,
+        spec_content: str,
+        package_name: str,
+        version: Optional[str],
+        build_system: str = 'unknown',
+        pypi_name: Optional[str] = None,
+    ) -> str:
         """
         Post-process the generated spec file
         
@@ -164,7 +175,120 @@ class SpecFileGenerator:
             '%pyproject_install',
             spec_content
         )
-        
+
+        # Strip extras bracket notation from BuildRequires — RPM package names
+        # cannot carry extras (e.g. python3-pyjwt[crypto], python3dist(twisted[tls])).
+        # These come from PyPI metadata that pyp2spec copies verbatim.
+        spec_content = re.sub(
+            r'^(BuildRequires:[^\[#\n]+?)\[[^\]]+\](\)?)',
+            r'\1\2',
+            spec_content,
+            flags=re.MULTILINE,
+        )
+
+        # Also normalize distro-style python package aliases that carry extras,
+        # e.g. python3-twisted[tls] -> python3-twisted.
+        spec_content = re.sub(
+            r'^(\s*BuildRequires\s*:\s*python3?-[A-Za-z0-9._+-]+)\[[^\]]+\](\s*)$',
+            r'\1\2',
+            spec_content,
+            flags=re.MULTILINE,
+        )
+
+        # Normalize distro-style python BuildRequires names to lowercase so
+        # tokens like "python3-PyJWT" resolve as "python3-pyjwt" in dnf.
+        spec_content = re.sub(
+            r'^(\s*BuildRequires\s*:\s*python3?-)([A-Za-z0-9._+-]+)\s*$',
+            lambda m: f"{m.group(1)}{m.group(2).lower()}",
+            spec_content,
+            flags=re.MULTILINE,
+        )
+
+        # pyp2spec metadata can emit invalid python package devel aliases like
+        # python3-poetry-core-devel. For Python deps this should be the runtime
+        # package/provide name (python3-poetry-core or python3dist(poetry-core)).
+        spec_content = re.sub(
+            r'^\s*BuildRequires\s*:\s*(python3?-[A-Za-z0-9._+-]+)-devel\b[^\n]*$',
+            lambda m: f'BuildRequires: {m.group(1).lower()}',
+            spec_content,
+            flags=re.MULTILINE,
+        )
+        spec_content = re.sub(
+            r'^\s*BuildRequires\s*:\s*(python3?dist\([A-Za-z0-9._+-]+)-devel(\))\b[^\n]*$',
+            lambda m: f'BuildRequires: {m.group(1).lower()}{m.group(2)}',
+            spec_content,
+            flags=re.MULTILINE,
+        )
+
+        # Normalize known extras-derived alias tokens that are not valid RPM
+        # package names in this build environment.
+        spec_content = re.sub(
+            r'^\s*BuildRequires\s*:\s*python3-pyjwt-crypto\b[^\n]*$',
+            'BuildRequires: python3-pyjwt',
+            spec_content,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+
+        # python3-openssl is a bad alias in RHEL repos; use the distro
+        # development package required for OpenSSL-backed builds.
+        spec_content = re.sub(
+            r'^\s*BuildRequires\s*:\s*python3-openssl\b[^\n]*$',
+            'BuildRequires: openssl-devel',
+            spec_content,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+
+        # Drop malformed/no-op BuildRequires aliases observed from noisy
+        # metadata parsing. They are not valid RHEL package names and break
+        # dnf builddep resolution inside mock.
+        spec_content = re.sub(
+            r'^\s*BuildRequires\s*:\s*(?:python3-python3dist|python3-venv|python3dist)\b[^\n]*\n?',
+            '',
+            spec_content,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+
+        # Detect hatch-vcs usage and patch pyproject.toml in %prep to use
+        # environment-variable-based versioning instead (hatch-vcs requires
+        # git history, which is not available inside the mock chroot).
+        if re.search(r'BuildRequires:.*hatch.vcs', spec_content, re.IGNORECASE):
+            # Drop the hatch-vcs BuildRequires — the %prep patch removes it from
+            # pyproject.toml so it is no longer needed at build time.
+            spec_content = re.sub(
+                r'^BuildRequires:\s*(?:python3?dist\()?hatch.vcs[^)\n]*\)?\s*\n',
+                '',
+                spec_content,
+                flags=re.MULTILINE | re.IGNORECASE,
+            )
+            # Inject a %prep shell snippet (after %setup / %autosetup) that
+            # rewrites pyproject.toml to switch from VCS-based to env-based versioning.
+            _hatchvcs_patch = r"""
+# Remove hatch-vcs (requires git, not available in mock) and use env-based versioning
+python3 - << 'REQPM_HV_PYEOF'
+import re
+c = open('pyproject.toml').read()
+c = re.sub(r'[ \t]*"hatch-vcs[^"]*",?\n?', '', c)
+c = re.sub(r"[ \t]*'hatch-vcs[^']*',?\n?", '', c)
+c = re.sub(r'\[tool\.hatch\.build\.hooks\.vcs\][^\[]*', '', c, flags=re.DOTALL)
+c = re.sub(r'source\s*=\s*"vcs"', 'source = "env"', c)
+c = re.sub(r"source\s*=\s*'vcs'", "source = 'env'", c)
+if 'variable' not in c:
+    c = re.sub(r'''(source = "env"|source = 'env')''',
+               lambda m: m.group(0) + '\nvariable = "SETUPTOOLS_SCM_PRETEND_VERSION"', c, count=1)
+if 'ignore-vcs' not in c:
+    c += '\n[tool.hatch.build.targets.wheel]\nignore-vcs = true\n'
+open('pyproject.toml', 'w').write(c)
+REQPM_HV_PYEOF
+"""
+            # Insert the patch after the first %setup or %autosetup line in %prep
+            spec_content = re.sub(
+                r'^(%(?:auto)?setup[^\n]*)\n',
+                lambda m: m.group(1) + '\n' + _hatchvcs_patch,
+                spec_content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+
         # Ensure pyproject macros BuildRequires are present if using pyproject macros
         if '%pyproject_wheel' in spec_content or '%pyproject_install' in spec_content:
             if 'BuildRequires:  pyproject-rpm-macros' not in spec_content and 'BuildRequires: pyproject-rpm-macros' not in spec_content:
@@ -194,6 +318,27 @@ class SpecFileGenerator:
                     count=1
                 )
 
+        # Prefix %pyproject_wheel AND %pyproject_buildrequires with
+        # SETUPTOOLS_SCM_PRETEND_VERSION so that packages using hatch-vcs /
+        # setuptools-scm get a sensible version even when git is not available
+        # inside the mock chroot.  This env var is a no-op for other packages.
+        if '%pyproject_wheel' in spec_content:
+            spec_content = re.sub(
+                r'^(%pyproject_wheel\b)',
+                r'SETUPTOOLS_SCM_PRETEND_VERSION=%{version} \1',
+                spec_content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+        if '%pyproject_buildrequires' in spec_content:
+            spec_content = re.sub(
+                r'^(%pyproject_buildrequires\b)',
+                r'SETUPTOOLS_SCM_PRETEND_VERSION=%{version} \1',
+                spec_content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+
         # Fix rich boolean dependencies from pyp2rpm
         # Convert: (python3dist(pkg) >= 1 with python3dist(pkg) < 3~~)
         # To: python3dist(pkg) >= 1
@@ -216,19 +361,47 @@ class SpecFileGenerator:
             spec_content,
             flags=re.MULTILINE | re.IGNORECASE,
         )
+        spec_content = re.sub(
+            rf'^BuildRequires:\s+python3?-{re.escape(_dist_name.replace("_", "-"))}\b[^\n]*\n',
+            '',
+            spec_content,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
         
+        # Normalize Source0 to use the pypi_source macro. Some pyp2spec outputs
+        # emit literal tarball names (e.g. backports_zoneinfo-%{version}.tar.gz),
+        # which can break source fetching in mock workflows.
+        src_pypi_name = (pypi_name or package_name or '').strip()
+        if src_pypi_name:
+            if re.search(r'^Source0:\s+%\{pypi_source\s+[^}]+\}', spec_content, flags=re.MULTILINE):
+                spec_content = re.sub(
+                    r'^Source0:\s+%\{pypi_source\s+[^}]+\}',
+                    f'Source0:        %{{pypi_source {src_pypi_name}}}',
+                    spec_content,
+                    flags=re.MULTILINE,
+                    count=1,
+                )
+            elif re.search(r'^Source0:\s+[^\s]+-%\{version\}\.tar\.gz\s*$', spec_content, flags=re.MULTILINE):
+                spec_content = re.sub(
+                    r'^Source0:\s+[^\s]+-%\{version\}\.tar\.gz\s*$',
+                    f'Source0:        %{{pypi_source {src_pypi_name}}}',
+                    spec_content,
+                    flags=re.MULTILINE,
+                    count=1,
+                )
+
         # Fix %autosetup -n to use PyPI normalized directory names
         # PyPI tarballs unpack to directories with underscores
         # PyPI normalization: replace hyphens AND dots with underscores
         # Examples: flit-core -> flit_core, awx-plugins.interfaces -> awx_plugins_interfaces
         spec_content = re.sub(
-            r'(%autosetup\s+-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
-            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_')}{m.group(3)}",
+            r'(%autosetup[^\n]*\s-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
+            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_').lower()}{m.group(3)}",
             spec_content
         )
         spec_content = re.sub(
-            r'(%setup\s+-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
-            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_')}{m.group(3)}",
+            r'(%setup[^\n]*\s-n\s+)([a-zA-Z0-9.-]+)(-%{\s*version\s*})',
+            lambda m: f"{m.group(1)}{m.group(2).replace('-', '_').replace('.', '_').lower()}{m.group(3)}",
             spec_content
         )
         
@@ -265,16 +438,10 @@ class SpecFileGenerator:
         # For Source0, use PyPI-normalized name (underscores) to match actual tarball filename
         pypi_source_name = pypi_name.replace('-', '_').replace('.', '_')
         
-        # For packages with dots/hyphens, RPM/Mock will look for files with hyphens
-        # based on the package name, so we need to:
-        # 1. Use underscored name in Source0 (the actual tarball filename from PyPI)  
-        # 2. Use fallback %prep logic to find the correct extracted directory
+        # Keep Source0 as pypi_source so fetch_sources can consistently resolve
+        # and download the source archive from PyPI.
         has_special_chars = '.' in pypi_name or '-' in pypi_name
-        if has_special_chars:
-            # Use PyPI-normalized (underscored) name - this is the actual file
-            source_line = f"Source0:        {pypi_source_name}-%{{version}}.tar.gz"
-        else:
-            source_line = f"Source0:        %{{pypi_source {pypi_name}}}"
+        source_line = f"Source0:        %{{pypi_source {pypi_name}}}"
         
         version = version or "0.0.1"
         date = datetime.now().strftime("%a %b %d %Y")

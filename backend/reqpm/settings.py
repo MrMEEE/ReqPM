@@ -214,7 +214,7 @@ CACHES = {
 }
 
 # Celery Configuration
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/1')
 CELERY_RESULT_BACKEND = 'django-db'  # Store results in Django database
 CELERY_CACHE_BACKEND = 'django-cache'  # Use Django cache for additional caching
 CELERY_ACCEPT_CONTENT = ['json']
@@ -257,6 +257,10 @@ REQPM = {
     
     # Build concurrency
     'MAX_CONCURRENT_BUILDS': int(os.getenv('MAX_CONCURRENT_BUILDS', '4')),
+
+    # Per-build memory limit enforced via systemd-run cgroup (e.g. '8G', '4096M').
+    # Set to None / leave unset to apply no limit.
+    'MOCK_MEMORY_LIMIT': os.getenv('MOCK_MEMORY_LIMIT') or None,
     
     # GPG key management
     'GPG_KEYS_CACHE_DIR': os.getenv('GPG_KEYS_CACHE_DIR', str(BASE_DIR / 'data' / 'gpg_keys_cache')),

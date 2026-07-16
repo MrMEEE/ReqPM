@@ -24,28 +24,6 @@ const StatusBadge = ({ status }) => {
   );
 };
 
-const getPackageHeaderDescription = (pkg) => {
-  const summary = pkg?.summary?.trim();
-  if (summary) {
-    return summary;
-  }
-
-  const description = pkg?.description?.trim();
-  if (!description) {
-    return '';
-  }
-
-  const firstParagraph = description
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/[*_`>#]/g, '')
-    .split(/\n+/)
-    .map((line) => line.trim())
-    .find(Boolean);
-
-  return firstParagraph || '';
-};
-
 export default function PackageDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -305,27 +283,25 @@ export default function PackageDetail() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-        <div className="flex min-w-0 items-start gap-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
           <button
             onClick={() => navigate(-1)}
             className="p-2 hover:bg-gray-800 rounded-lg transition-colors"
           >
             <ArrowLeft className="h-5 w-5 text-gray-400" />
           </button>
-          <div className="min-w-0 max-w-4xl">
-            <h1 className="flex items-center gap-3 text-2xl font-bold text-white">
-              <PackageIcon className="h-7 w-7 shrink-0" />
-              <span className="truncate">{pkg.name}</span>
+          <div>
+            <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+              <PackageIcon className="h-7 w-7" />
+              {pkg.name}
             </h1>
-            {getPackageHeaderDescription(pkg) && (
-              <p className="mt-2 max-w-4xl text-sm leading-6 text-gray-400 line-clamp-2 break-words">
-                {getPackageHeaderDescription(pkg)}
-              </p>
+            {pkg.description && (
+              <p className="text-gray-400 mt-1">{pkg.description}</p>
             )}
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 xl:justify-end">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
           <StatusBadge status={pkg.status} />
 
           {/* Live Log — only while building */}

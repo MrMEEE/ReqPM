@@ -431,12 +431,20 @@ def monitor_pending_work():
     Monitors:
     - Pending builds (BuildQueue with status='pending')
     - Pending spec generation (Package with status='pending', no spec)
+    - Dependency-blocked package builds whose blockers are now resolved
     
     This task runs periodically to ensure no work gets stuck in pending state.
     """
     from backend.apps.builds.models import BuildQueue
     from backend.apps.packages.models import Package
-    from backend.apps.packages.tasks import generate_spec_file_task
+    from backend.apps.packages.tasks import (
+        generate_spec_file_task,
+        _analyze_missing_item_resolution,
+        _is_self_dependency_item,
+        build_single_package_task,
+        log_package,
+        send_package_update,
+    )
     from celery import current_app
     from datetime import timedelta
     
@@ -495,6 +503,47 @@ def monitor_pending_work():
             logger.info(f"Triggering stuck pending spec generation for package {package.id} ({package.name})")
             generate_spec_file_task.delay(package.id)
             triggered_count += 1
+
+    # 3. Recover dependency-blocked package builds when blockers are already resolved.
+    dep_candidates = Package.objects.filter(
+        build_status__in=['dep_build_pending', 'missing_packages'],
+    )[:100]
+    active_single_build_ids = active_task_map.get('backend.apps.packages.tasks.build_single_package_task', set())
+
+    missing_cats = {
+        'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+        'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
+    }
+
+    for pkg in dep_candidates:
+        # Avoid duplicate dispatch if already active/reserved.
+        if pkg.id in active_single_build_ids:
+            continue
+
+        missing_items = []
+        for e in (pkg.analyzed_errors or []):
+            if e.get('category') in missing_cats:
+                missing_items.extend(e.get('items', []))
+
+        missing_items = [i for i in missing_items if not _is_self_dependency_item(pkg, i)]
+        if not missing_items:
+            continue
+
+        resolution = _analyze_missing_item_resolution(pkg, pkg.project, missing_items)
+        unresolved_items = (
+            resolution['unresolved_with_project_match']
+            + resolution['unresolved_without_project_match']
+        )
+        if unresolved_items:
+            continue
+
+        logger.info(f"Monitor waking dependency-blocked package {pkg.id} ({pkg.name})")
+        log_package(pkg.id, 'info', 'Dependency blockers resolved — monitor is starting build...')
+        pkg.build_status = 'pending'
+        pkg.save(update_fields=['build_status'])
+        send_package_update(pkg.id)
+        build_single_package_task.delay(pkg.id)
+        triggered_count += 1
     
     if triggered_count > 0:
         logger.info(f"Monitor triggered {triggered_count} stuck pending tasks")

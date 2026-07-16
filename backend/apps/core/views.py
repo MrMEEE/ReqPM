@@ -68,7 +68,7 @@ class SystemSettingsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def build_status(self, request):
         """Get current build concurrency status"""
-        active_builds = limiter.get_active_builds()
+        active_builds = limiter.get_active_jobs()
         active_count = limiter.get_active_count()
         max_concurrent = limiter.max_concurrent
 

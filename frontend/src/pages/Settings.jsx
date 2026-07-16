@@ -235,6 +235,26 @@ export default function Settings() {
             </p>
           </div>
 
+          {/* Per-build Memory Limit */}
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">
+              Per-Build Memory Limit
+            </label>
+            <input
+              type="text"
+              value={settings.mock_memory_limit ?? ''}
+              onChange={(e) => handleChange('mock_memory_limit', e.target.value)}
+              disabled={!isAdmin}
+              placeholder="e.g. 8G, 4096M — leave empty to disable"
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed font-mono"
+            />
+            <p className="text-sm text-gray-400 mt-2">
+              Maximum physical RAM + swap each build job may use, enforced via cgroup (systemd-run).
+              Accepts standard memory units: <code className="text-gray-300">8G</code>, <code className="text-gray-300">4096M</code>, <code className="text-gray-300">512K</code>.
+              Leave empty for no limit.
+            </p>
+          </div>
+
           {/* Cleanup Builds After Days */}
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-2">
