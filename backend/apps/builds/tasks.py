@@ -3,6 +3,7 @@ Celery tasks for build operations
 """
 from celery import shared_task
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 from pathlib import Path
 import logging
@@ -13,6 +14,112 @@ from backend.apps.builds.concurrency import limiter
 from backend.apps.builds.websocket_utils import send_build_job_update, send_queue_item_update
 
 logger = logging.getLogger(__name__)
+
+
+CLEANUP_STATUS_CACHE_KEY = 'reqpm:cleanup_status:v1'
+
+
+def _record_cleanup_status(task_name: str, payload: dict) -> dict:
+    """Persist latest cleanup task status for API/UI visibility."""
+    snapshot = cache.get(CLEANUP_STATUS_CACHE_KEY, {})
+    now = timezone.now().isoformat()
+    snapshot[task_name] = {
+        **(payload or {}),
+        'task_name': task_name,
+        'recorded_at': now,
+    }
+    snapshot['updated_at'] = now
+    cache.set(CLEANUP_STATUS_CACHE_KEY, snapshot, timeout=None)
+    return snapshot[task_name]
+
+
+def get_cleanup_status_snapshot() -> dict:
+    """Return latest cleanup status snapshot for API endpoints."""
+    return cache.get(CLEANUP_STATUS_CACHE_KEY, {}) or {}
+
+
+def _scrub_stale_unique_mock_roots(cutoff_ts: float) -> dict:
+    """
+    Scrub stale unique mock roots (build/bootstrap) under /var/lib/mock.
+
+    Returns counters to report cleanup effectiveness.
+    """
+    import os
+    import re
+    import subprocess
+
+    mock_root = Path('/var/lib/mock')
+    unique_pat = re.compile(r'^(?P<target>.+?)-(?:bootstrap-)?(?P<unique>(pkg\d+|build\d+))$')
+
+    scrubbed_mock_roots = 0
+    failed_mock_scrubs = 0
+    seen = set()
+
+    if not mock_root.exists() or not mock_root.is_dir():
+        return {
+            'scrubbed_mock_roots': 0,
+            'failed_mock_scrubs': 0,
+            'eligible_unique_roots': 0,
+        }
+
+    eligible = 0
+    for child in mock_root.iterdir():
+        if not child.is_dir():
+            continue
+        m = unique_pat.match(child.name)
+        if not m:
+            continue
+        try:
+            mtime = child.stat().st_mtime
+        except Exception:
+            continue
+        if mtime >= cutoff_ts:
+            continue
+
+        key = (m.group('target'), m.group('unique'))
+        if key in seen:
+            continue
+        seen.add(key)
+        eligible += 1
+
+        target, unique_ext = key
+        if os.geteuid() != 0:
+            cmd = ['sudo', '-n', 'mock']
+        else:
+            cmd = ['mock']
+        cmd += ['-r', target, '--uniqueext', unique_ext, '--scrub=all']
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if result.returncode == 0:
+                scrubbed_mock_roots += 1
+            else:
+                failed_mock_scrubs += 1
+                logger.warning(
+                    "mock scrub failed for target=%s uniqueext=%s: %s",
+                    target,
+                    unique_ext,
+                    (result.stderr or result.stdout or '').strip(),
+                )
+        except Exception as e:
+            failed_mock_scrubs += 1
+            logger.warning(
+                "mock scrub exception for target=%s uniqueext=%s: %s",
+                target,
+                unique_ext,
+                e,
+            )
+
+    return {
+        'scrubbed_mock_roots': scrubbed_mock_roots,
+        'failed_mock_scrubs': failed_mock_scrubs,
+        'eligible_unique_roots': eligible,
+    }
 
 
 @shared_task(bind=True, max_retries=3)
@@ -406,13 +513,32 @@ def cleanup_old_builds_task(days: int = 30):
     """
     from datetime import timedelta
     from backend.apps.builds.models import BuildJob
+    from backend.apps.packages.models import Package, PackageBuild
+    from backend.apps.core.models import SystemSettings
     import shutil
     
+    # Respect runtime system setting when available.
+    try:
+        cfg_days = SystemSettings.load().cleanup_builds_after_days
+        if cfg_days:
+            days = int(cfg_days)
+    except Exception:
+        pass
+
     cutoff_date = timezone.now() - timedelta(days=days)
     old_builds = BuildJob.objects.filter(
         completed_at__lt=cutoff_date,
         status__in=['completed', 'failed']
     )
+
+    deleted_build_job_dirs = 0
+    deleted_package_build_dirs = 0
+    scrubbed_mock_roots = 0
+    failed_mock_scrubs = 0
+    eligible_unique_roots = 0
+
+    build_root = Path(settings.REQPM['BUILD_DIR'])
+    package_builds_root = build_root / 'package_builds'
     
     for build_job in old_builds:
         # Clean up build directory
@@ -420,8 +546,114 @@ def cleanup_old_builds_task(days: int = 30):
         if build_dir.exists():
             shutil.rmtree(build_dir)
             logger.info(f"Cleaned up build directory for job {build_job.id}")
-    
-    logger.info(f"Cleaned up {old_builds.count()} old build jobs")
+            deleted_build_job_dirs += 1
+
+    # Clean orphaned package_builds dirs older than retention threshold.
+    # Keep directories referenced by current Package / PackageBuild artifact paths.
+    referenced_dirs = set()
+
+    for p in Package.objects.exclude(srpm_path__isnull=True).exclude(srpm_path='').only('srpm_path'):
+        try:
+            referenced_dirs.add(str(Path(p.srpm_path).resolve().parent))
+        except Exception:
+            pass
+    for p in Package.objects.exclude(rpm_path__isnull=True).exclude(rpm_path='').only('rpm_path'):
+        try:
+            referenced_dirs.add(str(Path(p.rpm_path).resolve().parent))
+        except Exception:
+            pass
+
+    for b in PackageBuild.objects.exclude(srpm_path='').only('srpm_path', 'rpm_paths'):
+        if b.srpm_path:
+            try:
+                referenced_dirs.add(str(Path(b.srpm_path).resolve().parent))
+            except Exception:
+                pass
+        for rpm in (b.rpm_paths or []):
+            if not rpm:
+                continue
+            try:
+                referenced_dirs.add(str(Path(rpm).resolve().parent))
+            except Exception:
+                pass
+
+    cutoff_ts = cutoff_date.timestamp()
+    if package_builds_root.exists():
+        for pkg_dir in package_builds_root.iterdir():
+            if not pkg_dir.is_dir():
+                continue
+            try:
+                mtime = pkg_dir.stat().st_mtime
+            except Exception:
+                continue
+            if mtime >= cutoff_ts:
+                continue
+            try:
+                if str(pkg_dir.resolve()) in referenced_dirs:
+                    continue
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(pkg_dir)
+                deleted_package_build_dirs += 1
+            except Exception as e:
+                logger.warning(f"Could not remove package build dir {pkg_dir}: {e}")
+
+    scrub = _scrub_stale_unique_mock_roots(cutoff_ts)
+    scrubbed_mock_roots = scrub['scrubbed_mock_roots']
+    failed_mock_scrubs = scrub['failed_mock_scrubs']
+    eligible_unique_roots = scrub['eligible_unique_roots']
+
+    summary = {
+        'days': days,
+        'deleted_build_job_dirs': deleted_build_job_dirs,
+        'deleted_package_build_dirs': deleted_package_build_dirs,
+        'scrubbed_mock_roots': scrubbed_mock_roots,
+        'failed_mock_scrubs': failed_mock_scrubs,
+        'eligible_unique_roots': eligible_unique_roots,
+    }
+
+    _record_cleanup_status('cleanup_old_builds_task', summary)
+
+    logger.info(
+        "cleanup_old_builds_task(days=%s): build_job_dirs=%s package_build_dirs=%s "
+        "mock_scrubbed=%s mock_scrub_failed=%s eligible_unique_roots=%s",
+        summary['days'],
+        summary['deleted_build_job_dirs'],
+        summary['deleted_package_build_dirs'],
+        summary['scrubbed_mock_roots'],
+        summary['failed_mock_scrubs'],
+        summary['eligible_unique_roots'],
+    )
+    return summary
+
+
+@shared_task
+def cleanup_mock_roots_task(days: int = 3):
+    """
+    Dedicated cleanup task for stale mock unique roots.
+
+    Runs more frequently than full build artifact cleanup to prevent
+    /var/lib/mock growth spikes during active build periods.
+    """
+    from datetime import timedelta
+
+    cutoff_date = timezone.now() - timedelta(days=days)
+    scrub = _scrub_stale_unique_mock_roots(cutoff_date.timestamp())
+    summary = {
+        'days': days,
+        **scrub,
+    }
+
+    _record_cleanup_status('cleanup_mock_roots_task', summary)
+    logger.info(
+        "cleanup_mock_roots_task(days=%s): mock_scrubbed=%s mock_scrub_failed=%s eligible_unique_roots=%s",
+        summary['days'],
+        summary['scrubbed_mock_roots'],
+        summary['failed_mock_scrubs'],
+        summary['eligible_unique_roots'],
+    )
+    return summary
 
 
 @shared_task
@@ -504,11 +736,29 @@ def monitor_pending_work():
             generate_spec_file_task.delay(package.id)
             triggered_count += 1
 
-    # 3. Recover dependency-blocked package builds when blockers are already resolved.
+    # 3. Recover ordinary package builds stuck in build_status='pending'.
+    active_single_build_ids = active_task_map.get('backend.apps.packages.tasks.build_single_package_task', set())
+
+    pending_package_builds = Package.objects.filter(
+        build_status='pending',
+        status='ready',
+        spec_revisions__isnull=False,
+        updated_at__lt=threshold_time,
+    ).distinct()[:100]
+
+    for pkg in pending_package_builds:
+        if pkg.id in active_single_build_ids:
+            continue
+
+        logger.info(f"Monitor triggering stuck pending package build for {pkg.id} ({pkg.name})")
+        log_package(pkg.id, 'info', 'Build monitor detected a stuck pending build and is restarting it...')
+        build_single_package_task.delay(pkg.id)
+        triggered_count += 1
+
+    # 4. Recover dependency-blocked package builds when blockers are already resolved.
     dep_candidates = Package.objects.filter(
         build_status__in=['dep_build_pending', 'missing_packages'],
     )[:100]
-    active_single_build_ids = active_task_map.get('backend.apps.packages.tasks.build_single_package_task', set())
 
     missing_cats = {
         'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',

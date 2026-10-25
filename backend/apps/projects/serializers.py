@@ -129,12 +129,35 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
     
     branch = serializers.CharField(source='git_branch', default='main')
     tag = serializers.CharField(source='git_tag', allow_blank=True, required=False, default='')
+    rhel_versions = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+    )
+
+    @staticmethod
+    def _normalize_rhel_versions(raw_versions):
+        """Normalize version values to sorted string list like ['8','9','10']."""
+        out = []
+        seen = set()
+        for item in (raw_versions or []):
+            s = str(item).strip()
+            if not s:
+                continue
+            if s.isdigit():
+                s = str(int(s))
+            if s not in {'8', '9', '10'}:
+                continue
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return sorted(out, key=int)
     
     class Meta:
         model = Project
         fields = [
             'name', 'description', 'git_url', 'branch', 'tag',
-            'requirements_files', 'build_version', 'rhel_version', 'python_version',
+            'requirements_files', 'build_version', 'rhel_version', 'rhel_versions', 'python_version',
             'git_ssh_key', 'git_api_token'
         ]
         extra_kwargs = {
@@ -142,12 +165,34 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
             'git_api_token': {'write_only': True, 'required': False},
             'requirements_files': {'required': False, 'default': list},
             'build_version': {'required': False},
-            'rhel_version': {'required': False, 'default': '9'},
+            'rhel_version': {'required': False},
             'python_version': {'required': False, 'default': 'default'}
         }
     
     def create(self, validated_data):
         """Create project and trigger initial sync"""
+        raw_rhel_versions = validated_data.pop('rhel_versions', None)
+
+        normalized_versions = self._normalize_rhel_versions(raw_rhel_versions)
+        user_provided_rhel = 'rhel_version' in getattr(self, 'initial_data', {}) and str(self.initial_data.get('rhel_version') or '').strip() != ''
+        chosen_rhel = str(validated_data.get('rhel_version') or '').strip() if user_provided_rhel else ''
+        if not chosen_rhel:
+            # If user selected from rhel_versions UI, use the highest selected
+            # version as the project's primary rhel_version.
+            chosen_rhel = normalized_versions[-1] if normalized_versions else '9'
+        elif chosen_rhel.isdigit():
+            chosen_rhel = str(int(chosen_rhel))
+
+        if chosen_rhel not in {'8', '9', '10'}:
+            chosen_rhel = '9'
+
+        if chosen_rhel not in normalized_versions:
+            normalized_versions.append(chosen_rhel)
+            normalized_versions = sorted(set(normalized_versions), key=int)
+
+        validated_data['rhel_version'] = chosen_rhel
+        validated_data['rhel_versions'] = normalized_versions
+
         # Set owner to current user
         validated_data['owner'] = self.context['request'].user
         validated_data['status'] = 'pending'
@@ -170,12 +215,34 @@ class ProjectUpdateSerializer(serializers.ModelSerializer):
     
     branch = serializers.CharField(source='git_branch', required=False)
     tag = serializers.CharField(source='git_tag', allow_blank=True, required=False)
+    rhel_versions = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+    )
+
+    @staticmethod
+    def _normalize_rhel_versions(raw_versions):
+        out = []
+        seen = set()
+        for item in (raw_versions or []):
+            s = str(item).strip()
+            if not s:
+                continue
+            if s.isdigit():
+                s = str(int(s))
+            if s not in {'8', '9', '10'}:
+                continue
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return sorted(out, key=int)
     
     class Meta:
         model = Project
         fields = [
             'name', 'description', 'branch', 'tag',
-            'requirements_files', 'build_version', 'python_version', 'rhel_version',
+            'requirements_files', 'build_version', 'python_version', 'rhel_version', 'rhel_versions',
             'parallel_builds', 'build_repositories',
             'git_ssh_key', 'git_api_token',
             'spec_repo_url', 'spec_repo_ssh_key', 'spec_repo_api_token'
@@ -189,6 +256,20 @@ class ProjectUpdateSerializer(serializers.ModelSerializer):
     
     def update(self, instance, validated_data):
         """Update project and trigger sync if git ref changed"""
+        raw_rhel_versions = validated_data.pop('rhel_versions', None)
+        if raw_rhel_versions is not None:
+            normalized_versions = self._normalize_rhel_versions(raw_rhel_versions)
+            chosen_rhel = str(validated_data.get('rhel_version') or instance.rhel_version or '').strip()
+            if chosen_rhel.isdigit():
+                chosen_rhel = str(int(chosen_rhel))
+            if chosen_rhel not in {'8', '9', '10'}:
+                chosen_rhel = normalized_versions[-1] if normalized_versions else '9'
+            if chosen_rhel not in normalized_versions:
+                normalized_versions.append(chosen_rhel)
+                normalized_versions = sorted(set(normalized_versions), key=int)
+            validated_data['rhel_version'] = chosen_rhel
+            validated_data['rhel_versions'] = normalized_versions
+
         branch_changed = 'git_branch' in validated_data and validated_data['git_branch'] != instance.git_branch
         tag_changed = 'git_tag' in validated_data and validated_data['git_tag'] != instance.git_tag
         requirements_changed = 'requirements_files' in validated_data and validated_data['requirements_files'] != instance.requirements_files

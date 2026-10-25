@@ -1,6 +1,6 @@
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { Home, Package, Boxes, Archive, LogOut, List, Settings } from 'lucide-react';
+import { Home, Package, Boxes, Archive, LogOut, List, Settings, Bot } from 'lucide-react';
 
 export default function Layout({ children }) {
   const { user, logout } = useAuth();
@@ -40,6 +40,9 @@ export default function Layout({ children }) {
             </NavLink>
             <NavLink to="/tasks" icon={<List size={20} />}>
               Tasks
+            </NavLink>
+            <NavLink to="/ai-fixer" icon={<Bot size={20} />}>
+              AI Fixer
             </NavLink>
             
             {/* Admin-only Settings */}

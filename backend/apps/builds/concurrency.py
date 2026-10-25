@@ -17,6 +17,9 @@ local key = KEYS[1]
 local job_id = ARGV[1]
 local max = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
+if redis.call('sismember', key, job_id) == 1 then
+    return 0
+end
 if redis.call('scard', key) < max then
     redis.call('sadd', key, job_id)
     redis.call('expire', key, ttl)
@@ -30,6 +33,7 @@ class JobConcurrencyLimiter:
     """
     Limits the number of concurrent jobs using Redis semaphore.
     Uses an atomic Lua script so the check-and-add cannot race.
+    Also prevents duplicate acquisition of the same job_id.
     """
     
     def __init__(self, max_concurrent=None):
@@ -39,11 +43,21 @@ class JobConcurrencyLimiter:
         Args:
             max_concurrent: Maximum number of concurrent jobs (default from settings)
         """
-        self.max_concurrent = max_concurrent or settings.REQPM.get('MAX_CONCURRENT_BUILDS', 4)
+        self._default_max_concurrent = max_concurrent or settings.REQPM.get('MAX_CONCURRENT_BUILDS', 4)
         self.redis_client = redis.from_url(settings.CELERY_BROKER_URL)
         self.semaphore_key = 'reqpm:job:semaphore'
         self.lock_timeout = 7200  # 2 hours max per job
         self._acquire_script = self.redis_client.register_script(_ACQUIRE_LUA)
+
+    @property
+    def max_concurrent(self):
+        """Return the current concurrency limit from DB-backed settings."""
+        try:
+            from backend.apps.core.models import SystemSettings
+
+            return int(SystemSettings.load().max_concurrent_builds or self._default_max_concurrent)
+        except Exception:
+            return int(self._default_max_concurrent)
     
     @contextmanager
     def acquire(self, job_id, timeout=None):
@@ -68,7 +82,7 @@ class JobConcurrencyLimiter:
                     raise TimeoutError(
                         f"Could not acquire job slot after {timeout}s. "
                         f"Max concurrent jobs: {self.max_concurrent}. "
-                        f"Consider increasing MAX_CONCURRENT_BUILDS setting."
+                        f"Consider increasing Maximum Concurrent Builds in Settings."
                     )
                 
                 # Atomic check-and-add via Lua script

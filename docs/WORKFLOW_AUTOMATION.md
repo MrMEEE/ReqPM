@@ -21,6 +21,21 @@ The system now automatically processes projects from requirements analysis throu
 6. Build Packages in Dependency Order
 ```
 
+### Build-failure routing
+
+SRPM and RPM failures caused by unavailable repository dependencies are handled
+before automatic spec fixes or AI fixes. ReqPM records the latest build and root
+logs, resolves missing dependencies, and queues known unbuilt project dependencies.
+The blocked package is marked `dep_build_pending` when its dependencies are known
+in the project, or `missing_packages` when they cannot yet be resolved. Dependency
+completion triggers a readiness check and rebuild of waiting packages.
+
+This routing is checked again after each RPM retry. If an SRPM rebuild fails, its
+logs replace the previous RPM failure for dependency analysis. Missing imports,
+compilers, headers, and self-referential requirements remain eligible for targeted
+spec corrections; packaging errors such as missing `%files` paths also continue
+through the spec/AI fixer loop.
+
 ## Changes Implemented
 
 ### 1. Fixed reqpm.sh Script

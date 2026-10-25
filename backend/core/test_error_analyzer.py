@@ -2,7 +2,7 @@
 """
 Test script for BuildErrorAnalyzer
 """
-from error_analyzer import BuildErrorAnalyzer
+from backend.core.error_analyzer import BuildErrorAnalyzer
 
 # Sample build log with various errors
 test_log = """

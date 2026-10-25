@@ -110,6 +110,7 @@ class Package(models.Model):
             ('dep_build_pending', 'Dependency Build Pending'),
             ('pending', 'Pending'),
             ('building', 'Building'),
+            ('fixing', 'Fixing'),
             ('completed', 'Completed'),
             ('failed', 'Failed'),
             ('missing_packages', 'Missing Packages'),
@@ -121,6 +122,8 @@ class Package(models.Model):
     build_completed_at = models.DateTimeField(null=True, blank=True)
     build_log = models.TextField(blank=True)
     build_root_log = models.TextField(blank=True)
+    last_build_log = models.TextField(blank=True)
+    last_build_root_log = models.TextField(blank=True)
     build_error_message = models.TextField(blank=True)
     build_dependency_repo_url = models.CharField(
         max_length=500,
@@ -147,6 +150,14 @@ class Package(models.Model):
         null=True, blank=True,
         help_text=_('When sources were last successfully fetched')
     )
+
+    def archive_build_logs(self) -> None:
+        """Move the current attempt logs to the last-attempt fields and clear them."""
+        if self.build_log or self.build_root_log:
+            self.last_build_log = self.build_log
+            self.last_build_root_log = self.build_root_log
+        self.build_log = ''
+        self.build_root_log = ''
     
     class Meta:
         db_table = 'packages'
@@ -176,10 +187,8 @@ class Package(models.Model):
     @property
     def source_fetched(self):
         """Check if source file has been downloaded."""
-        # Fast DB-backed path: if we have recorded a fetch timestamp, trust it.
-        if self.sources_fetched_at is not None:
-            return True
-        # Fallback: filesystem scan (covers packages fetched before this field existed).
+        # Check the filesystem even when a prior fetch timestamp exists: sources
+        # may have been removed outside the normal artifact-cleanup path.
         from pathlib import Path
         sources_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / self.name
         if not sources_dir.exists():
@@ -336,6 +345,41 @@ class SpecFileRevision(models.Model):
         help_text="Error fingerprint + actions stored for AI few-shot retrieval"
     )
 
+    class AIFeedback(models.TextChoices):
+        UNKNOWN = 'unknown', _('Unknown')
+        CORRECT = 'correct', _('Correct')
+        WRONG = 'wrong', _('Wrong')
+
+    ai_feedback = models.CharField(
+        max_length=20,
+        choices=AIFeedback.choices,
+        default=AIFeedback.UNKNOWN,
+        help_text='User feedback for AI-generated fix quality'
+    )
+    ai_feedback_note = models.TextField(blank=True)
+    ai_feedback_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='ai_fix_feedbacks'
+    )
+    ai_feedback_at = models.DateTimeField(null=True, blank=True)
+
+    ai_taught = models.BooleanField(
+        default=False,
+        help_text='Whether this revision was explicitly marked as a learning example for AI'
+    )
+    ai_taught_note = models.TextField(blank=True)
+    ai_taught_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='ai_taught_revisions'
+    )
+    ai_taught_at = models.DateTimeField(null=True, blank=True)
+
     # Git information (if pushed to spec repo)
     git_commit_hash = models.CharField(max_length=40, blank=True)
     git_commit_url = models.URLField(max_length=500, blank=True)
@@ -355,6 +399,63 @@ class SpecFileRevision(models.Model):
     
     def __str__(self):
         return f"{self.package.name} spec revision at {self.created_at}"
+
+
+class AIFixAttempt(models.Model):
+    """
+    One exchange with the AI fixer: the prompt sent, the raw model response,
+    the parsed outcome and (if applied) the resulting spec revision. Replies
+    from users are chained via ``parent`` so the conversation can be resumed.
+    """
+    class Source(models.TextChoices):
+        AUTOFIX = 'autofix', _('Autofix')
+        USER_REPLY = 'user_reply', _('User reply')
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', _('Pending')
+        RUNNING = 'running', _('Running')
+        APPLIED = 'applied', _('Applied')
+        NO_FIX = 'no_fix', _('No fix proposed')
+        INVALID_RESPONSE = 'invalid_response', _('Invalid response')
+        VALIDATION_FAILED = 'validation_failed', _('Validation failed')
+        UNCHANGED = 'unchanged', _('Spec unchanged')
+        ERROR = 'error', _('Error')
+
+    package = models.ForeignKey(Package, on_delete=models.CASCADE, related_name='ai_attempts')
+    parent = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='replies'
+    )
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.AUTOFIX)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+
+    user_message = models.TextField(blank=True)
+    prompt = models.TextField(blank=True)
+    raw_response = models.TextField(blank=True)
+    error_category = models.CharField(max_length=200, blank=True)
+    reasoning = models.TextField(blank=True)
+    actions = models.JSONField(default=list, blank=True)
+    applied_changes = models.JSONField(default=list, blank=True)
+    error_message = models.TextField(blank=True)
+    model_name = models.CharField(max_length=200, blank=True)
+    rebuild_requested = models.BooleanField(default=False)
+
+    revision = models.ForeignKey(
+        SpecFileRevision, on_delete=models.SET_NULL, null=True, blank=True, related_name='ai_attempts'
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_fix_attempts'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'ai_fix_attempts'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['package', 'created_at'])]
+
+    def __str__(self):
+        return f"AI attempt {self.id} for {self.package.name} ({self.status})"
 
 
 class PackageLog(models.Model):
@@ -427,4 +528,3 @@ class PackageExtra(models.Model):
     
     def __str__(self):
         return f"[{self.level}] {self.package.name}: {self.message[:50]}"
-

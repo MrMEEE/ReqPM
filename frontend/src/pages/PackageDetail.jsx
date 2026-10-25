@@ -1,16 +1,18 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download, Terminal, Wrench } from 'lucide-react';
+import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download, Terminal, Wrench, ThumbsUp, ThumbsDown, Brain } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
 import { useState, useEffect } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import LivePackageBuildLog from '../components/LivePackageBuildLog';
+import AIConversations from '../components/AIConversations';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
     pending: { color: 'bg-gray-100 text-gray-800', label: 'Pending' },
     ready: { color: 'bg-green-100 text-green-800', label: 'Ready' },
     building: { color: 'bg-blue-100 text-blue-800', label: 'Building' },
+    fixing: { color: 'bg-violet-100 text-violet-800', label: 'Fixing' },
     built: { color: 'bg-green-100 text-green-800', label: 'Built' },
     failed: { color: 'bg-red-100 text-red-800', label: 'Failed' },
   };
@@ -24,6 +26,94 @@ const StatusBadge = ({ status }) => {
   );
 };
 
+function computeLineDiff(oldText, newText) {
+  const oldLines = (oldText || '').split('\n');
+  const newLines = (newText || '').split('\n');
+  const m = oldLines.length;
+  const n = newLines.length;
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i += 1) {
+    for (let j = 1; j <= n; j += 1) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  const ops = [];
+  let i = m;
+  let j = n;
+  while (i > 0 && j > 0) {
+    if (oldLines[i - 1] === newLines[j - 1]) {
+      ops.push({ type: 'context', line: oldLines[i - 1] });
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      ops.push({ type: 'removed', line: oldLines[i - 1] });
+      i -= 1;
+    } else {
+      ops.push({ type: 'added', line: newLines[j - 1] });
+      j -= 1;
+    }
+  }
+  while (i > 0) {
+    ops.push({ type: 'removed', line: oldLines[i - 1] });
+    i -= 1;
+  }
+  while (j > 0) {
+    ops.push({ type: 'added', line: newLines[j - 1] });
+    j -= 1;
+  }
+
+  return ops.reverse();
+}
+
+function NoteModal({ open, title, promptText, initialValue, submitting, onCancel, onSubmit }) {
+  const [value, setValue] = useState(initialValue || '');
+
+  useEffect(() => {
+    if (open) {
+      setValue(initialValue || '');
+    }
+  }, [open, initialValue]);
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="w-full max-w-xl rounded-lg border border-gray-700 bg-gray-800 p-5 shadow-xl">
+        <h3 className="text-lg font-semibold text-white mb-2">{title}</h3>
+        <p className="text-sm text-gray-400 mb-3">{promptText}</p>
+        <textarea
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          className="w-full h-32 px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-gray-200 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+          placeholder="Optional description..."
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            disabled={submitting}
+            className="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-white text-sm disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => onSubmit(value)}
+            disabled={submitting}
+            className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm disabled:opacity-50"
+          >
+            {submitting ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function PackageDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -33,7 +123,7 @@ export default function PackageDetail() {
   useEffect(() => {
     const interval = setInterval(() => {
       const pkg = queryClient.getQueryData(['package', id])
-      if (['building', 'pending', 'waiting_for_deps', 'dep_build_pending'].includes(pkg?.build_status)) {
+      if (['building', 'fixing', 'pending', 'waiting_for_deps', 'dep_build_pending'].includes(pkg?.build_status)) {
         queryClient.invalidateQueries({ queryKey: ['package', id] })
         queryClient.invalidateQueries({ queryKey: ['package-specs', id] })
       }
@@ -47,6 +137,14 @@ export default function PackageDetail() {
   const [commitMessage, setCommitMessage] = useState('');
   const [regenerating, setRegenerating] = useState(false);
   const [showBuildLog, setShowBuildLog] = useState(false);
+  const [sourceFetchQueued, setSourceFetchQueued] = useState(false);
+  const [noteModal, setNoteModal] = useState({
+    open: false,
+    mode: null,
+    revisionId: null,
+    feedback: null,
+    initialValue: '',
+  });
 
   const { data: pkg, isLoading, error } = useQuery({
     queryKey: ['package', id],
@@ -129,13 +227,26 @@ export default function PackageDetail() {
       const response = await packagesAPI.fetchSource(id);
       return response.data;
     },
+    onMutate: () => {
+      setSourceFetchQueued(true);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries(['package-logs', id]);
+      queryClient.invalidateQueries(['package', id]);
+      setTimeout(() => {
+        setSourceFetchQueued(false);
+      }, 2500);
     },
     onError: (error) => {
+      setSourceFetchQueued(false);
       toast.error(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
     },
   });
+
+  const handleFetchSource = () => {
+    if (fetchSourceMutation.isPending || sourceFetchQueued) return;
+    fetchSourceMutation.mutate();
+  };
 
   const buildPackageMutation = useMutation({
     mutationFn: async () => {
@@ -215,6 +326,34 @@ export default function PackageDetail() {
     },
   });
 
+  const aiFeedbackMutation = useMutation({
+    mutationFn: async ({ revisionId, feedback, note }) => {
+      const response = await packagesAPI.feedbackSpecRevisionAI(id, revisionId, feedback, note || '');
+      return response.data;
+    },
+    onSuccess: (_, vars) => {
+      toast.success(`Marked AI fix as ${vars.feedback}`);
+      queryClient.invalidateQueries(['package-specs', id]);
+    },
+    onError: (error) => {
+      toast.error(`Failed to save AI feedback: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const teachAiMutation = useMutation({
+    mutationFn: async ({ revisionId, note }) => {
+      const response = await packagesAPI.teachSpecRevisionAI(id, revisionId, note || '');
+      return response.data;
+    },
+    onSuccess: () => {
+      toast.success('Marked revision as AI teaching example');
+      queryClient.invalidateQueries(['package-specs', id]);
+    },
+    onError: (error) => {
+      toast.error(`Failed to teach AI: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
   const handleEditSpec = (spec) => {
     setEditingSpec(spec.id);
     setSpecContent(spec.content);
@@ -258,6 +397,50 @@ export default function PackageDetail() {
     } catch (error) {
       console.error('Failed to regenerate spec:', error);
       setRegenerating(false);
+    }
+  };
+
+  const openFeedbackModal = (spec, feedback) => {
+    setNoteModal({
+      open: true,
+      mode: 'feedback',
+      revisionId: spec.id,
+      feedback,
+      initialValue: spec.ai_feedback_note || '',
+    });
+  };
+
+  const openTeachModal = (spec) => {
+    setNoteModal({
+      open: true,
+      mode: 'teach',
+      revisionId: spec.id,
+      feedback: null,
+      initialValue: spec.ai_taught_note || '',
+    });
+  };
+
+  const closeNoteModal = () => {
+    setNoteModal({ open: false, mode: null, revisionId: null, feedback: null, initialValue: '' });
+  };
+
+  const handleSubmitNoteModal = async (noteValue) => {
+    try {
+      if (noteModal.mode === 'feedback') {
+        await aiFeedbackMutation.mutateAsync({
+          revisionId: noteModal.revisionId,
+          feedback: noteModal.feedback,
+          note: noteValue || '',
+        });
+      } else if (noteModal.mode === 'teach') {
+        await teachAiMutation.mutateAsync({
+          revisionId: noteModal.revisionId,
+          note: noteValue || '',
+        });
+      }
+      closeNoteModal();
+    } catch (e) {
+      // Errors are surfaced via mutation onError toasts.
     }
   };
 
@@ -305,7 +488,7 @@ export default function PackageDetail() {
           <StatusBadge status={pkg.status} />
 
           {/* Live Log — only while building */}
-          {pkg.build_status === 'building' && (
+          {['building', 'fixing'].includes(pkg.build_status) && (
             <button
               onClick={() => setShowBuildLog(true)}
               className="px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-1.5 text-sm animate-pulse"
@@ -317,7 +500,7 @@ export default function PackageDetail() {
           )}
 
           {/* Log — when there is something to show and not actively building */}
-          {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) &&
+          {!['building', 'fixing', 'pending', 'waiting_for_deps'].includes(pkg.build_status) &&
             (pkg.has_build_log || pkg.build_error_message ||
               ['completed', 'failed', 'missing_packages', 'dep_build_pending'].includes(pkg.build_status) ||
               ['built', 'failed'].includes(pkg.status) ||
@@ -345,22 +528,22 @@ export default function PackageDetail() {
 
           {/* Fetch Source */}
           <button
-            onClick={() => fetchSourceMutation.mutate()}
-            disabled={fetchSourceMutation.isPending || !specFiles || specFiles.length === 0}
+            onClick={handleFetchSource}
+            disabled={fetchSourceMutation.isPending || sourceFetchQueued || !specFiles || specFiles.length === 0}
             className="px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
             title={!specFiles || specFiles.length === 0 ? 'Generate spec file first' : 'Fetch source files'}
           >
-            <Download className="h-3.5 w-3.5" />
-            {fetchSourceMutation.isPending ? 'Fetching…' : 'Fetch'}
+            <Download className={`h-3.5 w-3.5 ${(fetchSourceMutation.isPending || sourceFetchQueued) ? 'animate-spin' : ''}`} />
+            {(fetchSourceMutation.isPending || sourceFetchQueued) ? 'Fetching...' : 'Fetch'}
           </button>
 
           {/* Cancel / Build / Rebuild */}
-          {['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status) ? (
+          {['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building', 'fixing'].includes(pkg.build_status) ? (
             <button
               onClick={() => cancelBuildMutation.mutate()}
               disabled={cancelBuildMutation.isPending}
               className="px-3 py-1.5 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
-              title={pkg.build_status === 'building' ? 'Cancel running build' : 'Cancel waiting build'}
+              title={['building', 'fixing'].includes(pkg.build_status) ? 'Cancel running build' : 'Cancel waiting build'}
             >
               <X className="h-3.5 w-3.5" />
               Cancel
@@ -378,7 +561,7 @@ export default function PackageDetail() {
           ) : (
             <button
               onClick={() => rebuildPackageMutation.mutate()}
-              disabled={!pkg.source_fetched || !specFiles?.length || rebuildPackageMutation.isPending || pkg.build_status === 'building'}
+              disabled={!pkg.source_fetched || !specFiles?.length || rebuildPackageMutation.isPending || ['building', 'fixing'].includes(pkg.build_status)}
               className="px-3 py-1.5 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm"
               title="Rebuild package"
             >
@@ -520,7 +703,12 @@ export default function PackageDetail() {
             </div>
           ) : specFiles?.length > 0 ? (
             <div className="space-y-3">
-              {specFiles.map((spec) => (
+              {specFiles.map((spec, idx) => {
+                const previousSpec = specFiles[idx + 1];
+                const contentLines = previousSpec
+                  ? computeLineDiff(previousSpec.content || '', spec.content || '')
+                  : null;
+                return (
                 <div
                   key={spec.id}
                   className="p-4 bg-gray-700/50 rounded border border-gray-600"
@@ -535,9 +723,14 @@ export default function PackageDetail() {
                           {spec.git_commit_hash.substring(0, 7)}
                         </span>
                       )}
-                      {spec.commit_message?.startsWith('AI-fixed:') && (
+                      {spec.is_ai_fix && (
                         <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-purple-900/50 text-purple-300 border border-purple-700">
                           AI fixed
+                        </span>
+                      )}
+                      {spec.ai_taught && (
+                        <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-teal-900/50 text-teal-300 border border-teal-700">
+                          AI taught
                         </span>
                       )}
                     </div>
@@ -549,7 +742,7 @@ export default function PackageDetail() {
                       Edit
                     </button>
                   </div>
-                  {spec.commit_message?.startsWith('AI-fixed:') ? (() => {
+                  {spec.is_ai_fix ? (() => {
                     const actions = spec.commit_message.slice('AI-fixed:'.length).split(';').map(s => s.trim()).filter(Boolean);
                     return (
                       <ul className="mt-1 mb-2 space-y-1">
@@ -564,24 +757,104 @@ export default function PackageDetail() {
                   })() : (
                     <p className="text-sm text-gray-400 mb-2">{spec.commit_message}</p>
                   )}
+
+                  {spec.is_ai_fix ? (
+                    <div className="mt-2 mb-2 flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => openFeedbackModal(spec, 'correct')}
+                        disabled={aiFeedbackMutation.isPending}
+                        className={`px-2.5 py-1.5 text-xs rounded flex items-center gap-1.5 transition-colors ${spec.ai_feedback === 'correct' ? 'bg-green-700 text-white' : 'bg-green-800/40 text-green-300 hover:bg-green-700/60'}`}
+                      >
+                        <ThumbsUp className="h-3.5 w-3.5" /> Correct
+                      </button>
+                      <button
+                        onClick={() => openFeedbackModal(spec, 'wrong')}
+                        disabled={aiFeedbackMutation.isPending}
+                        className={`px-2.5 py-1.5 text-xs rounded flex items-center gap-1.5 transition-colors ${spec.ai_feedback === 'wrong' ? 'bg-red-700 text-white' : 'bg-red-800/40 text-red-300 hover:bg-red-700/60'}`}
+                      >
+                        <ThumbsDown className="h-3.5 w-3.5" /> Wrong
+                      </button>
+                      {spec.ai_feedback && spec.ai_feedback !== 'unknown' && (
+                        <span className="text-xs text-gray-400">
+                          Feedback: {spec.ai_feedback}
+                          {spec.ai_feedback_by_username ? ` by ${spec.ai_feedback_by_username}` : ''}
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mt-2 mb-2 flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => openTeachModal(spec)}
+                        disabled={teachAiMutation.isPending}
+                        className="px-2.5 py-1.5 text-xs rounded bg-teal-800/40 text-teal-300 hover:bg-teal-700/60 flex items-center gap-1.5 transition-colors"
+                      >
+                        <Brain className="h-3.5 w-3.5" /> {spec.ai_taught ? 'Update Teach AI' : 'Teach AI'}
+                      </button>
+                      {spec.ai_taught && (
+                        <span className="text-xs text-gray-400">
+                          Taught by {spec.ai_taught_by_username || 'user'}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {(spec.ai_feedback_note || spec.ai_taught_note) && (
+                    <p className="text-xs text-gray-400 mb-2">
+                      Note: {spec.ai_feedback_note || spec.ai_taught_note}
+                    </p>
+                  )}
+
                   {spec.content && (
                     <details className="mt-2">
                       <summary className="text-sm text-indigo-400 cursor-pointer hover:text-indigo-300">
                         View Content
                       </summary>
-                      <pre className="mt-2 p-3 bg-gray-900 rounded text-xs text-gray-300 overflow-x-auto max-h-96 overflow-y-auto">
-                        {spec.content}
-                      </pre>
+                      <div className="mt-2 p-3 bg-gray-900 rounded text-xs font-mono overflow-x-auto max-h-96 overflow-y-auto">
+                        {contentLines ? (
+                          <div className="space-y-1">
+                            {contentLines.map((line, lineIdx) => {
+                              const lineClass =
+                                line.type === 'added'
+                                  ? 'text-green-400'
+                                  : line.type === 'removed'
+                                  ? 'text-red-400'
+                                  : 'text-gray-300';
+                              const marker = line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ';
+                              return (
+                                <div key={`${spec.id}-content-${lineIdx}`} className={lineClass}>
+                                  {marker} {line.line}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <pre className="text-gray-300 whitespace-pre-wrap">
+                            {spec.content}
+                          </pre>
+                        )}
+                      </div>
                     </details>
                   )}
                 </div>
-              ))}
+              );})}
             </div>
           ) : (
             <p className="text-gray-400 text-sm">No spec files generated yet</p>
           )}
         </div>
       </div>
+
+      <NoteModal
+        open={noteModal.open}
+        title={noteModal.mode === 'teach' ? 'Teach AI Description' : 'AI Feedback Description'}
+        promptText={noteModal.mode === 'teach' ? 'Add an optional description for why this revision should be learned.' : 'Add an optional description for this AI fix feedback.'}
+        initialValue={noteModal.initialValue}
+        submitting={aiFeedbackMutation.isPending || teachAiMutation.isPending}
+        onCancel={closeNoteModal}
+        onSubmit={handleSubmitNoteModal}
+      />
+
+      <AIConversations packageId={id} />
 
       {/* Package Extras */}
       <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
@@ -864,13 +1137,13 @@ export default function PackageDetail() {
           <h2 className="text-lg font-semibold text-white">Package Logs</h2>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => fetchSourceMutation.mutate()}
-              disabled={fetchSourceMutation.isPending || !specFiles || specFiles.length === 0}
+              onClick={handleFetchSource}
+              disabled={fetchSourceMutation.isPending || sourceFetchQueued || !specFiles || specFiles.length === 0}
               className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors flex items-center gap-1"
               title={!specFiles || specFiles.length === 0 ? "Generate spec file first" : "Fetch source files"}
             >
-              <Download className="h-3 w-3" />
-              {fetchSourceMutation.isPending ? 'Fetching...' : 'Fetch Source'}
+              <Download className={`h-3 w-3 ${(fetchSourceMutation.isPending || sourceFetchQueued) ? 'animate-spin' : ''}`} />
+              {(fetchSourceMutation.isPending || sourceFetchQueued) ? 'Fetching...' : 'Fetch Source'}
             </button>
             <button
               onClick={handleRegenerateSpec}

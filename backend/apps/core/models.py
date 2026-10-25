@@ -20,6 +20,12 @@ class SystemSettings(models.Model):
         help_text="Maximum number of simultaneous builds (1-20)"
     )
 
+    celery_worker_concurrency = models.IntegerField(
+        default=4,
+        validators=[MinValueValidator(1), MaxValueValidator(20)],
+        help_text="Number of Celery worker processes for the main task queue"
+    )
+
     mock_memory_limit = models.CharField(
         max_length=20,
         blank=True,
@@ -102,6 +108,12 @@ class SystemSettings(models.Model):
         default=300,
         validators=[MinValueValidator(30), MaxValueValidator(1800)],
         help_text="LLM request timeout in seconds"
+    )
+
+    ai_fixer_slot_wait_timeout = models.IntegerField(
+        default=45,
+        validators=[MinValueValidator(5), MaxValueValidator(3600)],
+        help_text="Seconds to wait for an available AI fixer slot before failing"
     )
 
     ai_fixer_max_attempts = models.IntegerField(

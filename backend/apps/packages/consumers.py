@@ -67,6 +67,9 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                 'name': pkg.name,
                 'build_status': pkg.build_status,
                 'build_log': pkg.build_log or '',
+                'build_root_log': pkg.build_root_log or '',
+                'last_build_log': pkg.last_build_log or '',
+                'last_build_root_log': pkg.last_build_root_log or '',
                 'build_error_message': pkg.build_error_message or '',
                 'analyzed_errors': pkg.analyzed_errors or [],
                 'build_started_at': pkg.build_started_at.isoformat() if pkg.build_started_at else None,
@@ -164,6 +167,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
 
     async def _send_completed_log(self, pkg):
         """Send the full stored build log for a completed/failed build"""
+        await self._send_attempt_logs(pkg)
+
         # Send error analysis FIRST so it appears even if the log transfer is interrupted
         if pkg['analyzed_errors']:
             await self.send(text_data=json.dumps({
@@ -221,6 +226,27 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
             'analyzed_errors': pkg['analyzed_errors'] or [],
         }))
 
+    async def _send_attempt_logs(self, pkg, fields=None):
+        logs = {
+            'current_build_log': pkg['build_log'],
+            'current_build_root_log': pkg['build_root_log'],
+            'last_build_log': pkg['last_build_log'],
+            'last_build_root_log': pkg['last_build_root_log'],
+        }
+        selected_fields = fields if fields is not None else logs
+        for field in selected_fields:
+            content = logs[field]
+            await self.send(text_data=json.dumps({
+                'type': 'attempt_log_start',
+                'field': field,
+            }))
+            for offset in range(0, len(content), 64 * 1024):
+                await self.send(text_data=json.dumps({
+                    'type': 'attempt_log_chunk',
+                    'field': field,
+                    'data': content[offset:offset + 64 * 1024],
+                }))
+
     async def _stream_live_build(self, pkg):
         """
         Tail log files from disk while the build is running.
@@ -229,6 +255,7 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
         We poll those files and stream new content as it appears.
         """
         build_dir = await self.get_build_dir()
+        await self._send_attempt_logs(pkg)
         
         # If the DB log was cleared (empty) this is a fresh/retried build — tell the
         # frontend to discard any previously displayed lines.
@@ -238,6 +265,13 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
         # Track file positions for each log file we find
         file_positions = {}  # path → last read position
         sent_any = False
+        previous_status = pkg['build_status']
+        previous_attempt_logs = (
+            pkg['build_log'],
+            pkg['build_root_log'],
+            pkg['last_build_log'],
+            pkg['last_build_root_log'],
+        )
         
         while self._streaming:
             # Check for new/existing log files
@@ -277,7 +311,46 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
             pkg = await self.get_package_snapshot()
             if not pkg:
                 break
-            
+
+            if pkg['build_status'] != previous_status:
+                previous_status = pkg['build_status']
+                await self.send(text_data=json.dumps({
+                    'type': 'status',
+                    'status': previous_status,
+                }))
+
+            attempt_logs = (
+                pkg['build_log'],
+                pkg['build_root_log'],
+                pkg['last_build_log'],
+                pkg['last_build_root_log'],
+            )
+            if attempt_logs != previous_attempt_logs:
+                retry_started = (
+                    bool(previous_attempt_logs[0] or previous_attempt_logs[1])
+                    and not pkg['build_log']
+                    and not pkg['build_root_log']
+                )
+                changed_fields = [
+                    field for field, old, new in zip(
+                        (
+                            'current_build_log',
+                            'current_build_root_log',
+                            'last_build_log',
+                            'last_build_root_log',
+                        ),
+                        previous_attempt_logs,
+                        attempt_logs,
+                    )
+                    if old != new
+                ]
+                previous_attempt_logs = attempt_logs
+                if retry_started:
+                    await self.send(text_data=json.dumps({'type': 'clear_log'}))
+                    file_positions = {}
+                    sent_any = False
+                await self._send_attempt_logs(pkg, changed_fields)
+
             if pkg['build_status'] in ('completed', 'failed'):
                 # One final read of any remaining log content on disk
                 for log_file in await asyncio.to_thread(self._find_log_files, build_dir):

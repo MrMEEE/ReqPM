@@ -13,6 +13,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'max_concurrent_builds',
+            'celery_worker_concurrency',
             'mock_memory_limit',
             'cleanup_builds_after_days',
             'cleanup_repos_after_days',
@@ -25,6 +26,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             'ai_fixer_base_url',
             'ai_fixer_api_key',
             'ai_fixer_timeout',
+            'ai_fixer_slot_wait_timeout',
             'ai_fixer_max_attempts',
             'ai_fixer_max_concurrent',
             'created_at',
@@ -37,6 +39,12 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
     
     def validate_max_concurrent_builds(self, value):
         """Validate max_concurrent_builds"""
+        if value < 1 or value > 20:
+            raise serializers.ValidationError("Must be between 1 and 20")
+        return value
+
+    def validate_celery_worker_concurrency(self, value):
+        """Validate celery_worker_concurrency"""
         if value < 1 or value > 20:
             raise serializers.ValidationError("Must be between 1 and 20")
         return value
@@ -72,4 +80,10 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
         """Validate repository_sync_interval_minutes"""
         if value < 5 or value > 1440:
             raise serializers.ValidationError("Must be between 5 and 1440 minutes")
+        return value
+
+    def validate_ai_fixer_slot_wait_timeout(self, value):
+        """Validate ai_fixer_slot_wait_timeout"""
+        if value < 5 or value > 3600:
+            raise serializers.ValidationError("Must be between 5 and 3600 seconds")
         return value

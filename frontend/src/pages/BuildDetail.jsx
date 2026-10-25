@@ -127,7 +127,16 @@ export default function BuildDetail() {
       return response.data;
     },
     onSuccess: (data) => {
-      toast.success(`Source fetching triggered for ${data.package_count} packages. Check project logs for progress.`);
+      if (data.package_count > 0) {
+        toast.info(`Fetching missing sources for ${data.package_count} package(s). Check project logs for progress.`);
+        if (data.missing_spec_count > 0) {
+          toast.warning(`${data.missing_spec_count} package(s) need a spec file before their sources can be fetched.`);
+        }
+      } else if (data.missing_spec_count > 0) {
+        toast.warning(`No packages with missing sources could be queued. ${data.missing_spec_count} package(s) need a spec file first.`);
+      } else {
+        toast.success('All queued packages already have sources.');
+      }
     },
     onError: (error) => {
       toast.error(`Failed to fetch sources: ${error.response?.data?.detail || error.message}`);

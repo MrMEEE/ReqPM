@@ -4,6 +4,7 @@ ViewSets for Packages app
 import logging
 import os
 from django.http import FileResponse, Http404
+from django.utils import timezone
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -11,20 +12,22 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 
 from backend.apps.packages.models import (
-    Package, PackageDependency, PackageBuild, SpecFileRevision, PackageLog, PackageExtra
+    Package, PackageDependency, PackageBuild, SpecFileRevision, PackageLog, PackageExtra,
+    AIFixAttempt,
 )
 from backend.apps.packages.serializers import (
     PackageListSerializer, PackageDetailSerializer,
     PackageCreateSerializer, PackageUpdateSerializer,
     PackageDependencySerializer, PackageBuildSerializer,
     SpecFileRevisionSerializer, SpecFileCreateSerializer,
-    PackageLogSerializer, PackageExtraSerializer
+    PackageLogSerializer, PackageExtraSerializer, AIFixAttemptSerializer,
 )
 from backend.apps.packages.tasks import (
     generate_spec_file_task, update_package_metadata_task, sync_package_extras_task
 )
 from backend.apps.packages.artifact_cleanup import (
     wipe_package_artifacts_for_rebuild,
+    wipe_package_build_artifacts_for_rebuild,
     reset_package_build_state,
 )
 
@@ -229,6 +232,167 @@ class PackageViewSet(viewsets.ModelViewSet):
                 serializer.save()
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get'])
+    def ai_attempts(self, request, pk=None):
+        """
+        List recorded AI fixer exchanges (newest first).
+
+        GET /api/packages/{id}/ai_attempts/?limit=50
+        """
+        package = self.get_object()
+        try:
+            limit = max(1, min(200, int(request.query_params.get('limit', 50))))
+        except (TypeError, ValueError):
+            limit = 50
+        attempts = (
+            package.ai_attempts.select_related('created_by', 'revision')
+            .order_by('-created_at')[:limit]
+        )
+        return Response(AIFixAttemptSerializer(attempts, many=True).data)
+
+    @action(detail=True, methods=['post'], url_path=r'ai_attempts/(?P<attempt_id>[^/.]+)/reply')
+    def ai_attempt_reply(self, request, pk=None, attempt_id=None):
+        """
+        Reply to an AI fixer answer with more information and ask it again.
+
+        POST /api/packages/{id}/ai_attempts/{attempt_id}/reply/
+        Body: {"message": "...", "rebuild": true}
+        """
+        from backend.apps.packages.tasks import ai_fixer_reply_task
+        from backend.core import ai_fixer
+
+        package = self.get_object()
+        try:
+            parent = package.ai_attempts.get(id=attempt_id)
+        except AIFixAttempt.DoesNotExist:
+            return Response({'detail': 'AI attempt not found for this package'}, status=status.HTTP_404_NOT_FOUND)
+
+        message = str(request.data.get('message', '') or '').strip()
+        if not message:
+            return Response({'detail': 'message is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(message) > 4000:
+            return Response({'detail': 'message is too long (max 4000 characters)'}, status=status.HTTP_400_BAD_REQUEST)
+        if not ai_fixer.is_enabled():
+            return Response({'detail': 'The AI fixer is disabled in settings'}, status=status.HTTP_400_BAD_REQUEST)
+        if parent.status in (AIFixAttempt.Status.PENDING, AIFixAttempt.Status.RUNNING):
+            return Response({'detail': 'Wait for the AI to answer before replying'}, status=status.HTTP_409_CONFLICT)
+        if not package.spec_revisions.exists():
+            return Response({'detail': 'Package has no spec file'}, status=status.HTTP_400_BAD_REQUEST)
+
+        rebuild = request.data.get('rebuild', True)
+        if isinstance(rebuild, str):
+            rebuild = rebuild.strip().lower() in ('1', 'true', 'yes', 'on')
+
+        attempt = AIFixAttempt.objects.create(
+            package=package,
+            parent=parent,
+            source=AIFixAttempt.Source.USER_REPLY,
+            status=AIFixAttempt.Status.PENDING,
+            user_message=message,
+            rebuild_requested=bool(rebuild),
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        ai_fixer_reply_task.delay(attempt.id)
+        return Response(AIFixAttemptSerializer(attempt).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['post'], url_path=r'spec_files/(?P<revision_id>[^/.]+)/ai_feedback')
+    def spec_file_ai_feedback(self, request, pk=None, revision_id=None):
+        """
+        Record user feedback for an AI-generated fix revision.
+
+        POST /api/packages/{id}/spec_files/{revision_id}/ai_feedback/
+        Body: {"feedback": "correct"|"wrong", "note": "optional"}
+        """
+        package = self.get_object()
+        try:
+            revision = package.spec_revisions.get(id=revision_id)
+        except SpecFileRevision.DoesNotExist:
+            return Response({'detail': 'Spec revision not found for this package'}, status=status.HTTP_404_NOT_FOUND)
+
+        feedback = str(request.data.get('feedback', '')).strip().lower()
+        note = str(request.data.get('note', '') or '').strip()
+        if feedback not in ('correct', 'wrong'):
+            return Response({'detail': 'feedback must be "correct" or "wrong"'}, status=status.HTTP_400_BAD_REQUEST)
+
+        revision.ai_feedback = feedback
+        revision.ai_feedback_note = note
+        revision.ai_feedback_by = request.user
+        revision.ai_feedback_at = timezone.now()
+        revision.save(update_fields=['ai_feedback', 'ai_feedback_note', 'ai_feedback_by', 'ai_feedback_at'])
+
+        return Response({'detail': f'AI feedback saved as {feedback}', 'revision_id': revision.id})
+
+    @action(detail=True, methods=['post'], url_path=r'spec_files/(?P<revision_id>[^/.]+)/ai-feedback')
+    def spec_file_ai_feedback_alias(self, request, pk=None, revision_id=None):
+        """Compatibility alias for ai_feedback endpoint."""
+        return self.spec_file_ai_feedback(request, pk=pk, revision_id=revision_id)
+
+    @action(detail=True, methods=['post'], url_path=r'spec_files/(?P<revision_id>[^/.]+)/teach_ai')
+    def spec_file_teach_ai(self, request, pk=None, revision_id=None):
+        """
+        Mark a spec revision as a learning example for AI few-shot retrieval.
+
+        POST /api/packages/{id}/spec_files/{revision_id}/teach_ai/
+        Body: {"note": "optional teaching note"}
+        """
+        package = self.get_object()
+        try:
+            revision = package.spec_revisions.get(id=revision_id)
+        except SpecFileRevision.DoesNotExist:
+            return Response({'detail': 'Spec revision not found for this package'}, status=status.HTTP_404_NOT_FOUND)
+
+        note = str(request.data.get('note', '') or '').strip()
+
+        # Build a lightweight error fingerprint when missing so this taught
+        # revision can be retrieved for similar future failures.
+        if not revision.fix_context:
+            try:
+                from backend.core import ai_fixer
+
+                build_log = package.build_log or ''
+                root_log = package.build_root_log or ''
+                error_ctx = ai_fixer.extract_error_context(build_log, root_log, 120)
+                keywords = sorted(ai_fixer._extract_keywords(error_ctx)) if error_ctx else []
+                revision.fix_context = {
+                    'error_excerpt': (error_ctx or '')[:400],
+                    'error_keywords': keywords,
+                    'actions': ['manual_taught_fix'],
+                    'taught': True,
+                    'teaching_note': note,
+                }
+            except Exception:
+                revision.fix_context = {
+                    'error_excerpt': (package.build_error_message or '')[:400],
+                    'error_keywords': [],
+                    'actions': ['manual_taught_fix'],
+                    'taught': True,
+                    'teaching_note': note,
+                }
+        else:
+            ctx = dict(revision.fix_context or {})
+            actions = list(ctx.get('actions') or [])
+            if 'manual_taught_fix' not in actions:
+                actions.append('manual_taught_fix')
+            ctx['actions'] = actions
+            ctx['taught'] = True
+            ctx['teaching_note'] = note
+            revision.fix_context = ctx
+
+        revision.ai_taught = True
+        revision.ai_taught_note = note
+        revision.ai_taught_by = request.user
+        revision.ai_taught_at = timezone.now()
+        revision.save(update_fields=[
+            'fix_context', 'ai_taught', 'ai_taught_note', 'ai_taught_by', 'ai_taught_at'
+        ])
+
+        return Response({'detail': 'Revision marked as AI teaching example', 'revision_id': revision.id})
+
+    @action(detail=True, methods=['post'], url_path=r'spec_files/(?P<revision_id>[^/.]+)/teach-ai')
+    def spec_file_teach_ai_alias(self, request, pk=None, revision_id=None):
+        """Compatibility alias for teach_ai endpoint."""
+        return self.spec_file_teach_ai(request, pk=pk, revision_id=revision_id)
     
     @action(detail=True, methods=['get'], url_path='spec_files/latest')
     def latest_spec(self, request, pk=None):
@@ -308,6 +472,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         
         if unbuilt_deps:
             # Set to waiting_for_deps instead of rejecting
+            package.archive_build_logs()
             package.build_status = 'waiting_for_deps'
             package.build_error_message = ''
             package.build_log = ''
@@ -325,6 +490,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         
         # All deps ready, trigger build immediately
         # Set status to pending before dispatching task
+        package.archive_build_logs()
         package.build_status = 'pending'
         package.build_error_message = ''
         package.build_log = ''
@@ -389,6 +555,7 @@ class PackageViewSet(viewsets.ModelViewSet):
                 package.build_log += '\n\n=== Build cancelled by user ==='
         else:
             # For waiting/pending builds, just reset to not_built
+            package.archive_build_logs()
             package.build_status = 'not_built'
             package.build_started_at = None
             package.build_completed_at = None
@@ -413,7 +580,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         
         POST /api/packages/{id}/rebuild_package/
         """
-        from backend.apps.packages.tasks import build_single_package_task
+        from backend.apps.packages.tasks import build_single_package_task, mark_dependents_waiting_for_rebuild
         
         package = self.get_object()
         
@@ -431,8 +598,13 @@ class PackageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        cleanup = wipe_package_build_artifacts_for_rebuild(package, reason='manual-rebuild')
+        reset_package_build_state(package)
+        moved_waiting = mark_dependents_waiting_for_rebuild(package.id, reason='dependency rebuild in progress')
+
         # Trigger build (no dependency check for rebuild)
         # Set status to pending before dispatching task
+        package.archive_build_logs()
         package.build_status = 'pending'
         package.build_error_message = ''
         package.build_log = ''
@@ -446,7 +618,9 @@ class PackageViewSet(viewsets.ModelViewSet):
         return Response({
             'detail': 'Package rebuild triggered',
             'package_id': package.id,
-            'status': 'pending'
+            'status': 'pending',
+            'cleanup': cleanup,
+            'dependents_waiting': moved_waiting,
         })
 
     @action(detail=True, methods=['post'])
@@ -456,7 +630,7 @@ class PackageViewSet(viewsets.ModelViewSet):
 
         POST /api/packages/{id}/fix_and_rebuild/
         """
-        from backend.apps.packages.tasks import fix_and_rebuild_task
+        from backend.apps.packages.tasks import fix_and_rebuild_task, mark_dependents_waiting_for_rebuild
 
         package = self.get_object()
 
@@ -472,11 +646,17 @@ class PackageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        cleanup = wipe_package_build_artifacts_for_rebuild(package, reason='fix-and-rebuild')
+        reset_package_build_state(package)
+        moved_waiting = mark_dependents_waiting_for_rebuild(package.id, reason='dependency rebuild in progress')
+
         fix_and_rebuild_task.delay(package.id)
 
         return Response({
             'detail': 'Fix & rebuild triggered',
-            'package_id': package.id
+            'package_id': package.id,
+            'cleanup': cleanup,
+            'dependents_waiting': moved_waiting,
         })
 
     @action(detail=True, methods=['get'])

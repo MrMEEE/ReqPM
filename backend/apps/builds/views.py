@@ -220,20 +220,39 @@ class BuildJobViewSet(viewsets.ModelViewSet):
         
         POST /api/build-jobs/{id}/fetch_all_sources/
         """
+        from backend.apps.packages.models import Package, SpecFileRevision
         from backend.apps.packages.tasks import fetch_package_source_task
         
         build_job = self.get_object()
         
-        # Get all unique packages from queue items
-        package_ids = build_job.queue_items.values_list('package_id', flat=True).distinct()
+        # Get unique packages that have a spec but still need their sources.
+        queued_package_ids = list(
+            build_job.queue_items.values_list('package_id', flat=True).distinct()
+        )
+        packages_with_specs = Package.objects.filter(
+            id__in=queued_package_ids,
+        ).filter(id__in=SpecFileRevision.objects.values('package_id').distinct())
+        packages_to_fetch = [
+            package for package in packages_with_specs
+            if not package.source_fetched
+        ]
         
         # Trigger source fetching for each package
-        for package_id in package_ids:
-            fetch_package_source_task.delay(package_id)
+        for package in packages_to_fetch:
+            fetch_package_source_task.delay(package.id)
+
+        package_ids = [package.id for package in packages_to_fetch]
+        missing_spec_count = (
+            Package.objects.filter(id__in=queued_package_ids)
+            .exclude(id__in=SpecFileRevision.objects.values('package_id'))
+            .count()
+        )
         
         return Response({
             'detail': f'Source fetching triggered for {len(package_ids)} packages',
-            'package_count': len(package_ids)
+            'package_count': len(package_ids),
+            'package_ids': package_ids,
+            'missing_spec_count': missing_spec_count,
         })
         
         # Reset build job status

@@ -233,14 +233,16 @@ export default function ProjectDetail() {
   const [transitiveSort, setTransitiveSort] = useState({ key: null, dir: 'asc' });
   const [wsConnected, setWsConnected] = useState(false);
   const [generatingSpecPackages, setGeneratingSpecPackages] = useState(new Set());
-  const [buildStatusFilter, setBuildStatusFilter] = useState(null);
+  const [fetchingSourcePackages, setFetchingSourcePackages] = useState(new Set());
+  const [fetchAllSourcesPending, setFetchAllSourcesPending] = useState(null);
+  const [buildStatusFilters, setBuildStatusFilters] = useState([]);
   const wsRef = useRef(null);
   const wsReconnectTimerRef = useRef(null);
 
   // Build status → actual build_status values to match
   const STATUS_FILTER_MAP = {
     completed:        ['completed'],
-    building:         ['building'],
+    building:         ['building', 'fixing'],
     failed:           ['failed'],
     missing_packages: ['missing_packages'],
     pending:          ['pending'],
@@ -250,14 +252,16 @@ export default function ProjectDetail() {
   };
 
   const handleStatusFilterClick = (key) => {
-    setBuildStatusFilter(prev => prev === key ? null : key);
+    setBuildStatusFilters(prev => (
+      prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
+    ));
     setDirectPage(1);
     setTransitivePage(1);
   };
 
   const applyBuildStatusFilter = (list) => {
-    if (!buildStatusFilter) return list;
-    const allowed = STATUS_FILTER_MAP[buildStatusFilter] || [];
+    if (!buildStatusFilters.length) return list;
+    const allowed = [...new Set(buildStatusFilters.flatMap(k => STATUS_FILTER_MAP[k] || []))];
     return list.filter(p => allowed.includes(p.build_status));
   };
 
@@ -281,7 +285,37 @@ export default function ProjectDetail() {
       return response.data;
     },
     enabled: !!project,
+    refetchInterval: fetchAllSourcesPending ? 3000 : false,
   });
+
+  useEffect(() => {
+    if (!fetchAllSourcesPending || !packagesData) return;
+
+    const packagesById = new Map(
+      (packagesData.packages || []).map((pkg) => [pkg.id, pkg])
+    );
+    const remaining = fetchAllSourcesPending.packageIds.filter(
+      (packageId) => !packagesById.get(packageId)?.source_fetched
+    );
+
+    let completionMessage = '';
+    if (remaining.length === 0) {
+      completionMessage = 'Sources fetched for all queued packages';
+    } else if (Date.now() - fetchAllSourcesPending.startedAt >= 15 * 60 * 1000) {
+      completionMessage = `${remaining.length} source fetch(es) are still incomplete. Check package logs and retry.`;
+    }
+    if (!completionMessage) return;
+
+    const timeoutId = setTimeout(() => {
+      setFetchAllSourcesPending(null);
+      if (remaining.length === 0) {
+        toast.success(completionMessage);
+      } else {
+        toast.warning(completionMessage);
+      }
+    }, 0);
+    return () => clearTimeout(timeoutId);
+  }, [fetchAllSourcesPending, packagesData, toast]);
 
   // Track package statuses for change notifications
   const prevPkgStatusRef = useRef({});
@@ -471,16 +505,33 @@ export default function ProjectDetail() {
       const response = await packagesAPI.fetchSource(packageId);
       return response.data;
     },
-    onSuccess: () => {
+    onMutate: (packageId) => {
+      setFetchingSourcePackages(prev => new Set(prev).add(packageId));
+    },
+    onSuccess: (_data, packageId) => {
       // Show logs so user can see progress
       setShowLogs(true);
+      queryClient.invalidateQueries(['project-packages', id]);
+      setTimeout(() => {
+        setFetchingSourcePackages(prev => {
+          const next = new Set(prev);
+          next.delete(packageId);
+          return next;
+        });
+      }, 2500);
     },
-    onError: (error) => {
+    onError: (error, packageId) => {
+      setFetchingSourcePackages(prev => {
+        const next = new Set(prev);
+        next.delete(packageId);
+        return next;
+      });
       toast.error(`Failed to fetch source: ${error.response?.data?.detail || error.message}`);
     },
   });
 
   const handleFetchSource = (packageId) => {
+    if (fetchingSourcePackages.has(packageId)) return;
     fetchSourceMutation.mutate(packageId);
   };
 
@@ -617,8 +668,21 @@ export default function ProjectDetail() {
       return response.data;
     },
     onSuccess: (data) => {
-      toast.info(`Started fetching sources for ${data.count} packages`);
-      // Refetch packages to update source status
+      const packageIds = data.package_ids || [];
+      if (packageIds.length === 0) {
+        const detail = data.missing_spec_count
+          ? ` No spec file is available for ${data.missing_spec_count} package(s).`
+          : '';
+        toast.info(`No packages need source fetching.${detail}`);
+        return;
+      }
+
+      setFetchAllSourcesPending({ packageIds, startedAt: Date.now() });
+      setShowLogs(true);
+      toast.info(`Fetching missing sources for ${packageIds.length} package(s).`);
+      if (data.missing_spec_count > 0) {
+        toast.warning(`${data.missing_spec_count} package(s) need a spec file before their sources can be fetched.`);
+      }
       queryClient.invalidateQueries(['project-packages', id]);
     },
     onError: (error) => {
@@ -884,12 +948,12 @@ export default function ProjectDetail() {
               </button>
               <button
                 onClick={handleFetchAllSources}
-                disabled={fetchAllSourcesMutation.isPending}
+                disabled={fetchAllSourcesMutation.isPending || !!fetchAllSourcesPending}
                 className="flex items-center gap-2 px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 disabled:opacity-50 transition-colors"
                 title="Fetch source files for all packages with spec files"
               >
-                <Download className={`h-4 w-4 ${fetchAllSourcesMutation.isPending ? 'animate-spin' : ''}`} />
-                Fetch All Sources
+                <Download className={`h-4 w-4 ${fetchAllSourcesMutation.isPending || fetchAllSourcesPending ? 'animate-spin' : ''}`} />
+                {fetchAllSourcesPending ? 'Fetching Sources…' : 'Fetch All Sources'}
               </button>
               <button
                 onClick={handleBuildAllPackages}
@@ -932,7 +996,7 @@ export default function ProjectDetail() {
         const total = all.length;
         const stats = [
           { key: 'completed',         label: 'Built',            n: count(['completed']),                          color: 'text-green-400',  ring: 'ring-green-500',  bg: 'bg-green-500/10',  dot: 'bg-green-400' },
-          { key: 'building',          label: 'Building',         n: count(['building']),                           color: 'text-blue-400',   ring: 'ring-blue-500',   bg: 'bg-blue-500/10',   dot: 'bg-blue-400', pulse: true },
+          { key: 'building',          label: 'Building',         n: count(['building', 'fixing']),                color: 'text-blue-400',   ring: 'ring-blue-500',   bg: 'bg-blue-500/10',   dot: 'bg-blue-400', pulse: true },
           { key: 'failed',            label: 'Failed',           n: count(['failed']),                              color: 'text-red-400',    ring: 'ring-red-500',    bg: 'bg-red-500/10',    dot: 'bg-red-400' },
           { key: 'missing_packages',  label: 'Missing deps',     n: count(['missing_packages']),                    color: 'text-amber-400',  ring: 'ring-amber-500',  bg: 'bg-amber-500/10',  dot: 'bg-amber-400' },
           { key: 'pending',           label: 'Pending',          n: count(['pending']),                            color: 'text-gray-400',   ring: 'ring-gray-500',   bg: 'bg-gray-500/10',   dot: 'bg-gray-400' },
@@ -953,9 +1017,9 @@ export default function ProjectDetail() {
                 />
               </div>
               <span className="text-xs text-gray-400 shrink-0">{builtPct}% built ({count(['completed'])}/{total})</span>
-              {buildStatusFilter && (
+              {buildStatusFilters.length > 0 && (
                 <button
-                  onClick={() => { setBuildStatusFilter(null); setDirectPage(1); setTransitivePage(1); }}
+                  onClick={() => { setBuildStatusFilters([]); setDirectPage(1); setTransitivePage(1); }}
                   className="text-xs text-gray-400 hover:text-white underline shrink-0"
                 >
                   Clear filter
@@ -969,14 +1033,14 @@ export default function ProjectDetail() {
                   key={s.key}
                   onClick={() => handleStatusFilterClick(s.key)}
                   className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all text-sm ${
-                    buildStatusFilter === s.key
+                    buildStatusFilters.includes(s.key)
                       ? `${s.bg} border-current ring-1 ${s.ring} ${s.color}`
                       : 'bg-gray-900/50 border-gray-700 text-gray-300 hover:border-gray-500'
                   }`}
                 >
                   <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot} ${s.pulse ? 'animate-pulse' : ''}`} />
-                  <span className={`font-semibold ${buildStatusFilter === s.key ? s.color : ''}`}>{s.n}</span>
-                  <span className={`${buildStatusFilter === s.key ? s.color : 'text-gray-400'}`}>{s.label}</span>
+                  <span className={`font-semibold ${buildStatusFilters.includes(s.key) ? s.color : ''}`}>{s.n}</span>
+                  <span className={`${buildStatusFilters.includes(s.key) ? s.color : 'text-gray-400'}`}>{s.label}</span>
                 </button>
               ))}
             </div>
@@ -1155,7 +1219,7 @@ export default function ProjectDetail() {
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  📋 Direct Dependencies ({(packageSearch || buildStatusFilter) ? `${filteredDirect.length} of ` : ''}{packagesData.direct_count || packagesData.direct_dependencies.length})
+                  📋 Direct Dependencies ({(packageSearch || buildStatusFilters.length > 0) ? `${filteredDirect.length} of ` : ''}{packagesData.direct_count || packagesData.direct_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Packages from requirements files
                   </span>
@@ -1288,6 +1352,12 @@ export default function ProjectDetail() {
                                 Building
                               </span>
                             )}
+                            {pkg.build_status === 'fixing' && (
+                              <span className="px-2 py-1 bg-violet-900/30 text-violet-300 text-xs rounded flex items-center gap-1">
+                                <Wrench className="h-3 w-3" />
+                                Fixing
+                              </span>
+                            )}
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
                                 className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
@@ -1375,7 +1445,7 @@ export default function ProjectDetail() {
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             <div className="flex items-center gap-2 flex-wrap">
-                              {['building', 'pending'].includes(pkg.build_status) && (
+                              {['building', 'fixing', 'pending'].includes(pkg.build_status) && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1388,7 +1458,7 @@ export default function ProjectDetail() {
                                   Live Log
                                 </button>
                               )}
-                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
+                              {!['building', 'fixing', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1418,21 +1488,21 @@ export default function ProjectDetail() {
                                   e.stopPropagation();
                                   handleFetchSource(pkg.id);
                                 }}
-                                disabled={!pkg.spec_files_count || pkg.spec_files_count === 0}
+                                disabled={fetchingSourcePackages.has(pkg.id) || !pkg.spec_files_count || pkg.spec_files_count === 0}
                                 className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : "Fetch source files"}
+                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : (fetchingSourcePackages.has(pkg.id) ? "Source fetch queued" : "Fetch source files")}
                               >
-                                <Download className="h-3 w-3" />
-                                Fetch
+                                <Download className={`h-3 w-3 ${fetchingSourcePackages.has(pkg.id) ? 'animate-spin' : ''}`} />
+                                {fetchingSourcePackages.has(pkg.id) ? 'Fetching...' : 'Fetch'}
                               </button>
-                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status)) ? (
+                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building', 'fixing'].includes(pkg.build_status)) ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleCancelBuild(pkg.id);
                                   }}
                                   className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
-                                  title={pkg.build_status === 'building' ? "Cancel running build" : "Cancel waiting build"}
+                                  title={['building', 'fixing'].includes(pkg.build_status) ? "Cancel running build" : "Cancel waiting build"}
                                 >
                                   <X className="h-3 w-3" />
                                   Cancel
@@ -1443,7 +1513,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleBuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || ['building', 'fixing'].includes(pkg.build_status)}
                                   className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
                                 >
@@ -1456,7 +1526,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleRebuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || ['building', 'fixing'].includes(pkg.build_status)}
                                   className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title="Rebuild package"
                                 >
@@ -1535,7 +1605,7 @@ export default function ProjectDetail() {
               return (
               <div>
                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2">
-                  🔗 Transitive Dependencies ({(packageSearch || buildStatusFilter) ? `${filteredTransitive.length} of ` : ''}{packagesData.transitive_count || packagesData.transitive_dependencies.length})
+                  🔗 Transitive Dependencies ({(packageSearch || buildStatusFilters.length > 0) ? `${filteredTransitive.length} of ` : ''}{packagesData.transitive_count || packagesData.transitive_dependencies.length})
                   <span className="text-xs text-gray-400 font-normal">
                     Dependencies of dependencies
                   </span>
@@ -1681,6 +1751,12 @@ export default function ProjectDetail() {
                                 Building
                               </span>
                             )}
+                            {pkg.build_status === 'fixing' && (
+                              <span className="px-2 py-1 bg-violet-900/30 text-violet-300 text-xs rounded flex items-center gap-1">
+                                <Wrench className="h-3 w-3" />
+                                Fixing
+                              </span>
+                            )}
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
                                 className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
@@ -1768,7 +1844,7 @@ export default function ProjectDetail() {
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             <div className="flex items-center gap-2 flex-wrap">
-                              {['building', 'pending'].includes(pkg.build_status) && (
+                              {['building', 'fixing', 'pending'].includes(pkg.build_status) && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1781,7 +1857,7 @@ export default function ProjectDetail() {
                                   Live Log
                                 </button>
                               )}
-                              {!['building', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
+                              {!['building', 'fixing', 'pending', 'waiting_for_deps'].includes(pkg.build_status) && (pkg.has_build_log || pkg.build_error_message || pkg.build_status === 'completed' || pkg.build_status === 'failed' || pkg.build_status === 'missing_packages' || pkg.build_status === 'dep_build_pending') && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1811,21 +1887,21 @@ export default function ProjectDetail() {
                                   e.stopPropagation();
                                   handleFetchSource(pkg.id);
                                 }}
-                                disabled={!pkg.spec_files_count || pkg.spec_files_count === 0}
+                                disabled={fetchingSourcePackages.has(pkg.id) || !pkg.spec_files_count || pkg.spec_files_count === 0}
                                 className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : "Fetch source files"}
+                                title={!pkg.spec_files_count || pkg.spec_files_count === 0 ? "Generate spec file first" : (fetchingSourcePackages.has(pkg.id) ? "Source fetch queued" : "Fetch source files")}
                               >
-                                <Download className="h-3 w-3" />
-                                Fetch
+                                <Download className={`h-3 w-3 ${fetchingSourcePackages.has(pkg.id) ? 'animate-spin' : ''}`} />
+                                {fetchingSourcePackages.has(pkg.id) ? 'Fetching...' : 'Fetch'}
                               </button>
-                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building'].includes(pkg.build_status)) ? (
+                              {(['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building', 'fixing'].includes(pkg.build_status)) ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleCancelBuild(pkg.id);
                                   }}
                                   className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 flex items-center gap-1"
-                                  title={pkg.build_status === 'building' ? "Cancel running build" : "Cancel waiting build"}
+                                  title={['building', 'fixing'].includes(pkg.build_status) ? "Cancel running build" : "Cancel waiting build"}
                                 >
                                   <X className="h-3 w-3" />
                                   Cancel
@@ -1836,7 +1912,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleBuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || ['building', 'fixing'].includes(pkg.build_status)}
                                   className="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title={!pkg.source_fetched ? "Fetch source first" : !pkg.spec_files_count ? "Generate spec file first" : "Build package"}
                                 >
@@ -1849,7 +1925,7 @@ export default function ProjectDetail() {
                                     e.stopPropagation();
                                     handleRebuildPackage(pkg.id);
                                   }}
-                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || pkg.build_status === 'building'}
+                                  disabled={!pkg.source_fetched || !pkg.spec_files_count || ['building', 'fixing'].includes(pkg.build_status)}
                                   className="px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                                   title="Rebuild package"
                                 >

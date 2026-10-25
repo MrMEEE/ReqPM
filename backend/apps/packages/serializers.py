@@ -3,7 +3,8 @@ Serializers for Packages app
 """
 from rest_framework import serializers
 from backend.apps.packages.models import (
-    Package, PackageDependency, PackageBuild, SpecFileRevision, PackageLog, PackageExtra
+    Package, PackageDependency, PackageBuild, SpecFileRevision, PackageLog, PackageExtra,
+    AIFixAttempt,
 )
 from backend.apps.users.serializers import UserSerializer
 
@@ -41,14 +42,50 @@ class SpecFileRevisionSerializer(serializers.ModelSerializer):
     """Serializer for SpecFileRevision model"""
     
     created_by = UserSerializer(read_only=True)
+    ai_feedback_by_username = serializers.CharField(source='ai_feedback_by.username', read_only=True)
+    ai_taught_by_username = serializers.CharField(source='ai_taught_by.username', read_only=True)
+    is_ai_fix = serializers.SerializerMethodField()
+
+    def get_is_ai_fix(self, obj):
+        return bool((obj.commit_message or '').startswith('AI-fixed:'))
     
     class Meta:
         model = SpecFileRevision
         fields = [
             'id', 'content', 'commit_message', 'git_commit_hash', 'git_commit_url',
-            'created_by', 'created_at'
+            'created_by', 'created_at',
+            'is_ai_fix',
+            'ai_feedback', 'ai_feedback_note', 'ai_feedback_at', 'ai_feedback_by_username',
+            'ai_taught', 'ai_taught_note', 'ai_taught_at', 'ai_taught_by_username',
         ]
         read_only_fields = ['id', 'created_by', 'created_at']
+
+
+class AIFixAttemptSerializer(serializers.ModelSerializer):
+    """Serializer for a recorded AI fixer exchange."""
+
+    created_by_username = serializers.CharField(source='created_by.username', read_only=True, default=None)
+    revision_commit_message = serializers.CharField(source='revision.commit_message', read_only=True, default=None)
+    revision_ai_feedback = serializers.CharField(source='revision.ai_feedback', read_only=True, default=None)
+    summary = serializers.SerializerMethodField()
+
+    def get_summary(self, obj):
+        from backend.core.ai_fixer import summarize_attempt
+        if obj.status in ('pending', 'running'):
+            return 'Waiting for the AI model...'
+        return summarize_attempt(obj)
+
+    class Meta:
+        model = AIFixAttempt
+        fields = [
+            'id', 'parent', 'source', 'status', 'summary',
+            'user_message', 'prompt', 'raw_response',
+            'error_category', 'reasoning', 'actions', 'applied_changes', 'error_message',
+            'model_name', 'rebuild_requested',
+            'revision', 'revision_commit_message', 'revision_ai_feedback',
+            'created_by_username', 'created_at', 'completed_at',
+        ]
+        read_only_fields = fields
 
 
 class PackageListSerializer(serializers.ModelSerializer):

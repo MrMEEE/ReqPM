@@ -803,6 +803,21 @@ class MockBuilder(BaseBuilder):
         )
         log_output, root_log_output = _read_mock_logs(run_started_at)
 
+        # Some mock failures (notably early infra/depsolver exits) may return
+        # little or no persisted build/root logs. Preserve command stdout/stderr
+        # so callers can classify and auto-fix instead of getting opaque code-only failures.
+        if returncode != 0:
+            if not (log_output or '').strip():
+                pieces = []
+                if stdout and stdout.strip():
+                    pieces.append(f"mock stdout:\n{stdout.strip()}")
+                if stderr and stderr.strip():
+                    pieces.append(f"mock stderr:\n{stderr.strip()}")
+                if pieces:
+                    log_output = "\n\n".join(pieces)
+            if not (root_log_output or '').strip() and stderr and stderr.strip():
+                root_log_output = f"mock stderr:\n{stderr.strip()}"
+
         # Auto-retry path for modern Rust packages when distro rust/cargo is too old.
         required_rust = self._detect_required_rustc_version(
             (log_output or '') + "\n" + (root_log_output or '')
@@ -824,21 +839,41 @@ class MockBuilder(BaseBuilder):
         build_duration = int(time.time() - start_time)
 
         # ------------------------------------------------------------------ #
-        # Chroot cleanup — scrub only the unique build chroot (not the shared  #
-        # bootstrap which is reused across concurrent builds).                 #
+        # Chroot cleanup for unique builds.                                  #
+        #                                                                    #
+        # We use --uniqueext to isolate concurrent builds. Some mock versions #
+        # can leave both target-<uniqueext> and target-bootstrap-<uniqueext>  #
+        # roots behind unless we scrub all artifacts for that unique suffix.  #
         # ------------------------------------------------------------------ #
-        logger.info(f"Scrubbing build chroot: {target}-{unique_ext}")
-        scrub_args = [
+        logger.info(f"Scrubbing unique mock roots: {target}-{unique_ext}")
+
+        # First attempt: full scrub for this unique suffix (preferred).
+        scrub_all_args = [
             '-r', target,
             '--arch', arch,
             '--uniqueext', unique_ext,
-            '--scrub=chroot',
+            '--scrub=all',
         ]
-        rc, _, _ = self._run_mock_command(scrub_args, timeout=300)
-        if rc == 0:
-            logger.info(f"Scrubbed build chroot for {unique_ext}")
+        rc_all, _, _ = self._run_mock_command(scrub_all_args, timeout=600)
+
+        if rc_all == 0:
+            logger.info(f"Scrubbed unique build/bootstrap roots for {unique_ext}")
         else:
-            logger.warning(f"Failed to scrub build chroot for {unique_ext} (rc={rc})")
+            # Fallback for environments where --scrub=all may be restricted.
+            logger.warning(
+                f"Full scrub failed for {unique_ext} (rc={rc_all}); falling back to chroot scrub"
+            )
+            scrub_args = [
+                '-r', target,
+                '--arch', arch,
+                '--uniqueext', unique_ext,
+                '--scrub=chroot',
+            ]
+            rc, _, _ = self._run_mock_command(scrub_args, timeout=300)
+            if rc == 0:
+                logger.info(f"Fallback scrubbed build chroot for {unique_ext}")
+            else:
+                logger.warning(f"Fallback scrub failed for {unique_ext} (rc={rc})")
 
         # ------------------------------------------------------------------ #
         # Resultdir cleanup — keep RPMs/SRPMs only; everything else           #

@@ -1,13 +1,16 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { Settings as SettingsIcon, Save, AlertCircle, CheckCircle, Activity, Bot, Download, Zap } from 'lucide-react';
+import { Settings as SettingsIcon, Save, AlertCircle, CheckCircle, Activity, Bot, Download, Zap, RotateCw } from 'lucide-react';
 import { settingsAPI } from '../lib/api';
 
 export default function Settings() {
   const { user } = useAuth();
   const [settings, setSettings] = useState(null);
   const [buildStatus, setBuildStatus] = useState(null);
+  const [cleanupStatus, setCleanupStatus] = useState(null);
   const [aiStatus, setAiStatus] = useState(null);
+  const [cleanupRunning, setCleanupRunning] = useState(false);
+  const [workersReloading, setWorkersReloading] = useState(false);
   const [aiTesting, setAiTesting] = useState(false);
   const [aiTestResult, setAiTestResult] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -20,11 +23,16 @@ export default function Settings() {
   useEffect(() => {
     loadSettings();
     loadBuildStatus();
+    loadCleanupStatus();
     loadAiStatus();
     
-    // Refresh build status every 5 seconds
-    const interval = setInterval(loadBuildStatus, 5000);
-    return () => clearInterval(interval);
+    // Refresh build status and cleanup status.
+    const buildInterval = setInterval(loadBuildStatus, 5000);
+    const cleanupInterval = setInterval(loadCleanupStatus, 15000);
+    return () => {
+      clearInterval(buildInterval);
+      clearInterval(cleanupInterval);
+    };
   }, []);
 
   // Poll AI status more frequently while a download is in progress
@@ -66,6 +74,29 @@ export default function Settings() {
     }
   };
 
+  const loadCleanupStatus = async () => {
+    try {
+      const response = await settingsAPI.cleanupStatus();
+      setCleanupStatus(response.data);
+    } catch (err) {
+      console.error('Failed to load cleanup status:', err);
+    }
+  };
+
+  const formatBytes = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) {
+      return 'N/A';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = Number(value);
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+  };
+
   const handleDownloadModel = async (modelKey) => {
     try {
       await settingsAPI.aiDownloadModel(modelKey);
@@ -85,6 +116,51 @@ export default function Settings() {
       setAiTestResult({ ok: false, detail: err.response?.data?.detail || 'Test failed' });
     } finally {
       setAiTesting(false);
+    }
+  };
+
+  const handleRunCleanupNow = async () => {
+    if (!isAdmin) {
+      setError('Only administrators can run cleanup tasks');
+      return;
+    }
+
+    setCleanupRunning(true);
+    setError(null);
+    try {
+      const response = await settingsAPI.runCleanupNow();
+      const retention = response.data?.retention_days;
+      setMessage(`Cleanup queued (retention: ${retention} days)`);
+      await loadCleanupStatus();
+      setTimeout(loadCleanupStatus, 4000);
+      setTimeout(loadCleanupStatus, 10000);
+      setTimeout(() => setMessage(null), 4000);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to queue cleanup tasks');
+    } finally {
+      setCleanupRunning(false);
+    }
+  };
+
+  const handleReloadWorkers = async () => {
+    if (!isAdmin) {
+      setError('Only administrators can reload workers');
+      return;
+    }
+
+    setWorkersReloading(true);
+    setError(null);
+    setMessage(null);
+    try {
+      await settingsAPI.reloadWorkers();
+      setMessage('Celery workers reloaded with the current concurrency setting');
+      await loadBuildStatus();
+      setTimeout(loadBuildStatus, 4000);
+      setTimeout(() => setMessage(null), 4000);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to reload workers');
+    } finally {
+      setWorkersReloading(false);
     }
   };
 
@@ -168,12 +244,24 @@ export default function Settings() {
       {/* Build Status Card */}
       {buildStatus && (
         <div className="bg-gray-800 rounded-lg shadow-lg p-6 border border-gray-700">
-          <div className="flex items-center space-x-2 mb-4">
-            <Activity className="text-blue-500" size={24} />
-            <h2 className="text-xl font-semibold text-white">Build Activity</h2>
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div className="flex items-center space-x-2">
+              <Activity className="text-blue-500" size={24} />
+              <h2 className="text-xl font-semibold text-white">Build Activity</h2>
+            </div>
+            {isAdmin && (
+              <button
+                onClick={handleReloadWorkers}
+                disabled={workersReloading}
+                className="flex items-center space-x-2 px-4 py-2 bg-violet-700 hover:bg-violet-600 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RotateCw size={16} className={workersReloading ? 'animate-spin' : ''} />
+                <span>{workersReloading ? 'Reloading...' : 'Reload Workers'}</span>
+              </button>
+            )}
           </div>
           
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-gray-900/50 rounded-lg p-4">
               <div className="text-gray-400 text-sm mb-1">Active Builds</div>
               <div className="text-3xl font-bold text-blue-500">{buildStatus.active_count}</div>
@@ -181,6 +269,10 @@ export default function Settings() {
             <div className="bg-gray-900/50 rounded-lg p-4">
               <div className="text-gray-400 text-sm mb-1">Max Concurrent</div>
               <div className="text-3xl font-bold text-white">{buildStatus.max_concurrent}</div>
+            </div>
+            <div className="bg-gray-900/50 rounded-lg p-4">
+              <div className="text-gray-400 text-sm mb-1">Worker Processes</div>
+              <div className="text-3xl font-bold text-violet-400">{buildStatus.worker_concurrency ?? settings.celery_worker_concurrency}</div>
             </div>
             <div className="bg-gray-900/50 rounded-lg p-4">
               <div className="text-gray-400 text-sm mb-1">Available Slots</div>
@@ -206,11 +298,95 @@ export default function Settings() {
         </div>
       )}
 
+      {/* Cleanup Status Card */}
+      {cleanupStatus && (
+        <div className="bg-gray-800 rounded-lg shadow-lg p-6 border border-gray-700">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center space-x-2">
+              <Activity className="text-emerald-500" size={24} />
+              <h2 className="text-xl font-semibold text-white">Cleanup Activity</h2>
+            </div>
+            {isAdmin && (
+              <button
+                onClick={handleRunCleanupNow}
+                disabled={cleanupRunning}
+                className="flex items-center space-x-2 px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RotateCw size={16} className={cleanupRunning ? 'animate-spin' : ''} />
+                <span>{cleanupRunning ? 'Queuing...' : 'Run Cleanup Now'}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+            <div className="bg-gray-900/50 rounded-lg p-4">
+              <div className="text-gray-400 text-sm mb-1">Mock Root</div>
+              <div className="text-2xl font-bold text-emerald-400">
+                {formatBytes(cleanupStatus.footprint?.mock_root_bytes)}
+              </div>
+            </div>
+            <div className="bg-gray-900/50 rounded-lg p-4">
+              <div className="text-gray-400 text-sm mb-1">Package Builds</div>
+              <div className="text-2xl font-bold text-blue-400">
+                {formatBytes(cleanupStatus.footprint?.package_builds_bytes)}
+              </div>
+            </div>
+            <div className="bg-gray-900/50 rounded-lg p-4">
+              <div className="text-gray-400 text-sm mb-1">Build Artifacts</div>
+              <div className="text-2xl font-bold text-white">
+                {formatBytes(cleanupStatus.footprint?.build_dir_bytes)}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="bg-gray-900/40 rounded-lg p-4 border border-gray-700">
+              <div className="text-sm text-gray-300 mb-2">Hourly Mock Janitor</div>
+              <div className="text-sm text-gray-400 space-y-1">
+                <div>Scrubbed: <span className="text-emerald-300">{cleanupStatus.cleanup?.cleanup_mock_roots_task?.scrubbed_mock_roots ?? 0}</span></div>
+                <div>Failed: <span className="text-red-300">{cleanupStatus.cleanup?.cleanup_mock_roots_task?.failed_mock_scrubs ?? 0}</span></div>
+                <div>Eligible: <span className="text-blue-300">{cleanupStatus.cleanup?.cleanup_mock_roots_task?.eligible_unique_roots ?? 0}</span></div>
+                <div>Last run: <span className="text-gray-200">{cleanupStatus.cleanup?.cleanup_mock_roots_task?.recorded_at ? new Date(cleanupStatus.cleanup.cleanup_mock_roots_task.recorded_at).toLocaleString() : 'N/A'}</span></div>
+              </div>
+            </div>
+
+            <div className="bg-gray-900/40 rounded-lg p-4 border border-gray-700">
+              <div className="text-sm text-gray-300 mb-2">Daily Full Cleanup</div>
+              <div className="text-sm text-gray-400 space-y-1">
+                <div>Build dirs removed: <span className="text-emerald-300">{cleanupStatus.cleanup?.cleanup_old_builds_task?.deleted_package_build_dirs ?? 0}</span></div>
+                <div>Job dirs removed: <span className="text-emerald-300">{cleanupStatus.cleanup?.cleanup_old_builds_task?.deleted_build_job_dirs ?? 0}</span></div>
+                <div>Mock scrubbed: <span className="text-blue-300">{cleanupStatus.cleanup?.cleanup_old_builds_task?.scrubbed_mock_roots ?? 0}</span></div>
+                <div>Last run: <span className="text-gray-200">{cleanupStatus.cleanup?.cleanup_old_builds_task?.recorded_at ? new Date(cleanupStatus.cleanup.cleanup_old_builds_task.recorded_at).toLocaleString() : 'N/A'}</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Build Settings */}
       <div className="bg-gray-800 rounded-lg shadow-lg p-6 border border-gray-700">
         <h2 className="text-xl font-semibold text-white mb-6">Build Settings</h2>
         
         <div className="space-y-6">
+          {/* Celery Worker Concurrency */}
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">
+              Celery Worker Concurrency
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={settings.celery_worker_concurrency}
+              onChange={(e) => handleChange('celery_worker_concurrency', parseInt(e.target.value))}
+              disabled={!isAdmin}
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            />
+            <p className="text-sm text-gray-400 mt-2">
+              Number of Celery worker processes for the main task queue. Use Reload Workers after changing this value.
+            </p>
+          </div>
+
           {/* Max Concurrent Builds */}
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-2">
@@ -613,6 +789,25 @@ export default function Settings() {
             />
             <p className="text-sm text-gray-400 mt-2">
               How many packages the AI fixer may work on at the same time. Others will wait until a slot is free (1-10). Keep at 1 on low-RAM machines.
+            </p>
+          </div>
+
+          {/* Slot wait timeout */}
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">
+              Slot Wait Timeout (Seconds)
+            </label>
+            <input
+              type="number"
+              min="5"
+              max="3600"
+              value={settings.ai_fixer_slot_wait_timeout}
+              onChange={(e) => handleChange('ai_fixer_slot_wait_timeout', parseInt(e.target.value))}
+              disabled={!isAdmin}
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            />
+            <p className="text-sm text-gray-400 mt-2">
+              How long AI fixer should wait for a free concurrency slot before giving up (5-3600).
             </p>
           </div>
 

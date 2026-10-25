@@ -6,11 +6,151 @@ import re
 import subprocess
 import tempfile
 import os
+import tarfile
+import zipfile
 from typing import Optional
 from datetime import datetime
 import logging
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
+
+
+def get_source_archive_root(archive_path: str | Path) -> str | None:
+    """Return the unique top-level directory in an sdist archive, if present."""
+    path = Path(archive_path)
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                entries = [(entry.filename, entry.is_dir()) for entry in archive.infolist()]
+        else:
+            with tarfile.open(path, 'r:*') as archive:
+                entries = [(member.name, member.isdir()) for member in archive.getmembers()]
+    except (OSError, tarfile.TarError, zipfile.BadZipFile):
+        logger.warning(f'Could not inspect source archive {path}')
+        return None
+
+    roots = set()
+    for name, is_dir in entries:
+        parts = PurePosixPath(name).parts
+        if not parts or parts[0] in ('.', '..'):
+            continue
+        if len(parts) > 1 or is_dir:
+            roots.add(parts[0])
+
+    return next(iter(roots)) if len(roots) == 1 else None
+
+
+_NON_MODULE_DIRS = {
+    'test', 'tests', 'testing', 'doc', 'docs', 'example', 'examples',
+    'benchmark', 'benchmarks', 'script', 'scripts', 'tools', 'build', 'dist',
+}
+_NON_MODULE_FILES = {'setup', 'conftest', 'noxfile', 'tasks', 'fabfile'}
+
+
+def get_source_top_level_modules(archive_path: str | Path) -> list[str]:
+    """Return importable top-level module names shipped in an sdist archive.
+
+    Prefers ``top_level.txt`` from bundled egg-info/dist-info metadata and
+    falls back to scanning Python files under the archive root (or ``src/``).
+    """
+    path = Path(archive_path)
+
+    def _read(archive, name):
+        if isinstance(archive, zipfile.ZipFile):
+            return archive.read(name).decode('utf-8', errors='replace')
+        member = archive.extractfile(name)
+        return member.read().decode('utf-8', errors='replace') if member else ''
+
+    try:
+        if zipfile.is_zipfile(path):
+            archive = zipfile.ZipFile(path)
+            names = [entry.filename for entry in archive.infolist() if not entry.is_dir()]
+        else:
+            archive = tarfile.open(path, 'r:*')
+            names = [member.name for member in archive.getmembers() if member.isfile()]
+    except (OSError, tarfile.TarError, zipfile.BadZipFile):
+        logger.warning(f'Could not inspect source archive {path}')
+        return []
+
+    valid = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+    try:
+        top_level_files = sorted(
+            (n for n in names
+             if n.endswith(('.egg-info/top_level.txt', '.dist-info/top_level.txt'))),
+            key=lambda n: len(PurePosixPath(n).parts),
+        )
+        for name in top_level_files:
+            modules = [
+                line.strip() for line in _read(archive, name).splitlines()
+                if valid.match(line.strip()) and line.strip().lower() not in _NON_MODULE_DIRS
+            ]
+            if modules:
+                return list(dict.fromkeys(modules))
+    except (OSError, KeyError, tarfile.TarError, zipfile.BadZipFile):
+        pass
+    finally:
+        archive.close()
+
+    modules = []
+    for name in names:
+        parts = list(PurePosixPath(name).parts)[1:]  # drop archive root dir
+        if parts and parts[0] == 'src':
+            parts = parts[1:]
+        if not parts or not parts[-1].endswith('.py'):
+            continue
+        top = parts[0][:-3] if len(parts) == 1 else parts[0]
+        if (
+            valid.match(top)
+            and top.lower() not in _NON_MODULE_DIRS
+            and top.lower() not in _NON_MODULE_FILES
+        ):
+            modules.append(top)
+    return list(dict.fromkeys(modules))
+
+
+def fix_setup_directory(
+    spec_content: str,
+    expected_dir: str,
+    archive_root: str,
+    version: str,
+) -> str | None:
+    """Update a matching %setup -n directory to the source archive's root."""
+    if not re.fullmatch(r'[A-Za-z0-9_.+-]+', archive_root):
+        return None
+
+    setup_match = re.search(
+        r'^(%(?:auto)?setup\b[^\n]*)$',
+        spec_content,
+        flags=re.MULTILINE,
+    )
+    if not setup_match:
+        return None
+
+    setup_dir_match = re.search(r'(?<!\S)-n\s+(\S+)', setup_match.group(1))
+    if not setup_dir_match:
+        return None
+
+    setup_dir = setup_dir_match.group(1)
+    if setup_dir.replace('%{version}', version) != expected_dir:
+        return None
+
+    corrected_setup_dir = archive_root
+    version_suffix = f'-{version}'
+    if version and archive_root.endswith(version_suffix):
+        corrected_setup_dir = f'{archive_root[:-len(version_suffix)]}-%{{version}}'
+
+    new_setup_line = setup_match.group(1).replace(
+        setup_dir_match.group(0),
+        f'-n {corrected_setup_dir}',
+        1,
+    )
+    new_content = (
+        spec_content[:setup_match.start(1)]
+        + new_setup_line
+        + spec_content[setup_match.end(1):]
+    )
+    return new_content if new_content != spec_content else None
 
 
 class SpecFileGenerator:

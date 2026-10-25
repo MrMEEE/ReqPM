@@ -67,9 +67,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         
         # Users see their own projects and projects they collaborate on
         return Project.objects.filter(
-            owner=user
-        ) | Project.objects.filter(
-            collaborators__user=user
+            models.Q(owner=user) | models.Q(collaborators__user=user)
         ).distinct()
     
     def get_serializer_class(self):
@@ -393,25 +391,37 @@ class ProjectViewSet(viewsets.ModelViewSet):
         
         project = self.get_object()
         
-        # Get all packages that have spec files
+        # Only fetch packages that have a spec and do not already have sources.
         # Use Exists subquery instead of annotate+filter to avoid
         # 'Cannot combine a unique query with a non-unique query' error
         packages_with_specs = Package.objects.filter(
             project=project,
             id__in=SpecFileRevision.objects.values('package_id').distinct()
         )
-        
-        count = packages_with_specs.count()
-        
-        # Trigger source fetching for each package
-        for package in packages_with_specs:
+
+        packages_to_fetch = [
+            package for package in packages_with_specs
+            if not package.source_fetched
+        ]
+
+        # Trigger source fetching only for missing sources.
+        for package in packages_to_fetch:
             fetch_package_source_task.delay(package.id)
-        
+
+        package_ids = [package.id for package in packages_to_fetch]
+        missing_spec_count = (
+            Package.objects.filter(project=project)
+            .exclude(id__in=SpecFileRevision.objects.values('package_id'))
+            .count()
+        )
+        count = len(package_ids)
         logger.info(f"Triggered source fetching for {count} packages in project {project.id}")
         
         return Response({
             'message': f'Started fetching sources for {count} packages',
-            'count': count
+            'count': count,
+            'package_ids': package_ids,
+            'missing_spec_count': missing_spec_count,
         })
     
     def _get_all_transitive_dependencies(self, packages):

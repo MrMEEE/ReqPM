@@ -122,6 +122,17 @@ start_django() {
 }
 
 # Function to start Celery worker
+get_celery_worker_concurrency() {
+    source "$VENV/bin/activate"
+    local value
+    value=$(python manage.py shell -c "from backend.apps.core.models import SystemSettings; print(SystemSettings.load().celery_worker_concurrency)" 2>/dev/null | tail -n 1)
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ]; then
+        echo "$value"
+    else
+        echo 4
+    fi
+}
+
 start_celery() {
     if is_running "$CELERY_PID"; then
         print_warning "Celery worker is already running (PID: $(cat $CELERY_PID))"
@@ -131,12 +142,15 @@ start_celery() {
     print_status "Starting Celery worker..."
     
     source "$VENV/bin/activate"
+
+    local celery_concurrency
+    celery_concurrency=$(get_celery_worker_concurrency)
     
-    nohup celery -A backend.reqpm worker -l info --concurrency=4 --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
+    nohup celery -A backend.reqpm worker -l info --concurrency="$celery_concurrency" --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
     
     sleep 2
     if is_running "$CELERY_PID"; then
-        print_success "Celery worker started (PID: $(cat $CELERY_PID))"
+        print_success "Celery worker started (PID: $(cat $CELERY_PID)) with concurrency=$celery_concurrency"
     else
         print_error "Failed to start Celery worker"
         return 1
@@ -281,6 +295,15 @@ stop_celery_projects() {
     stop_service "Celery projects worker" "$CELERY_PROJECTS_PID"
 }
 
+reload_workers() {
+    print_status "Reloading Celery workers..."
+    stop_celery
+    stop_celery_projects
+    sleep 1
+    start_celery
+    start_celery_projects
+}
+
 # Function to stop Celery beat
 stop_beat() {
     stop_service "Celery beat" "$CELERY_BEAT_PID"
@@ -411,6 +434,9 @@ restart_service() {
             sleep 1
             start_celery_projects
             ;;
+        workers)
+            reload_workers
+            ;;
         beat)
             stop_beat
             sleep 1
@@ -426,7 +452,7 @@ restart_service() {
             ;;
         *)
             print_error "Unknown service: $service"
-            echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
+            echo "Available: django, redis, celery, celery-projects, workers, beat, frontend, all"
             exit 1
             ;;
     esac
@@ -555,6 +581,9 @@ case "${1:-}" in
     stop-frontend)
         stop_frontend
         ;;
+    reload-workers)
+        reload_workers
+        ;;
     *)
         echo "ReqPM Control Script"
         echo ""
@@ -575,6 +604,7 @@ case "${1:-}" in
         echo "  start-celery, stop-celery"
         echo "  start-beat, stop-beat"
         echo "  start-frontend, stop-frontend"
+        echo "  reload-workers"
         echo ""
         exit 1
         ;;

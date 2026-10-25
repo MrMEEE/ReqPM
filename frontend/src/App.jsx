@@ -17,6 +17,7 @@ import BuildDetail from './pages/BuildDetail';
 import Repositories from './pages/Repositories';
 import Tasks from './pages/Tasks';
 import Settings from './pages/Settings';
+import AiFixerActivity from './pages/AiFixerActivity';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -140,6 +141,17 @@ function App() {
                 <ProtectedRoute>
                   <Layout>
                     <Tasks />
+                  </Layout>
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/ai-fixer"
+              element={
+                <ProtectedRoute>
+                  <Layout>
+                    <AiFixerActivity />
                   </Layout>
                 </ProtectedRoute>
               }

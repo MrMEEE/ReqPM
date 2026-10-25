@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { projectsAPI, buildsAPI } from '../lib/api';
-import { Package, GitBranch, Clock, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
+import { projectsAPI, buildsAPI, settingsAPI } from '../lib/api';
+import { Package, GitBranch, Clock, CheckCircle, XCircle, AlertCircle, Bot } from 'lucide-react';
 
 export default function Dashboard() {
   const { data: projects, isLoading: projectsLoading } = useQuery({
@@ -12,6 +12,16 @@ export default function Dashboard() {
   const { data: builds, isLoading: buildsLoading } = useQuery({
     queryKey: ['builds'],
     queryFn: () => buildsAPI.list({ ordering: '-created_at', page_size: 10 }).then(res => res.data),
+  });
+
+  const {
+    data: aiFixer,
+    isLoading: aiFixerLoading,
+    isError: aiFixerError,
+  } = useQuery({
+    queryKey: ['ai-fixer-packages'],
+    queryFn: () => settingsAPI.aiFixerPackages().then(res => res.data),
+    refetchInterval: 10000,
   });
 
   const stats = [
@@ -175,6 +185,82 @@ export default function Dashboard() {
             <div className="text-center py-8 text-gray-400">
               <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
               <p>No builds yet.</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* AI Fixer In Process */}
+      <div className="bg-gray-800 rounded-lg shadow-lg border border-gray-700">
+        <div className="p-6 border-b border-gray-700">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <Bot className="text-blue-400" size={20} />
+              <h2 className="text-xl font-semibold text-white">AI Fixer In Process</h2>
+            </div>
+            <div className="flex items-center space-x-4">
+              <div className="text-sm text-gray-400">
+                Slots {aiFixer?.active_count ?? 0}/{aiFixer?.max_concurrent ?? 0}
+              </div>
+              <Link
+                to="/ai-fixer"
+                className="text-sm text-blue-400 hover:text-blue-300"
+              >
+                Open activity →
+              </Link>
+            </div>
+          </div>
+        </div>
+        <div className="p-6">
+          {aiFixerLoading ? (
+            <div className="flex justify-center py-8">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+            </div>
+          ) : aiFixerError ? (
+            <div className="text-center py-6 text-red-300">
+              <AlertCircle size={32} className="mx-auto mb-3 opacity-70" />
+              <p>Could not load AI fixer activity right now.</p>
+            </div>
+          ) : aiFixer?.enabled === false ? (
+            <div className="text-center py-6 text-gray-400">
+              <AlertCircle size={32} className="mx-auto mb-3 opacity-60" />
+              <p>AI fixer is disabled in settings.</p>
+              <Link
+                to="/settings"
+                className="mt-3 inline-block text-sm text-blue-400 hover:text-blue-300"
+              >
+                Open settings →
+              </Link>
+            </div>
+          ) : aiFixer?.packages?.length > 0 ? (
+            <div className="space-y-3">
+              {aiFixer.packages.map((pkg) => (
+                <Link
+                  key={pkg.id}
+                  to={`/packages/${pkg.id}`}
+                  className="block p-4 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors"
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-medium text-white">{pkg.name} {pkg.version || ''}</h3>
+                      <p className="text-sm text-gray-400 mt-1">
+                        {pkg.project_name || `Project #${pkg.project_id}`}
+                      </p>
+                      {pkg.last_ai_log ? (
+                        <p className="text-xs text-gray-500 mt-2 line-clamp-1">{pkg.last_ai_log}</p>
+                      ) : null}
+                    </div>
+                    <span className="px-2 py-1 text-xs font-medium text-white rounded bg-blue-500">
+                      In process
+                    </span>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-gray-400">
+              <CheckCircle size={36} className="mx-auto mb-3 opacity-70 text-green-400" />
+              <p>No packages are currently in AI fixer processing.</p>
             </div>
           )}
         </div>

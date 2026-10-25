@@ -319,8 +319,20 @@ function CreateProjectModal({ onClose, onSuccess }) {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    console.log('Submitting project data:', formData);
-    createMutation.mutate(formData);
+    const selected = [...(formData.rhel_versions || [])]
+      .map((v) => String(v).trim())
+      .filter(Boolean)
+      .sort((a, b) => Number(a) - Number(b));
+
+    const primary = selected.length ? selected[selected.length - 1] : '9';
+    const payload = {
+      ...formData,
+      rhel_versions: selected,
+      rhel_version: primary,
+    };
+
+    console.log('Submitting project data:', payload);
+    createMutation.mutate(payload);
   };
 
   return (

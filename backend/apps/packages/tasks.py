@@ -5,6 +5,7 @@ from celery import shared_task
 from django.conf import settings
 import logging
 import os
+import time
 
 from backend.core.spec_generator import SpecFileGenerator
 from backend.core.pypi_client import PyPIClient
@@ -619,7 +620,7 @@ def check_package_updates_task(project_id: int):
     return updates_found
 
 
-@shared_task(bind=True, name='fetch_package_source_task')
+@shared_task(bind=True, name='fetch_package_source_task', max_retries=12)
 def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
     """
     Fetch source files for a package
@@ -672,7 +673,12 @@ def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
                 sources_dir=str(sources_dir)
             )
             
-            if fetch_result.success:
+            archive_extensions = ('.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.zip', '.whl')
+            has_source_archive = any(
+                path.is_file() and path.name.lower().endswith(archive_extensions)
+                for path in sources_dir.iterdir()
+            )
+            if fetch_result.success and has_source_archive:
                 log_project(package.project_id, 'debug', f"Sources fetched for {package.name}")
                 log_package(package_id, 'info', f"Sources successfully fetched")
                 logger.info(f"Sources fetched for package {package_id}")
@@ -693,16 +699,24 @@ def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
                     except Exception as build_err:
                         logger.warning(f"Failed to auto-queue build after fetch for package {package_id}: {build_err}")
             else:
-                log_project(package.project_id, 'error', f"Failed to fetch sources for {package.name}: {fetch_result.error_message}")
-                log_package(package_id, 'error', f"Source fetching failed: {fetch_result.error_message}")
-                logger.error(f"Source fetching failed for package {package_id}: {fetch_result.error_message}")
+                error_message = fetch_result.error_message or (
+                    'Source fetch completed without producing a source archive'
+                    if fetch_result.success
+                    else 'Unknown source fetch error'
+                )
+                log_project(package.project_id, 'error', f"Failed to fetch sources for {package.name}: {error_message}")
+                log_package(package_id, 'error', f"Source fetching failed: {error_message}")
+                logger.error(f"Source fetching failed for package {package.name}: {error_message}")
     
     except TimeoutError as e:
         # Could not acquire job slot
         log_package(package_id, 'warning', f"Waiting for available job slot: {str(e)}")
         logger.warning(f"Source fetch {package_id} could not acquire slot: {e}")
-        # Retry the task
-        raise self.retry(exc=e, countdown=60)
+        raise self.retry(
+            exc=e,
+            countdown=min(30 * (2 ** self.request.retries), 300),
+            max_retries=12,
+        )
         
     except Package.DoesNotExist:
         logger.error(f"Package {package_id} not found")
@@ -736,11 +750,14 @@ def build_single_package_task(self, package_id: int):
             project = package.project
             rhel_version = project.rhel_version
             
+            # Preserve the previous attempt while preparing a clean build log.
+            package.archive_build_logs()
             # Update status to pending
             package.build_status = 'pending'
             package.build_started_at = None
             package.build_completed_at = None
             package.build_log = ''
+            package.build_root_log = ''
             package.build_error_message = ''
             package.build_dependency_repo_url = ''
             package.srpm_path = ''
@@ -782,14 +799,15 @@ def build_single_package_task(self, package_id: int):
             ).order_by('-created_at').first()
             
             if not spec_revision:
-                package.build_status = 'failed'
+                package.build_status = 'pending'
                 package.build_completed_at = timezone.now()
-                package.build_error_message = "No spec file found"
+                package.build_error_message = 'No spec file found - queued spec generation'
                 package.save()
                 send_package_update(package_id)
-                log_project(project.id, 'error', f"Build failed for {package.name}: No spec file")
-                log_package(package_id, 'error', "No spec file found")
-                logger.error(f"No spec file for package {package_id}")
+                log_project(project.id, 'warning', f"Spec missing for {package.name}; queued spec generation and rebuild")
+                log_package(package_id, 'warning', 'No spec file found - queued spec generation and rebuild')
+                logger.warning(f"No spec file for package {package_id}; queuing generation")
+                generate_spec_file_task.delay(package_id, force=True, auto_fetch=False, auto_build=True)
                 return
 
             spec_revision = _ensure_spec_source0_macro(package, spec_revision, reason='build-start')
@@ -974,14 +992,23 @@ def build_single_package_task(self, package_id: int):
             )
             
             if not srpm_result.success:
-                # Check if this is a directory mismatch error that can be auto-fixed
-                if _detect_and_fix_directory_mismatch(package_id, srpm_result.log_output or ''):
+                # Check if this is a spec-stage issue that can be auto-fixed
+                srpm_log = srpm_result.log_output or ''
+                fixed_srpm_spec_issue = not _has_unavailable_build_dependencies(
+                    package, srpm_log, srpm_result.root_log_output or '',
+                ) and (
+                    _detect_and_fix_directory_mismatch(package_id, srpm_log)
+                    or _detect_and_fix_pyproject_save_files_invalid_m_option(package_id, srpm_log)
+                )
+                if fixed_srpm_spec_issue:
                     # Spec file was regenerated, retry the build
-                    logger.info(f"Retrying build for {package.name} after fixing directory mismatch")
+                    logger.info(f"Retrying build for {package.name} after fixing SRPM-stage spec issue")
                     log_package(package_id, 'info', 'Retrying build with regenerated spec file...')
                     
-                    # Clear build log and old disk log files before retry
-                    package.build_log = ''
+                    # Preserve the failed attempt before starting a clean retry.
+                    package.build_log = srpm_result.log_output or ''
+                    package.build_root_log = srpm_result.root_log_output or ''
+                    package.archive_build_logs()
                     package.save()
                     _delete_build_log_files(build_dir)
                     
@@ -1011,7 +1038,7 @@ def build_single_package_task(self, package_id: int):
                         
                         # If it still fails after retry, fall through to normal error handling
                         if not srpm_result.success:
-                            logger.warning(f"SRPM build still failed after directory mismatch fix for {package.name}")
+                            logger.warning(f"SRPM build still failed after SRPM-stage spec fix for {package.name}")
                 
                 # If still failing (or wasn't a directory mismatch), handle as normal error
                 if not srpm_result.success:
@@ -1035,6 +1062,7 @@ def build_single_package_task(self, package_id: int):
                     missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
                     if any(e.get('category') in missing_cats for e in package.analyzed_errors):
                         package.build_status = _resolve_missing_dep_status(package, project)
+                        package.save()
                         # Auto-add missing dependencies to transitive dependency list
                         try:
                             auto_add_missing_dependencies(package_id)
@@ -1069,12 +1097,13 @@ def build_single_package_task(self, package_id: int):
             send_package_update(package_id)
 
             arch = 'x86_64'
+            build_unique_ext = f"pkg{package_id}-{int(time.time() * 1000)}"
             rpm_result = builder.build_rpm(
                 srpm_path=srpm_result.srpm_path,
                 output_dir=str(build_dir / 'RPMS'),
                 target=target,
                 arch=arch,
-                unique_ext=f"pkg{package_id}",
+                unique_ext=build_unique_ext,
                 local_repo_dir=local_repo_dir,
                 project_id=project.id,
             )
@@ -1086,78 +1115,77 @@ def build_single_package_task(self, package_id: int):
             _ai_fix_count = 0
             _fix_attempt = 0
             _MAX_FIX_ATTEMPTS = 10  # safety cap
+            ai_fix_revision_ids: list[int] = []
+            _autofix_state = _new_autofix_state(package)
             while not rpm_result.success and _fix_attempt < _MAX_FIX_ATTEMPTS:
+                if _has_unavailable_build_dependencies(
+                    package, rpm_result.log_output or '', rpm_result.root_log_output or '',
+                ):
+                    log_package(
+                        package_id, 'info',
+                        'Build dependencies are unavailable; resolving dependencies before spec or AI fixes',
+                    )
+                    break
+
+                if package.build_status != 'fixing':
+                    package.build_status = 'fixing'
+                    package.save(update_fields=['build_status'])
+                    send_package_update(package_id)
+
+                package.build_log = rpm_result.log_output or ''
+                package.build_root_log = rpm_result.root_log_output or ''
+                package.save(update_fields=['build_log', 'build_root_log'])
+
                 if not _has_fixable_build_signals(rpm_result.log_output or '', rpm_result.root_log_output or ''):
                     logger.warning(
                         f"Skipping auto-fix loop for {package.name}: logs do not contain fixable failure signals"
                     )
                     break
 
-                fixed = False
-                if _detect_and_fix_directory_mismatch(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_missing_build_files(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_unpackaged_files(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_missing_files_section_paths(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_invalid_buildrequires(
-                    package_id,
-                    (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or ''),
-                ):
-                    fixed = True
-                elif _detect_and_fix_missing_distinfo_glob(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_wrong_module_glob(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_missing_header_files(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_noarch_sitearch_mismatch(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_pyproject_save_files_auto(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_sitearch_files_entry(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_duplicate_files_and_empty_debugsource(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_spec_errors(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_self_buildrequires(package_id, rpm_result.log_output or '',
-                                                        rpm_result.root_log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_bad_setuptools_requires(package_id, rpm_result.log_output or '',
-                                                             rpm_result.root_log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_no_pip_in_chroot(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_pyproject_buildrequires_no_runtime(
-                    package_id,
-                    (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or ''),
-                ):
-                    fixed = True
-                elif _detect_and_fix_extras_in_buildrequires(
-                    package_id,
-                    (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or ''),
-                    rpm_result.root_log_output or '',
-                ):
-                    fixed = True
-                elif _detect_and_fix_vcs_version_failure(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_platformdirs_version_tuple(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                elif _detect_and_fix_rustc_version_mismatch(
-                    package_id,
-                    (rpm_result.log_output or '') + '\n' + (rpm_result.root_log_output or ''),
-                ):
-                    fixed = True
-                elif _detect_and_fix_missing_cc_linker(package_id, rpm_result.log_output or ''):
-                    fixed = True
-                # Last resort: AI-assisted fix (only if enabled in settings)
-                elif _detect_and_fix_with_ai(package_id, rpm_result.log_output or '',
-                                             rpm_result.root_log_output or '', _ai_fix_count):
-                    fixed = True
+                _log = rpm_result.log_output or ''
+                _root = rpm_result.root_log_output or ''
+                _both = _log + '\n' + _root
+                fixers = [
+                    ('directory_mismatch', lambda: _detect_and_fix_directory_mismatch(package_id, _log)),
+                    ('missing_build_files', lambda: _detect_and_fix_missing_build_files(package_id, _log)),
+                    ('unpackaged_files', lambda: _detect_and_fix_unpackaged_files(package_id, _log)),
+                    ('missing_files_section_paths', lambda: _detect_and_fix_missing_files_section_paths(package_id, _log)),
+                    ('invalid_buildrequires', lambda: _detect_and_fix_invalid_buildrequires(package_id, _both)),
+                    ('missing_distinfo_glob', lambda: _detect_and_fix_missing_distinfo_glob(package_id, _log)),
+                    ('pyproject_save_files_invalid_m', lambda: _detect_and_fix_pyproject_save_files_invalid_m_option(package_id, _log)),
+                    ('wrong_module_glob', lambda: _detect_and_fix_wrong_module_glob(package_id, _log)),
+                    ('missing_header_files', lambda: _detect_and_fix_missing_header_files(package_id, _log)),
+                    ('noarch_sitearch_mismatch', lambda: _detect_and_fix_noarch_sitearch_mismatch(package_id, _log)),
+                    ('pyproject_save_files_auto', lambda: _detect_and_fix_pyproject_save_files_auto(package_id, _log)),
+                    ('sitearch_files_entry', lambda: _detect_and_fix_sitearch_files_entry(package_id, _log)),
+                    ('ambiguous_python_shebang', lambda: _detect_and_fix_ambiguous_python_shebang(package_id, _log)),
+                    ('duplicate_files_empty_debugsource', lambda: _detect_and_fix_duplicate_files_and_empty_debugsource(package_id, _log)),
+                    ('spec_errors', lambda: _detect_and_fix_spec_errors(package_id, _log)),
+                    ('self_buildrequires', lambda: _detect_and_fix_self_buildrequires(package_id, _log, _root)),
+                    ('bad_setuptools_requires', lambda: _detect_and_fix_bad_setuptools_requires(package_id, _log, _root)),
+                    ('no_pip_in_chroot', lambda: _detect_and_fix_no_pip_in_chroot(package_id, _log)),
+                    ('pyproject_buildrequires_no_runtime', lambda: _detect_and_fix_pyproject_buildrequires_no_runtime(package_id, _both)),
+                    ('pyproject_license_keyerror', lambda: _detect_and_fix_pyproject_license_keyerror(package_id, _both)),
+                    ('extras_in_buildrequires', lambda: _detect_and_fix_extras_in_buildrequires(package_id, _both, _root)),
+                    ('dependency_runtime_requires', lambda: _detect_and_fix_dependency_runtime_requires(package_id, _log, _root)),
+                    ('vcs_version_failure', lambda: _detect_and_fix_vcs_version_failure(package_id, _log)),
+                    ('platformdirs_version_tuple', lambda: _detect_and_fix_platformdirs_version_tuple(package_id, _log)),
+                    ('rustc_version_mismatch', lambda: _detect_and_fix_rustc_version_mismatch(package_id, _both)),
+                    ('missing_cc_linker', lambda: _detect_and_fix_missing_cc_linker(package_id, _log)),
+                    ('missing_c_compiler', lambda: _detect_and_fix_missing_c_compiler(package_id, _both)),
+                    # Last resort: AI-assisted fix (only if enabled in settings)
+                    (_AI_FIXER_NAME, lambda: _detect_and_fix_with_ai(package_id, _log, _root, _ai_fix_count)),
+                ]
+                applied_fixer = _run_autofix_round(package, fixers, _autofix_state)
+                fixed = applied_fixer is not None
+                if applied_fixer == _AI_FIXER_NAME:
                     _ai_fix_count += 1
+                    ai_revision = SpecFileRevision.objects.filter(
+                        package=package,
+                        commit_message__startswith='AI-fixed:',
+                    ).order_by('-created_at', '-id').first()
+                    if ai_revision and ai_revision.id not in ai_fix_revision_ids:
+                        ai_fix_revision_ids.append(ai_revision.id)
 
                 if not fixed:
                     break
@@ -1166,8 +1194,8 @@ def build_single_package_task(self, package_id: int):
                 logger.info(f"Retrying build for {package.name} after auto-fix (attempt {_fix_attempt})")
                 log_package(package_id, 'info', f'Retrying full build with regenerated spec file (attempt {_fix_attempt})...')
 
-                # Clear build log and old disk log files before retry
-                package.build_log = ''
+                # Preserve the failed attempt and clear old disk logs before retry.
+                package.archive_build_logs()
                 package.save()
                 _delete_build_log_files(build_dir)
 
@@ -1195,6 +1223,10 @@ def build_single_package_task(self, package_id: int):
                     log_package(package_id, 'warning', 'Spec missing subdirectory search logic')
 
                 logger.info(f"Rebuilding SRPM for {package.name} from {spec_file}")
+                if package.build_status != 'building':
+                    package.build_status = 'building'
+                    package.save(update_fields=['build_status'])
+                    send_package_update(package_id)
                 log_package(package_id, 'info', "Rebuilding SRPM with fixed spec...")
                 srpm_result = builder.build_srpm(
                     spec_file=str(spec_file),
@@ -1205,17 +1237,18 @@ def build_single_package_task(self, package_id: int):
 
                 if not srpm_result.success:
                     logger.warning(f"SRPM rebuild failed after auto-fix for {package.name}")
-                    rpm_result.success = False
+                    rpm_result = srpm_result
                     break
 
                 logger.info(f"Rebuilding RPM for {package.name}")
                 log_package(package_id, 'info', "Rebuilding RPM...")
+                build_unique_ext = f"pkg{package_id}-{int(time.time() * 1000)}"
                 rpm_result = builder.build_rpm(
                     srpm_path=srpm_result.srpm_path,
                     output_dir=str(build_dir / 'RPMS'),
                     target=target,
                     arch=arch,
-                    unique_ext=f"pkg{package_id}",
+                    unique_ext=build_unique_ext,
                     local_repo_dir=local_repo_dir,
                     project_id=project.id,
                 )
@@ -1244,6 +1277,7 @@ def build_single_package_task(self, package_id: int):
                 missing_cats = {'Missing Packages', 'Missing Dependencies', 'Missing Python Modules', 'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'}
                 if any(e.get('category') in missing_cats for e in package.analyzed_errors):
                     package.build_status = _resolve_missing_dep_status(package, project)
+                    package.save()
                     # Auto-add missing dependencies to transitive dependency list
                     try:
                         auto_add_missing_dependencies(package_id)
@@ -1287,6 +1321,12 @@ def build_single_package_task(self, package_id: int):
                 logger.warning(f"Error analyzing build log for {package.name}: {analyze_err}")
                 package.analyzed_errors = []
             package.save()
+            try:
+                _confirm_successful_ai_fixes(package_id, ai_fix_revision_ids)
+            except Exception:
+                logger.exception(
+                    f"Build succeeded for {package.name}, but AI fix feedback could not be confirmed"
+                )
             send_package_update(package_id)
 
             # Add newly built RPMs to the project-local repo so subsequent
@@ -1349,22 +1389,119 @@ def _delete_build_log_files(build_dir):
                     logger.warning(f"Could not delete {log_path}: {e}")
 
 
+_AI_FIXER_NAME = 'ai'
+# A rule-based fixer may fire at most this many times per build run; after
+# that the loop moves on to other fixers (and finally the AI fixer).
+_MAX_APPLICATIONS_PER_FIXER = 3
+_TRIED_SPEC_HISTORY = 30
+
+
+def _spec_fingerprint(content: str) -> str:
+    import hashlib
+    normalized = '\n'.join(line.rstrip() for line in (content or '').strip().splitlines())
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+
+def _new_autofix_state(package) -> dict:
+    """Build per-run autofix state seeded with spec states already tried.
+
+    Seeds from revisions since the latest freshly generated spec so fixes that
+    already failed in earlier build runs are not reapplied either.
+    """
+    from backend.apps.packages.models import SpecFileRevision
+
+    revisions = SpecFileRevision.objects.filter(package=package)
+    latest_initial = revisions.filter(
+        commit_message__startswith='Initial spec file generated',
+    ).order_by('-created_at').values_list('created_at', flat=True).first()
+    if latest_initial:
+        revisions = revisions.filter(created_at__gte=latest_initial)
+    contents = revisions.order_by('-created_at').values_list('content', flat=True)[:_TRIED_SPEC_HISTORY]
+    return {
+        'tried_specs': {_spec_fingerprint(c) for c in contents},
+        'fixer_counts': {},
+        'exhausted': set(),
+    }
+
+
+def _run_autofix_round(package, fixers, state) -> str | None:
+    """Run fixers in order and return the name of the first one that made progress.
+
+    A fixer that recreates a spec already tried (in this or earlier runs) has its
+    revision discarded and is skipped for the rest of the run, so the loop falls
+    through to the next fixer and ultimately to the AI fixer.
+    """
+    from backend.apps.packages.models import SpecFileRevision
+
+    def _latest():
+        return SpecFileRevision.objects.filter(package=package).order_by('-created_at', '-id').first()
+
+    for name, fixer in fixers:
+        if name in state['exhausted']:
+            continue
+        if name != _AI_FIXER_NAME and state['fixer_counts'].get(name, 0) >= _MAX_APPLICATIONS_PER_FIXER:
+            state['exhausted'].add(name)
+            log_package(package.id, 'warning',
+                        f'Auto-fixer "{name}" already applied {_MAX_APPLICATIONS_PER_FIXER} times without success; trying other fixes')
+            continue
+
+        before = _latest()
+        try:
+            applied = fixer()
+        except Exception as e:
+            logger.error(f'Auto-fixer {name} raised for {package.name}: {e}')
+            applied = False
+        if not applied:
+            continue
+
+        after = _latest()
+        if after and (before is None or after.id != before.id):
+            fingerprint = _spec_fingerprint(after.content)
+            if fingerprint in state['tried_specs']:
+                logger.warning(f'Auto-fixer {name} recreated an already-tried spec for {package.name}; discarding')
+                log_package(package.id, 'warning',
+                            f'Auto-fixer "{name}" produced a spec that was already tried; skipping it and trying other fixes')
+                after.delete()
+                state['exhausted'].add(name)
+                continue
+            state['tried_specs'].add(fingerprint)
+
+        state['fixer_counts'][name] = state['fixer_counts'].get(name, 0) + 1
+        return name
+    return None
+
+
+def _find_package_source_archives(package) -> list:
+    """Return source archives for the package's current version (build dir first)."""
+    from pathlib import Path
+
+    build_dir = Path(settings.REQPM['BUILD_DIR']) / 'package_builds' / str(package.id)
+    source_dir = Path(settings.REQPM['BUILD_DIR']) / 'sources' / package.name
+    archive_suffixes = ('.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.zip')
+    archives = []
+    for directory in (build_dir, source_dir):
+        if not directory.is_dir():
+            continue
+        archives.extend(
+            path for path in sorted(directory.iterdir())
+            if path.is_file()
+            and package.version in path.name
+            and path.name.lower().endswith(archive_suffixes)
+        )
+    return list(dict.fromkeys(archives))
+
+
 def _detect_and_fix_directory_mismatch(package_id: int, build_log: str):
     """
     Detect if build failed due to directory name mismatch (cd: <dir>: No such file).
-    This happens when PyPI normalizes package names (hyphens/dots to underscores) but
-    spec file still expects original name.
-    
-    If detected, regenerates the spec file with corrected directory name and returns True.
+    Update the spec's %setup directory from the source archive instead of
+    regenerating the same spec from PyPI metadata.
     Returns False if not a directory mismatch error or fix failed.
     """
     import re
-    import importlib
+    from pathlib import Path
     from backend.apps.packages.models import Package, SpecFileRevision
-    import backend.core.spec_generator as spec_gen_module
-    
-    # Force reload to pick up any code changes
-    importlib.reload(spec_gen_module)
+    from backend.core.spec_generator import fix_setup_directory, get_source_archive_root
     
     logger.info(f"Checking for directory mismatch in package {package_id}")
     
@@ -1381,34 +1518,48 @@ def _detect_and_fix_directory_mismatch(package_id: int, build_log: str):
     
     try:
         package = Package.objects.get(id=package_id)
-        
-        # Directory mismatch detected - regenerate spec with fallback logic
-        # This handles both old specs (with %autosetup) and ensures new specs have fallback
-        logger.info(f"Regenerating spec file for {package.name} to fix directory mismatch...")
-        log_package(package_id, 'info', 'Regenerating spec file to fix directory mismatch...')
-        
-        # Regenerate spec file synchronously using SpecFileGenerator
-        generator = spec_gen_module.SpecFileGenerator()
-        new_spec_content = generator.generate_spec(
-            package_name=package.name,
-            version=package.version,
-            python_name=package.python_name
-        )
-        
-        if new_spec_content:
-            # Create a new spec revision
-            new_revision = SpecFileRevision.objects.create(
-                package=package,
-                content=new_spec_content,
-                commit_message='Auto-regenerated to fix directory name mismatch with fallback logic'
-            )
-            logger.info(f"Successfully regenerated spec file for {package.name}")
-            log_package(package_id, 'info', 'Auto-regenerated spec with directory fallback logic')
-            return True
-        else:
-            logger.warning(f"Failed to generate new spec content for {package.name}")
+
+        current_revision = SpecFileRevision.objects.filter(
+            package=package
+        ).order_by('-created_at').first()
+        if not current_revision:
             return False
-        
+
+        archive_root = None
+        for archive in _find_package_source_archives(package):
+            archive_root = get_source_archive_root(archive)
+            if archive_root:
+                break
+
+        if not archive_root:
+            logger.warning(f'Could not determine a safe source directory for {package.name}')
+            log_package(package_id, 'warning', 'Could not fix directory mismatch: source directory is unknown')
+            return False
+
+        new_spec_content = fix_setup_directory(
+            current_revision.content,
+            expected_dir,
+            archive_root,
+            package.version,
+        )
+        if new_spec_content is None:
+            logger.warning(f'Could not update %setup directory for {package.name}')
+            log_package(package_id, 'warning', 'Could not fix directory mismatch in the current spec; stopping retries')
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_spec_content,
+            commit_message=f'Auto-fixed %setup directory to match source archive ({archive_root})',
+        )
+        logger.info(f'Corrected %setup directory for {package.name} to match source archive {archive_root}')
+        log_package(
+            package_id,
+            'info',
+            f'Auto-fixed %setup directory to match source archive: {archive_root}',
+        )
+        return True
+
     except Exception as e:
         logger.error(f"Error in directory mismatch detection/fix for package {package_id}: {e}")
         log_package(package_id, 'error', f'Error in auto-fix: {e}')
@@ -1821,8 +1972,8 @@ def _detect_and_fix_spec_errors(package_id: int, build_log: str) -> bool:
 
 def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
     """
-    Detect the 'Globs did not match any module: <name>' error from
-    pyproject_save_files and fix the spec by replacing the bad glob with +auto.
+    Detect pyproject_save_files module-glob failures and rewrite to a better
+    module guess derived from build logs/spec context.
 
     This happens for namespace packages (e.g. poetry-core installs as
     poetry/core/ not poetry_core/) where the dist-info name doesn't match
@@ -1855,6 +2006,19 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
             logger.warning(f"No spec file found for package {package_id}")
             return False
 
+        # Common broken shape produced by previous fix attempts:
+        #   %pyproject_save_files +auto <module>
+        # Keep normalizing this first so we can rebuild the line from a better
+        # module inference below.
+        normalized_auto_spec, normalized_auto_count = re.subn(
+            r'^\s*%pyproject_save_files\s+\+auto\s+[^\s#]+\s*$',
+            '%pyproject_save_files +auto',
+            current_spec.content,
+            flags=re.MULTILINE,
+            count=1,
+        )
+        working_spec = normalized_auto_spec if normalized_auto_count else current_spec.content
+
         fixer = SpecFixer()
         recent_specs = list(
             SpecFileRevision.objects.filter(package=package)
@@ -1877,7 +2041,17 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
         seen = set()
         matched_items = [i for i in matched_items if not (i in seen or seen.add(i))]
 
-        new_spec, fixes = fixer._fix_wrong_module_glob(current_spec.content, matched_items)
+        new_spec, fixes = fixer._fix_wrong_module_glob(working_spec, matched_items)
+
+        # Dist-info directory names are often the best module clue for these
+        # failures, e.g. "python_tss_sdk-2.0.0.dist-info" -> python_tss_sdk.
+        dist_info_candidates = []
+        for m in re.findall(r'/site-packages/([A-Za-z0-9_.+-]+)\.dist-info/INSTALLER', build_log):
+            # Strip trailing version segment from the dist-info directory name.
+            m = re.sub(r'-\d[^/]*$', '', m)
+            cand = re.sub(r'[-.]', '_', m).strip('_')
+            if cand and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', cand):
+                dist_info_candidates.append(cand)
 
         # Infer an actual module root from build output so +auto still has a
         # module glob (required by pyproject_save_files on newer RPM macros).
@@ -1895,6 +2069,45 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
 
         bad_globs = {m.lower() for m in matched_items}
 
+        # Globs this fixer already tried for the current version and that still
+        # ended in a glob error must not be suggested again (prevents A->B->A).
+        tried_glob_qs = SpecFileRevision.objects.filter(
+            package=package,
+            commit_message__startswith='Auto-fixed: corrected %pyproject_save_files module glob',
+        )
+        latest_initial = SpecFileRevision.objects.filter(
+            package=package, commit_message__startswith='Initial spec file generated',
+        ).order_by('-created_at').values_list('created_at', flat=True).first()
+        if latest_initial:
+            tried_glob_qs = tried_glob_qs.filter(created_at__gte=latest_initial)
+        tried_glob_specs = tried_glob_qs.order_by('-created_at').values_list('content', flat=True)[:20]
+        for tried_content in tried_glob_specs:
+            m = re.search(r'^\s*%pyproject_save_files\s+([A-Za-z_][A-Za-z0-9_]*)\s*$',
+                          tried_content, flags=re.MULTILINE)
+            if m:
+                bad_globs.add(m.group(1).lower())
+        current_glob = re.search(r'^\s*%pyproject_save_files\s+([A-Za-z_][A-Za-z0-9_]*)\s*$',
+                                 current_spec.content, flags=re.MULTILINE)
+        if current_glob:
+            bad_globs.add(current_glob.group(1).lower())
+
+        # The sdist itself is the most reliable source for the real import
+        # name (e.g. googleapis-common-protos ships the "google" namespace).
+        archive_modules = []
+        try:
+            from backend.core.spec_generator import get_source_top_level_modules
+            for archive in _find_package_source_archives(package):
+                archive_modules = get_source_top_level_modules(archive)
+                if archive_modules:
+                    break
+        except Exception as e:
+            logger.warning(f"Could not inspect source archive modules for {package.name}: {e}")
+        archive_modules = [m for m in archive_modules if m.lower() not in bad_globs]
+        if archive_modules:
+            module_root = archive_modules[0]
+        elif module_root and module_root.lower() in bad_globs:
+            module_root = None
+
         def _candidate_variants(raw: str) -> list[str]:
             raw = (raw or '').strip()
             base = re.sub(r'[-.]', '_', raw).strip()
@@ -1907,20 +2120,12 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
                 variants.append(lowered)
 
             stripped = re.sub(r'^python3?_', '', base, flags=re.IGNORECASE)
+            stripped = re.sub(r'^python_', '', stripped, flags=re.IGNORECASE)
             if stripped and stripped != base:
                 variants.append(stripped)
                 stripped_lower = stripped.lower()
                 if stripped_lower != stripped:
                     variants.append(stripped_lower)
-
-            for suffix in ('_py', '_api', '_sdk', '_client', '_core'):
-                if stripped.endswith(suffix):
-                    shorter = stripped[:-len(suffix)]
-                    if shorter:
-                        variants.append(shorter)
-                        shorter_lower = shorter.lower()
-                        if shorter_lower != shorter:
-                            variants.append(shorter_lower)
 
             parts = [p for p in stripped.split('_') if p]
             if len(parts) >= 2:
@@ -1966,6 +2171,7 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
                 dist_from_specifier = re.sub(r'[-.]', '_', m.group(1)).lower()
 
             raw_candidates = []
+            raw_candidates.extend(dist_info_candidates)
             raw_candidates.extend(matched_items)
             raw_candidates.extend([
                 package.python_name or '',
@@ -1994,10 +2200,11 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
         # In this environment, bare +auto is rejected by pyproject_save_files.
         # Convert any +auto form to a concrete module glob when we can infer one.
         if '%pyproject_save_files +auto' in new_spec:
-            fallback_candidates = []
+            fallback_candidates = list(archive_modules)
             for raw in (
-                *matched_items,
                 module_root or '',
+                *dist_info_candidates,
+                *matched_items,
                 package.python_name or '',
                 package.name or '',
             ):
@@ -2028,13 +2235,47 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
                     else:
                         fixes.append(f'Normalized %pyproject_save_files +auto to module glob for this build env: {forced_root}')
 
+        # If the spec still points to a bad glob, force it to the best
+        # dist-info-derived candidate as a final deterministic fallback.
+        if archive_modules:
+            # Authoritative module list from the sdist overrides name guesses.
+            module_globs = ' '.join(archive_modules)
+            replaced_spec, n = re.subn(
+                r'^\s*%pyproject_save_files\s+[^\n]+$',
+                f'%pyproject_save_files {module_globs}',
+                new_spec,
+                flags=re.MULTILINE,
+                count=1,
+            )
+            if n and replaced_spec != new_spec:
+                new_spec = replaced_spec
+                fixes.append(f'Set %pyproject_save_files module from source archive: {module_globs}')
+        elif dist_info_candidates and matched_items:
+            bad_glob_set = set(bad_globs)
+            forced_root = None
+            for cand in dist_info_candidates:
+                if cand.lower() not in bad_glob_set:
+                    forced_root = cand
+                    break
+            if forced_root and re.search(r'^\s*%pyproject_save_files\s+[^\n]+$', new_spec, flags=re.MULTILINE):
+                replaced_spec, n = re.subn(
+                    r'^\s*%pyproject_save_files\s+[^\n]+$',
+                    f'%pyproject_save_files {forced_root}',
+                    new_spec,
+                    flags=re.MULTILINE,
+                    count=1,
+                )
+                if n:
+                    new_spec = replaced_spec
+                    fixes.append(f'Set %pyproject_save_files module from dist-info: {forced_root}')
+
         # Avoid creating duplicate revisions when the final content is unchanged.
         if new_spec == current_spec.content:
             logger.info(f"Wrong module glob fixer produced no net spec changes for {package.name}")
             return False
 
         # Guard against a ping-pong loop where this fixer alternates between
-        # two previously tried %pyproject_save_files forms.
+        # previously tried %pyproject_save_files forms.
         if new_spec in recent_specs[1:]:
             logger.warning(
                 f"Wrong module glob fixer refusing to recreate a recent spec state for {package.name}"
@@ -2053,7 +2294,7 @@ def _detect_and_fix_wrong_module_glob(package_id: int, build_log: str) -> bool:
         SpecFileRevision.objects.create(
             package=package,
             content=new_spec,
-            commit_message=f'Auto-fixed: replaced bad %pyproject_save_files glob with +auto ({"; ".join(fixes)})'
+            commit_message=f'Auto-fixed: corrected %pyproject_save_files module glob ({"; ".join(fixes)})'
         )
         log_package(package_id, 'info', f'Auto-fixed spec: {"; ".join(fixes)}')
         return True
@@ -2097,6 +2338,13 @@ def _detect_and_fix_missing_files_section_paths(package_id: int, build_log: str)
             removal_targets.add(path)
             if path.startswith('/usr/bin/'):
                 removal_targets.add(f'%{{_bindir}}/{path.split("/usr/bin/", 1)[1]}')
+            # Map concrete buildroot site-packages paths back to common RPM macros.
+            marker = '/site-packages/'
+            if marker in path:
+                rel = path.split(marker, 1)[1].lstrip('/')
+                if rel:
+                    removal_targets.add(f'%{{python3_sitearch}}/{rel}')
+                    removal_targets.add(f'%{{python3_sitelib}}/{rel}')
             if 'debugsourcefiles.list' in path:
                 for line in spec_lines:
                     if 'debugsourcefiles.list' in line:
@@ -2168,6 +2416,9 @@ def _detect_and_fix_invalid_buildrequires(package_id: int, build_log: str) -> bo
                 'python3-python3dist',
                 'python3dist',
                 'python3-venv',
+                'python3-python3',
+                'python2-python2',
+                'python-python',
             }
             if (item or '').strip().lower() in bad_aliases:
                 return ''
@@ -2183,6 +2434,9 @@ def _detect_and_fix_invalid_buildrequires(package_id: int, build_log: str) -> bo
                     base = base[:-6]
                     if not base:
                         return None
+                    # Handle invalid distro aliases like python3-3.10-devel.
+                    if re.match(r'^\d+(?:\.\d+)+$', base):
+                        return 'BuildRequires: python-devel'
                 if base == 'pyjwt-crypto':
                     base = 'pyjwt'
                 if base == 'openssl':
@@ -2281,7 +2535,13 @@ def _detect_and_fix_invalid_buildrequires(package_id: int, build_log: str) -> bo
 def _detect_and_fix_missing_distinfo_glob(package_id: int, build_log: str) -> bool:
     """
     Detect failures where the pyproject_save_files helper script attempts to
-    touch a non-expanded *.dist-info/INSTALLER path and switch to +auto.
+        touch a non-expanded *.dist-info/INSTALLER path and normalize save-files
+        behavior.
+
+        Strategy:
+        - If spec is using explicit module glob, switch to +auto.
+        - If spec is already +auto and still failing, force an explicit module
+            candidate derived from package naming.
     """
     import re
     from backend.apps.packages.models import Package, SpecFileRevision
@@ -2295,9 +2555,76 @@ def _detect_and_fix_missing_distinfo_glob(package_id: int, build_log: str) -> bo
         if not current_spec:
             return False
 
+        content = current_spec.content
+        if re.search(r'^\s*%pyproject_save_files\s+\+auto\s*$', content, flags=re.MULTILINE):
+            raw_name = (package.python_name or package.name or '').strip()
+            forced_module = re.sub(r'[-.]', '_', raw_name).lower()
+            forced_module = re.sub(r'^python3?_', '', forced_module)
+            forced_module = re.sub(r'^python_', '', forced_module)
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', forced_module):
+                return False
+
+            new_spec, count = re.subn(
+                r'^\s*%pyproject_save_files\s+\+auto\s*$',
+                f'%pyproject_save_files {forced_module}',
+                content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+            commit_message = f'Auto-fixed: switched %pyproject_save_files +auto to explicit module {forced_module} after missing dist-info glob failure'
+            log_message = f'Auto-fixed spec: switched %pyproject_save_files +auto to explicit module {forced_module}'
+        else:
+            new_spec, count = re.subn(
+                r'^%pyproject_save_files\s+(?!\+auto)([^\n]+)$',
+                '%pyproject_save_files +auto',
+                content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+            commit_message = 'Auto-fixed: switched %pyproject_save_files to +auto after missing dist-info glob failure'
+            log_message = 'Auto-fixed spec: switched %pyproject_save_files to +auto'
+
+        if not count or new_spec == content:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_spec,
+            commit_message=commit_message,
+        )
+        log_package(package_id, 'info', log_message)
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in missing_distinfo_glob fix for package {package_id}: {e}")
+        return False
+
+
+def _detect_and_fix_pyproject_save_files_invalid_m_option(package_id: int, build_log: str) -> bool:
+    """Recover when rpm macros do not support `%pyproject_save_files -M`."""
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+
+    text = build_log or ''
+    if "invalid option -- 'M'" not in text and 'Unknown option M in pyproject_save_files()' not in text:
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(package=package).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        raw_name = (package.python_name or package.name or '').strip()
+        forced_module = re.sub(r'[-.]', '_', raw_name).lower()
+        forced_module = re.sub(r'^python3?_', '', forced_module)
+        forced_module = re.sub(r'^python_', '', forced_module)
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', forced_module):
+            return False
+
         new_spec, count = re.subn(
-            r'^%pyproject_save_files\s+(?!\+auto)([^\n]+)$',
-            '%pyproject_save_files +auto',
+            r'^\s*%pyproject_save_files\s+-M\s*$',
+            f'%pyproject_save_files {forced_module}',
             current_spec.content,
             flags=re.MULTILINE,
             count=1,
@@ -2308,13 +2635,12 @@ def _detect_and_fix_missing_distinfo_glob(package_id: int, build_log: str) -> bo
         SpecFileRevision.objects.create(
             package=package,
             content=new_spec,
-            commit_message='Auto-fixed: switched %pyproject_save_files to +auto after missing dist-info glob failure',
+            commit_message=f'Auto-fixed: replaced unsupported %pyproject_save_files -M with module glob {forced_module}',
         )
-        log_package(package_id, 'info', 'Auto-fixed spec: switched %pyproject_save_files to +auto')
+        log_package(package_id, 'info', f'Auto-fixed unsupported -M option by using module glob: {forced_module}')
         return True
-
     except Exception as e:
-        logger.error(f"Error in missing_distinfo_glob fix for package {package_id}: {e}")
+        logger.error(f'Error in _detect_and_fix_pyproject_save_files_invalid_m_option for {package_id}: {e}')
         return False
 
 
@@ -2652,9 +2978,14 @@ def _detect_and_fix_no_pip_in_chroot(package_id: int, build_log: str) -> bool:
 
 def _detect_and_fix_pyproject_buildrequires_no_runtime(package_id: int, build_log: str) -> bool:
     """
-    Some backends cannot provide runtime metadata during %generate_buildrequires,
-    causing failures like:
+        Some backends cannot provide runtime metadata during %generate_buildrequires,
+        causing failures like:
       "The build backend cannot provide build metadata ... use -R flag ..."
+
+        We also see failures where hook-generated runtime metadata is treated as
+        mandatory during buildrequires generation, e.g.:
+            "Handling msal<2,>=1.29 from hook generated metadata: Requires-Dist (...)"
+            "Requirement not satisfied: msal<2,>=1.29"
 
     Fix: ensure %pyproject_buildrequires includes -R.
     """
@@ -2662,8 +2993,16 @@ def _detect_and_fix_pyproject_buildrequires_no_runtime(package_id: int, build_lo
     from backend.apps.packages.models import Package, SpecFileRevision
 
     combined = build_log or ''
-    if 'build backend cannot provide build metadata' not in combined:
+    has_backend_metadata_failure = ('build backend cannot provide build metadata' in combined)
+    has_hook_runtime_unsatisfied = bool(re.search(
+        r'Handling\s+.+\s+from hook generated metadata:\s+Requires-Dist.+\n.*Requirement not satisfied:\s+[^\n]+',
+        combined,
+        re.IGNORECASE,
+    ))
+
+    if not has_backend_metadata_failure and not has_hook_runtime_unsatisfied:
         return False
+
     if '%generate_buildrequires' not in combined and '%pyproject_buildrequires' not in combined:
         return False
 
@@ -2681,7 +3020,7 @@ def _detect_and_fix_pyproject_buildrequires_no_runtime(package_id: int, build_lo
 
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if not stripped.startswith('%pyproject_buildrequires'):
+            if stripped.startswith('#') or '%pyproject_buildrequires' not in stripped:
                 continue
             if re.search(r'(^|\s)-R(\s|$)', line):
                 continue
@@ -2716,6 +3055,52 @@ def _detect_and_fix_pyproject_buildrequires_no_runtime(package_id: int, build_lo
 
     except Exception as e:
         logger.error(f'Error in _detect_and_fix_pyproject_buildrequires_no_runtime for {package_id}: {e}')
+        return False
+
+
+def _detect_and_fix_pyproject_license_keyerror(package_id: int, build_log: str, root_log: str = '') -> bool:
+    """
+    Detect setuptools pyproject license parsing crashes like:
+      KeyError: 'text'
+      ... setuptools/config/_apply_pyprojecttoml.py ... _license
+
+    and route through the existing Invalid Pyproject License fixer.
+    """
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.spec_fixer import SpecFixer
+
+    combined = (build_log or '') + '\n' + (root_log or '')
+    if "KeyError: 'text'" not in combined:
+        return False
+    if '_apply_pyprojecttoml.py' not in combined or '_license' not in combined:
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(package=package).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        fixer = SpecFixer()
+        new_content, fixes = fixer.apply_fixes(
+            current_spec.content,
+            [{'category': 'Invalid Pyproject License', 'items': []}],
+        )
+
+        if new_content == current_spec.content:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_content,
+            commit_message='Auto-fix: normalized pyproject license table format for setuptools parsing',
+        )
+        fix_msg = '; '.join(fixes) if fixes else 'normalized pyproject license format'
+        log_package(package_id, 'info', f'Auto-fixed pyproject license parsing failure: {fix_msg}')
+        logger.info(f'Fixed pyproject license KeyError for {package.name}: {fix_msg}')
+        return True
+    except Exception as e:
+        logger.error(f'Error in _detect_and_fix_pyproject_license_keyerror for {package_id}: {e}')
         return False
 
 
@@ -2767,7 +3152,7 @@ def _detect_and_fix_extras_in_buildrequires(package_id: int, build_log: str, roo
             changed_runtime = False
             for i, line in enumerate(lines):
                 stripped = line.strip()
-                if not stripped.startswith('%pyproject_buildrequires'):
+                if stripped.startswith('#') or '%pyproject_buildrequires' not in stripped:
                     continue
                 if re.search(r'(^|\s)-R(\s|$)', line):
                     continue
@@ -2803,6 +3188,147 @@ def _detect_and_fix_extras_in_buildrequires(package_id: int, build_log: str, roo
     except Exception as e:
         logger.error(f'Error in _detect_and_fix_extras_in_buildrequires for {package_id}: {e}')
         return False
+
+
+def _detect_and_fix_dependency_runtime_requires(package_id: int, build_log: str, root_log: str = '') -> bool:
+    """
+    Detect solver failures where a dependency RPM exists but its runtime
+    Requires are unsatisfiable (often because extras notation leaked into
+    generated python3dist() requirements), then patch that dependency package
+    spec in %prep to normalize pyproject constraints and queue a rebuild.
+
+    Example root.log lines:
+      nothing provides python3.12dist(pbs-installer[download]) >= 2025.6.10
+        needed by python3-poetry-2.4.1-1.el10.noarch ...
+      nothing provides python3.12dist(poetry-core) = 2.4
+        needed by python3-poetry-2.4.1-1.el10.noarch ...
+    """
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+
+    combined = (build_log or '') + '\n' + (root_log or '')
+    if 'nothing provides' not in combined or 'needed by python3-' not in combined:
+        return False
+
+    try:
+        blocked_pkg = Package.objects.get(id=package_id)
+    except Exception:
+        return False
+
+    # offender_name -> {'extras': set[str], 'exact_pins': set[(name, version)]}
+    offenders = {}
+
+    for line in (root_log or '').splitlines():
+        if 'nothing provides' not in line or 'needed by python3-' not in line:
+            continue
+
+        m_needed = re.search(r'needed by\s+python3-([A-Za-z0-9._+-]+)-', line, re.IGNORECASE)
+        m_req = re.search(r'python3(?:\.\d+)?dist\(([^)]+)\)', line, re.IGNORECASE)
+        if not m_needed or not m_req:
+            continue
+
+        offender_name = m_needed.group(1).strip().lower()
+        req_name = m_req.group(1).strip()
+        data = offenders.setdefault(offender_name, {'extras': set(), 'exact_pins': set()})
+
+        if '[' in req_name and ']' in req_name:
+            data['extras'].add(req_name.split('[', 1)[0].strip().lower())
+
+        m_pin = re.search(
+            r'python3(?:\.\d+)?dist\(([^)]+)\)\s*=\s*([0-9]+(?:\.[0-9]+){1,2})',
+            line,
+            re.IGNORECASE,
+        )
+        if m_pin:
+            pin_name = m_pin.group(1).strip().lower()
+            pin_ver = m_pin.group(2).strip()
+            data['exact_pins'].add((pin_name, pin_ver))
+
+    if not offenders:
+        return False
+
+    fixed_any = False
+    for offender_name, data in offenders.items():
+        dep_pkg = Package.objects.filter(project=blocked_pkg.project, name__iexact=offender_name).first()
+        if not dep_pkg:
+            continue
+
+        current_spec = SpecFileRevision.objects.filter(package=dep_pkg).order_by('-created_at').first()
+        if not current_spec:
+            continue
+
+        content = current_spec.content
+        marker = '# Auto-fix: sanitize dependency constraints for local RPM solver compatibility.'
+
+        sed_lines = []
+        for base_name in sorted(data['extras']):
+            escaped = re.escape(base_name)
+            sed_lines.append(
+                f"sed -i -E \"s/{escaped}\\[[^]]+\\]/{base_name}/g\" pyproject.toml"
+            )
+
+        for pin_name, pin_ver in sorted(data['exact_pins']):
+            parts = pin_ver.split('.')
+            if len(parts) == 1:
+                lower = f'{pin_ver}.0.0'
+            elif len(parts) == 2:
+                lower = f'{pin_ver}.0'
+            else:
+                lower = pin_ver
+
+            try:
+                major = int(parts[0])
+            except Exception:
+                continue
+            upper = f'{major + 1}.0'
+
+            escaped_name = re.escape(pin_name)
+            escaped_ver = re.escape(pin_ver)
+            sed_lines.append(
+                f"sed -i -E \"s/{escaped_name}([[:space:]]*)=+([[:space:]]*){escaped_ver}([[:space:]]*)/{pin_name} >= {lower}, < {upper}/g\" pyproject.toml"
+            )
+            sed_lines.append(
+                f"sed -i -E \"s/{escaped_name}([[:space:]]*)\\(([[:space:]]*)=+([[:space:]]*){escaped_ver}(\\.0+)?([[:space:]]*)\\)/{pin_name} (>= {lower}, < {upper})/g\" pyproject.toml"
+            )
+
+        if not sed_lines:
+            continue
+
+        missing_sed_lines = [line for line in sed_lines if line not in content]
+        if not missing_sed_lines:
+            continue
+
+        if marker in content:
+            marker_line = marker
+            marker_with_inserts = marker_line + '\n' + '\n'.join(missing_sed_lines)
+            new_content = content.replace(marker_line, marker_with_inserts, 1)
+        else:
+            setup_match = re.search(r'^(%setup[^\n]*\n)', content, flags=re.MULTILINE)
+            if not setup_match:
+                continue
+            inject = setup_match.group(1) + marker + '\n' + '\n'.join(missing_sed_lines) + '\n'
+            new_content = content.replace(setup_match.group(1), inject, 1)
+
+        if new_content == content:
+            continue
+
+        new_rev = SpecFileRevision.objects.create(
+            package=dep_pkg,
+            content=new_content,
+            commit_message='Auto-fix: sanitize dependency constraints for local RPM solver compatibility',
+        )
+        log_package(
+            package_id,
+            'info',
+            f'Auto-fixed dependency package {dep_pkg.name} spec (rev {new_rev.id}) to normalize runtime dependency constraints; queued rebuild.',
+        )
+        logger.info(
+            f'Patched dependency package {dep_pkg.name} (rev {new_rev.id}) for unsatisfiable runtime requires; source package={blocked_pkg.name}'
+        )
+        build_single_package_task.delay(dep_pkg.id)
+        fixed_any = True
+
+    return fixed_any
 
 
 def _detect_and_fix_vcs_version_failure(package_id: int, build_log: str) -> bool:
@@ -2977,6 +3503,62 @@ def _detect_and_fix_missing_cc_linker(package_id: int, build_log: str) -> bool:
         return False
 
 
+def _detect_and_fix_missing_c_compiler(package_id: int, build_log: str, root_log: str = '') -> bool:
+    """
+    Detect generic C compiler failures in Python/C-extension builds and add
+    compiler BuildRequires.
+
+    Covers patterns like:
+      - Exception: you need a C compiler to build uWSGI
+      - gcc_version split on NoneType in setup probes
+      - unable to execute 'gcc'
+    """
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.spec_fixer import SpecFixer
+
+    combined = (build_log or '') + '\n' + (root_log or '')
+    compiler_missing = (
+        'you need a C compiler to build' in combined
+        or "unable to execute 'gcc'" in combined
+        or "command 'gcc' failed" in combined
+        or (
+            "gcc_version.split" in combined
+            and "AttributeError: 'NoneType' object has no attribute 'split'" in combined
+        )
+        or bool(re.search(r'No such file or directory:\s*[\'\"]g\+\+[\'\"]', combined))
+    )
+    if not compiler_missing:
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(package=package).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        fixer = SpecFixer()
+        new_content, fixes = fixer._add_buildrequires_items(
+            current_spec.content,
+            ['gcc', 'gcc-c++'],
+        )
+        if new_content == current_spec.content:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_content,
+            commit_message='Auto-fix: add gcc/gcc-c++ for missing C compiler failures',
+        )
+        fix_msg = '; '.join(fixes) if fixes else 'added gcc/gcc-c++ BuildRequires'
+        log_package(package_id, 'info', f'Auto-fixed missing C compiler: {fix_msg}')
+        logger.info(f'Fixed missing C compiler for {package.name}: {fix_msg}')
+        return True
+    except Exception as e:
+        logger.error(f'Error in _detect_and_fix_missing_c_compiler for {package_id}: {e}')
+        return False
+
+
 def _detect_and_fix_rustc_version_mismatch(package_id: int, build_log: str) -> bool:
     """
     Detect cargo/maturin failures caused by distro rustc being too old, e.g.:
@@ -3058,8 +3640,27 @@ def _detect_and_fix_noarch_sitearch_mismatch(package_id: int, build_log: str) ->
         re.search(r'Directory not found: .*?/usr/lib/python\d+\.\d+/site-packages/', combined)
     )
     has_sitearch_path = '/usr/lib64/python' in combined
+    has_distinfo_installer_glob_error = bool(
+        re.search(
+            r"sed:\s+can't read .*?/usr/lib/python\d+\.\d+/site-packages/\*\.dist-info/INSTALLER",
+            combined,
+        )
+    )
+    has_compiled_extension_signals = bool(
+        re.search(r'\b(?:g\+\+|gcc)\b', combined) and re.search(r'\.so\b|site-packages/.+\.so', combined)
+    )
 
-    if not (has_noarch_processing and has_missing_lib_path and has_sitearch_path):
+    has_noarch_sitearch_mismatch = has_noarch_processing and has_missing_lib_path and has_sitearch_path
+    has_noarch_distinfo_glob_mismatch = has_distinfo_installer_glob_error and has_sitearch_path
+    has_noarch_binary_extension_mismatch = (
+        has_noarch_processing and has_sitearch_path and has_compiled_extension_signals
+    )
+
+    if not (
+        has_noarch_sitearch_mismatch
+        or has_noarch_distinfo_glob_mismatch
+        or has_noarch_binary_extension_mismatch
+    ):
         return False
 
     try:
@@ -3276,6 +3877,86 @@ def _detect_and_fix_duplicate_files_and_empty_debugsource(package_id: int, build
         return False
 
 
+def _detect_and_fix_ambiguous_python_shebang(package_id: int, build_log: str) -> bool:
+    """
+    Fix ambiguous shebang errors by targeting the exact offending file path.
+
+    Typical error:
+      "*** ERROR: ambiguous python shebang in /usr/lib/.../foo.py: #!/usr/bin/env python"
+    """
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+
+    if 'ambiguous python shebang' not in (build_log or '').lower():
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(package=package).order_by('-created_at').first()
+        if not current_spec:
+            return False
+
+        m = re.search(r'ambiguous python shebang in\s+([^:]+):', build_log, flags=re.IGNORECASE)
+        if not m:
+            return False
+
+        raw_path = m.group(1).strip().strip('"\'')
+        macro_path = raw_path
+        macro_path = re.sub(
+            r'^/usr/lib64/python\d+\.\d+/site-packages/',
+            '%{python3_sitearch}/',
+            macro_path,
+        )
+        macro_path = re.sub(
+            r'^/usr/lib/python\d+\.\d+/site-packages/',
+            '%{python3_sitelib}/',
+            macro_path,
+        )
+        macro_path = re.sub(r'^/usr/bin/', '%{_bindir}/', macro_path)
+
+        shebang_line = f'%py3_shebang_fix %{{buildroot}}{macro_path} 2>/dev/null || true'
+
+        content = current_spec.content
+        changed = False
+
+        if re.search(r'^\s*%py3_shebang_fix\b', content, flags=re.MULTILINE):
+            new_content, n = re.subn(
+                r'^\s*%py3_shebang_fix\b.*$',
+                shebang_line,
+                content,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            if n and new_content != content:
+                content = new_content
+                changed = True
+        else:
+            new_content, n = re.subn(
+                r'^(%install\s*)$',
+                r'\1\n' + shebang_line,
+                content,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            if n and new_content != content:
+                content = new_content
+                changed = True
+
+        if not changed:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=content,
+            commit_message=f'Auto-fix: target ambiguous shebang file with %py3_shebang_fix ({macro_path})',
+        )
+        log_package(package_id, 'info', f'Auto-fixed ambiguous shebang path: {macro_path}')
+        return True
+    except Exception as e:
+        logger.error(f'Error in _detect_and_fix_ambiguous_python_shebang for {package_id}: {e}')
+        return False
+
+
 def _detect_and_fix_with_ai(package_id: int, build_log: str, root_log: str = '', ai_attempt: int = 0) -> bool:
     """
     Last-resort fixer: ask the configured LLM (see settings.REQPM['AI_FIXER'])
@@ -3286,10 +3967,11 @@ def _detect_and_fix_with_ai(package_id: int, build_log: str, root_log: str = '',
     try:
         from backend.core.ai_fixer import (
             AISlotTimeoutError,
-            attempt_ai_fix,
+            attempt_ai_fix_detailed,
             get_config,
             get_slot_wait_timeout,
             is_enabled,
+            summarize_attempt,
         )
         if not is_enabled():
             return False
@@ -3300,12 +3982,18 @@ def _detect_and_fix_with_ai(package_id: int, build_log: str, root_log: str = '',
             'info',
             f'Rule-based fixers exhausted, trying AI fixer (waiting for slot up to {wait_timeout}s)...',
         )
-        result = attempt_ai_fix(package_id, build_log, root_log, ai_attempt=ai_attempt)
+        attempt = attempt_ai_fix_detailed(package_id, build_log, root_log, ai_attempt=ai_attempt)
+        result = bool(attempt and attempt.status == 'applied')
         send_package_update(package_id)
         if result:
-            log_package(package_id, 'info', 'AI fixer proposed a spec fix, retrying build')
+            log_package(package_id, 'info', f'AI fixer proposed a spec fix, retrying build. {summarize_attempt(attempt)}')
+        elif attempt is not None:
+            log_package(
+                package_id, 'info',
+                f'{summarize_attempt(attempt)} (see "AI conversations" on the package page to reply)',
+            )
         else:
-            log_package(package_id, 'info', 'AI fixer could not propose a fix')
+            log_package(package_id, 'info', 'AI fixer could not propose a fix (skipped or failed before querying the model)')
         return result
     except AISlotTimeoutError as e:
         # Fail fast: skip AI and let the caller finalize the current failed build
@@ -3316,6 +4004,102 @@ def _detect_and_fix_with_ai(package_id: int, build_log: str, root_log: str = '',
     except Exception as e:
         logger.warning(f"Error in _detect_and_fix_with_ai for {package_id}: {e}")
         return False
+
+
+@shared_task(name='packages.ai_fixer_reply')
+def ai_fixer_reply_task(attempt_id: int):
+    """Send a user's reply to the AI fixer and optionally rebuild with the result."""
+    from django.utils import timezone
+    from backend.core.ai_fixer import reply_to_attempt, summarize_attempt
+    from .models import AIFixAttempt
+
+    attempt = AIFixAttempt.objects.select_related('package').get(id=attempt_id)
+    package_id = attempt.package_id
+    log_package(package_id, 'info', 'Sending user reply to AI fixer...')
+    try:
+        applied = reply_to_attempt(attempt_id)
+    except Exception as e:
+        logger.exception(f'AI fixer reply failed for attempt {attempt_id}')
+        AIFixAttempt.objects.filter(id=attempt_id, status__in=['pending', 'running']).update(
+            status='error', error_message=str(e)[:2000], completed_at=timezone.now())
+        applied = False
+
+    attempt.refresh_from_db()
+    log_package(package_id, 'info' if applied else 'warning', f'AI reply: {summarize_attempt(attempt)}')
+    send_package_update(package_id)
+
+    if applied and attempt.rebuild_requested:
+        from .artifact_cleanup import reset_package_build_state, wipe_package_build_artifacts_for_rebuild
+
+        package = attempt.package
+        package.refresh_from_db()
+        if package.build_status in ('building', 'pending', 'fixing'):
+            log_package(package_id, 'info', 'AI reply applied; package is already building, not triggering another rebuild')
+            return {'applied': applied, 'rebuild': False}
+        wipe_package_build_artifacts_for_rebuild(package, reason='ai-reply')
+        reset_package_build_state(package)
+        mark_dependents_waiting_for_rebuild(package.id, reason='dependency rebuild in progress')
+        package.build_status = 'pending'
+        package.build_error_message = ''
+        package.build_log = ''
+        package.save()
+        send_package_update(package.id)
+        log_package(package_id, 'info', 'AI reply produced a new spec revision, rebuilding package')
+        build_single_package_task.delay(package.id)
+        return {'applied': applied, 'rebuild': True}
+
+    return {'applied': applied, 'rebuild': False}
+
+
+def _confirm_successful_ai_fixes(package_id: int, revision_ids: list[int]) -> int:
+    """Mark unanswered AI fixes from this build run as correct after a successful build."""
+    if not revision_ids:
+        return 0
+
+    from django.utils import timezone
+    from backend.apps.packages.models import SpecFileRevision
+
+    confirmed = SpecFileRevision.objects.filter(
+        package_id=package_id,
+        id__in=revision_ids,
+        commit_message__startswith='AI-fixed:',
+        ai_feedback='unknown',
+    ).update(
+        ai_feedback='correct',
+        ai_feedback_at=timezone.now(),
+    )
+    if confirmed:
+        log_package(
+            package_id,
+            'info',
+            f'Automatically confirmed {confirmed} AI-generated fix(es) after a successful build',
+        )
+        logger.info(
+            f"Automatically confirmed {confirmed} AI fix revision(s) for package {package_id}"
+        )
+    return confirmed
+
+
+def _has_unavailable_build_dependencies(package, build_log: str, root_log: str) -> bool:
+    """Route repository/depsolver failures to dependency handling before fixers.
+
+    Missing imports, compilers and headers can require spec corrections and
+    remain eligible for fixers. Self-dependencies also need a spec correction.
+    """
+    from backend.core.error_analyzer import BuildErrorAnalyzer
+
+    errors = BuildErrorAnalyzer().analyze(f'{build_log}\n{root_log}')
+    dependency_errors = [
+        error for error in errors
+        if error.category in {'Missing Packages', 'Missing Dependencies'}
+    ]
+    if not dependency_errors:
+        return False
+
+    items = [item for error in dependency_errors for item in error.items]
+    if items and all(_is_self_dependency_item(package, item) for item in items):
+        return False
+    return True
 
 
 def _has_fixable_build_signals(build_log: str, root_log: str) -> bool:
@@ -3329,6 +4113,8 @@ def _has_fixable_build_signals(build_log: str, root_log: str) -> bool:
     if not text.strip():
         return False
 
+    lower_text = text.lower()
+
     markers = [
         'RPM build errors',
         'Bad exit status',
@@ -3340,8 +4126,14 @@ def _has_fixable_build_signals(build_log: str, root_log: str) -> bool:
         'ImportError:',
         'PermissionError:',
         'error:',
+        # Dependency failures are routed before fixers; retain these signals for
+        # malformed/self-referential requirements that need spec corrections.
+        'No matching package to install:',
+        'nothing provides requested',
+        'Error: Some packages could not be found.',
+        'Failed build dependencies',
     ]
-    return any(m in text for m in markers)
+    return any(m.lower() in lower_text for m in markers)
 
 
 def _update_project_local_repo(project_id: int, rpm_paths: list, rhel_version: int = None) -> str:
@@ -3461,6 +4253,34 @@ def _update_project_local_repo(project_id: int, rpm_paths: list, rhel_version: i
     return str(primary_dir)
 
 
+def _is_valid_python_dep_candidate(name: str) -> bool:
+    """
+    Return True only for plausible Python dependency package names.
+    Filters out version-only/system noise tokens extracted from build logs.
+    """
+    import re
+
+    n = (name or '').strip().lower()
+    if not n:
+        return False
+    # Must contain at least one ASCII letter to avoid numeric/version tokens.
+    if not re.search(r'[a-z]', n):
+        return False
+    # Reject version-like tokens (e.g. 3, 3.10, 3.10-devel, 3_10_dev).
+    if re.match(r'^\d+(?:[._-]\d+)*(?:[._-][a-z0-9_-]+)?$', n):
+        return False
+    # Reject obvious distro python-devel alias noise.
+    if re.match(r'^python3?-\d+(?:\.\d+)+-devel$', n):
+        return False
+    # Reject interpreter alias pseudo-packages that are not real PyPI projects.
+    if n in {
+        'python', 'python2', 'python3',
+        'python-python', 'python2-python2', 'python3-python3',
+    }:
+        return False
+    return True
+
+
 def _normalize_dep_names(item: str):
     """
     Normalize a single rpm dep string to a list of candidate package names.
@@ -3480,6 +4300,8 @@ def _normalize_dep_names(item: str):
         '_cffi_backend': 'cffi',
         'versioneer': 'versioneer',
         'pathfix': 'pathfix-python',
+        'coherent-licensed': 'coherent.licensed',
+        'coherent_licensed': 'coherent.licensed',
     }
 
     # Strip whitespace and unwrap only true outer grouping parentheses.
@@ -3488,8 +4310,56 @@ def _normalize_dep_names(item: str):
     if not item:
         return []
 
+    # Some analyzers/AI actions can collapse several dependency atoms into one
+    # item string, e.g. "python3dist(yarl) python3dist(frozenlist)".
+    # Split these cases early and normalize each atom independently.
+    dep_atoms = re.findall(
+        r"python3?dist\([^)]+\)(?:\s*(?:<=|>=|==|!=|<|>|~=|=)\s*[A-Za-z0-9_.+-]+)?"
+        r"|python3?-[A-Za-z0-9._+\-]+(?:\s*(?:<=|>=|==|!=|<|>|~=|=)\s*[A-Za-z0-9_.+-]+)?",
+        item,
+        flags=re.IGNORECASE,
+    )
+    if len(dep_atoms) >= 2:
+        out = []
+        seen = set()
+        for atom in dep_atoms:
+            for cand in _normalize_dep_names(atom):
+                if cand not in seen:
+                    seen.add(cand)
+                    out.append(cand)
+        return out
+
+    if ' ' in item:
+        tokens = item.split()
+        comparators = {'<', '>', '<=', '>=', '==', '!=', '~=', '='}
+        if (
+            len(tokens) > 1
+            and not any(t in comparators for t in tokens)
+            and all(re.match(r'^[A-Za-z0-9._+\-\[\]()]+$', t) for t in tokens)
+        ):
+            out = []
+            seen = set()
+            for tok in tokens:
+                for cand in _normalize_dep_names(tok):
+                    if cand not in seen:
+                        seen.add(cand)
+                        out.append(cand)
+            if len(out) >= 2:
+                return out
+
     # Ignore malformed/noise tokens captured from logs.
     if item.lower() in {'python3dist', 'python3?dist', 'dist'}:
+        return []
+
+    # Ignore interpreter pseudo-dependency aliases.
+    if item.lower() in {
+        'python', 'python2', 'python3',
+        'python-python', 'python2-python2', 'python3-python3',
+    }:
+        return []
+
+    # Ignore distro-version aliases that are not real project dependencies.
+    if re.match(r'^python3?-\d+(?:\.\d+)+-devel$', item.lower()):
         return []
 
     # Handle file-path style dependency hints from RPM output.
@@ -3516,6 +4386,8 @@ def _normalize_dep_names(item: str):
         'zope': 'zope-interface',
         'rds-py': 'rpds-py',
         'rds_py': 'rpds_py',
+        'coherent-licensed': 'coherent.licensed',
+        'coherent_licensed': 'coherent.licensed',
     }
     # python3dist(foo-bar) or python3dist(foo_bar)
     m = re.match(r'python3?dist\(([^)]+)\)', item, re.IGNORECASE)
@@ -3590,13 +4462,13 @@ def _normalize_dep_names(item: str):
     # For dotted module paths (e.g. 'platformdirs.version'), also add the
     # top-level module name as a candidate package name so that completing
     # 'python3-platformdirs' resolves a blocker of 'platformdirs.version'.
-    if '.' in plain_dash:
+    if '.' in plain_dash and re.match(r'^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)+$', plain_dash):
         root = plain_dash.split('.')[0]
         for cand in (root, f'python3-{root}'):
             if cand and cand not in seen:
                 seen.add(cand)
                 out.append(cand)
-    return out
+    return [cand for cand in out if _is_valid_python_dep_candidate(cand)]
 
 
 def _is_self_dependency_item(package, item: str) -> bool:
@@ -3933,16 +4805,25 @@ def _resolve_missing_dep_status(package, project):
             missing_items.extend(e.get('items', []))
 
     # Ignore self-referential dependency items (python3dist(this-package)).
-    filtered_items = [i for i in missing_items if not _is_self_dependency_item(package, i)]
-    if len(filtered_items) != len(missing_items):
+    non_self_items = [i for i in missing_items if not _is_self_dependency_item(package, i)]
+    if len(non_self_items) != len(missing_items):
         logger.info(
-            f"Ignoring {len(missing_items) - len(filtered_items)} self-dependency item(s) "
+            f"Ignoring {len(missing_items) - len(non_self_items)} self-dependency item(s) "
             f"for {package.name}"
+        )
+
+    # Ignore non-actionable malformed tokens that do not normalize to any
+    # plausible dependency candidate (e.g. python3-python3).
+    filtered_items = [i for i in non_self_items if _normalize_dep_names(i)]
+    dropped_noise = len(non_self_items) - len(filtered_items)
+    if dropped_noise:
+        logger.info(
+            f"Ignoring {dropped_noise} malformed/noise missing dependency item(s) for {package.name}"
         )
 
     if not filtered_items:
         log_package(package.id, 'info',
-            'Only self-referential missing dependencies were detected; not treating as missing packages')
+            'Only self-referential or malformed missing dependencies were detected; not treating as missing packages')
         return 'failed'
 
     resolution = _analyze_missing_item_resolution(package, project, filtered_items)
@@ -4068,9 +4949,15 @@ def auto_add_missing_dependencies(package_id: int):
                 # Skip system packages that aren't Python packages
                 skip_packages = {
                     'gcc', 'gcc-c++', 'g++', 'cargo', 'rust', 'wheel',
-                    'setuptools', 'pip', 'mock', 'rpm-build'
+                    'setuptools', 'pip', 'mock', 'rpm-build',
+                    'python-devel', 'openssl-devel', 'cmake', 'make',
+                    'pyproject-rpm-macros', 'python3-rpm-macros',
+                    'python', 'python2', 'python3',
                 }
-                if clean_name not in skip_packages:
+                if (
+                    clean_name not in skip_packages
+                    and _is_valid_python_dep_candidate(clean_name)
+                ):
                     candidate_packages.add(clean_name)
         
         if not candidate_packages:
@@ -4144,6 +5031,16 @@ def auto_add_missing_dependencies(package_id: int):
                 if pkg_info:
                     # Normalize package name to prevent duplicates (case-insensitive)
                     normalized_name = pkg_info.name.lower()
+
+                    # Defensive guard: never create transitive dependencies from
+                    # version-like or malformed names, even if lookup returned
+                    # metadata due redirects/normalization quirks.
+                    if not _is_valid_python_dep_candidate(normalized_name):
+                        failed_count += 1
+                        logger.warning(
+                            f"Rejected non-package dependency candidate from PyPI lookup: {pkg_name} -> {normalized_name}"
+                        )
+                        continue
                     
                     # Check if package already exists (case-insensitive check)
                     existing = Package.objects.filter(
@@ -4277,9 +5174,21 @@ def trigger_waiting_builds(completed_package_id: int):
                 if e.get('category') in missing_cats:
                     missing_items.extend(e.get('items', []))
 
-            # Ignore self-referential dependency items.
-            missing_items = [i for i in missing_items if not _is_self_dependency_item(pkg, i)]
+            # Ignore self-referential and non-actionable malformed dependency items.
+            missing_items = [
+                i for i in missing_items
+                if not _is_self_dependency_item(pkg, i) and _normalize_dep_names(i)
+            ]
             if not missing_items:
+                if pkg.build_status == 'missing_packages':
+                    pkg.build_status = 'failed'
+                    pkg.save(update_fields=['build_status'])
+                    send_package_update(pkg.id)
+                    log_package(
+                        pkg.id,
+                        'info',
+                        'Cleared stale missing_packages state: no actionable missing dependency items remain',
+                    )
                 continue
 
             # Check if the completed package name is one of the blockers
@@ -4314,6 +5223,45 @@ def trigger_waiting_builds(completed_package_id: int):
         logger.exception(f"Error in trigger_waiting_builds for {completed_package_id}: {e}")
 
 
+def mark_dependents_waiting_for_rebuild(package_id: int, reason: str = '') -> int:
+    """
+    Mark dependent packages as waiting_for_deps when a dependency is rebuilding.
+
+    This prevents queued dependents from starting while a dependency artifact is
+    being replaced.
+    """
+    from backend.apps.packages.models import Package
+
+    try:
+        dep_pkg = Package.objects.get(id=package_id)
+    except Package.DoesNotExist:
+        return 0
+
+    moved = 0
+    for rel in dep_pkg.dependents.select_related('package').all():
+        pkg = rel.package
+        if not pkg or pkg.id == dep_pkg.id:
+            continue
+
+        # Keep active builds and finished packages unchanged.
+        if pkg.build_status in {'building', 'completed', 'not_required'}:
+            continue
+
+        if pkg.build_status != 'waiting_for_deps':
+            pkg.build_status = 'waiting_for_deps'
+            pkg.build_error_message = ''
+            pkg.save(update_fields=['build_status', 'build_error_message'])
+            send_package_update(pkg.id)
+            log_package(
+                pkg.id,
+                'info',
+                f"Waiting for dependency rebuild: {dep_pkg.name}{' (' + reason + ')' if reason else ''}",
+            )
+            moved += 1
+
+    return moved
+
+
 @shared_task
 def refresh_missing_packages_state_task(project_id: int):
     """
@@ -4323,10 +5271,31 @@ def refresh_missing_packages_state_task(project_id: int):
     promptly instead of waiting for periodic monitors.
     """
     from backend.apps.projects.models import Project
+    from backend.apps.projects.tasks import log_project
     from backend.apps.packages.models import Package
 
     try:
         project = Project.objects.get(id=project_id)
+
+        # Cleanup safety net: remove invalid auto-generated transitive packages
+        # (e.g. numeric/version tokens) so they do not pollute dependency
+        # resolution or trigger bogus follow-up builds.
+        invalid_generated = Package.objects.filter(
+            project=project,
+            is_direct_dependency=False,
+        )
+        removed_invalid = 0
+        for bad_pkg in invalid_generated:
+            if _is_valid_python_dep_candidate(bad_pkg.name):
+                continue
+            log_project(
+                project.id,
+                'warning',
+                f"Removing invalid auto-generated dependency package: {bad_pkg.name}",
+            )
+            bad_pkg.delete()
+            removed_invalid += 1
+
         blocked_qs = Package.objects.filter(
             project=project,
             build_status__in=['missing_packages', 'failed'],
@@ -4345,9 +5314,31 @@ def refresh_missing_packages_state_task(project_id: int):
                 if e.get('category') in missing_cats:
                     missing_items.extend(e.get('items', []))
 
-            missing_items = [i for i in missing_items if not _is_self_dependency_item(pkg, i)]
+            missing_items = [
+                i for i in missing_items
+                if not _is_self_dependency_item(pkg, i) and _normalize_dep_names(i)
+            ]
             if not missing_items:
+                if pkg.build_status == 'missing_packages':
+                    pkg.build_status = 'failed'
+                    pkg.save(update_fields=['build_status'])
+                    send_package_update(pkg.id)
+                    log_package(
+                        pkg.id,
+                        'info',
+                        'Cleared stale missing_packages state during refresh: no actionable missing dependency items remain',
+                    )
                 continue
+
+            # Stale missing/failed entries may never re-enter build_single_package_task,
+            # so they can miss the normal auto_add_missing_dependencies() path.
+            # Re-run auto-add here to keep dependency discovery progressing.
+            try:
+                auto_add_missing_dependencies(pkg.id)
+            except Exception as auto_add_err:
+                logger.warning(
+                    f"refresh_missing_packages_state_task: auto_add_missing_dependencies failed for {pkg.id}: {auto_add_err}"
+                )
 
             # Re-evaluate using the same resolver that classifies missing deps.
             target_status = _resolve_missing_dep_status(pkg, project)
@@ -4395,12 +5386,13 @@ def refresh_missing_packages_state_task(project_id: int):
         if moved_to_dep_pending or moved_to_pending:
             logger.info(
                 f"refresh_missing_packages_state_task({project_id}): "
-                f"dep_build_pending={moved_to_dep_pending}, pending={moved_to_pending}"
+                f"dep_build_pending={moved_to_dep_pending}, pending={moved_to_pending}, removed_invalid={removed_invalid}"
             )
         return {
             'project_id': project_id,
             'dep_build_pending': moved_to_dep_pending,
             'pending': moved_to_pending,
+            'removed_invalid': removed_invalid,
         }
 
     except Project.DoesNotExist:
@@ -4417,6 +5409,10 @@ def fix_and_rebuild_task(self, package_id: int):
     """
     from django.utils import timezone
     from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.apps.packages.artifact_cleanup import (
+        wipe_package_build_artifacts_for_rebuild,
+        reset_package_build_state,
+    )
     from backend.core.spec_fixer import SpecFixer, has_auto_fix
 
     try:
@@ -4429,6 +5425,15 @@ def fix_and_rebuild_task(self, package_id: int):
         if not spec_revision:
             log_package(package_id, 'error', 'No spec file found — cannot apply fixes')
             return
+
+        cleanup = wipe_package_build_artifacts_for_rebuild(package, reason='fix-and-rebuild-task')
+        reset_package_build_state(package)
+        moved_waiting = mark_dependents_waiting_for_rebuild(package.id, reason='dependency rebuild in progress')
+        log_package(
+            package_id,
+            'info',
+            f"Prepared rebuild: removed existing build artifacts ({cleanup}), dependents waiting={moved_waiting}",
+        )
 
         send_package_update(package_id)
         errors = package.analyzed_errors or []
@@ -4466,4 +5471,3 @@ def fix_and_rebuild_task(self, package_id: int):
             send_package_update(package_id)
         except Exception:
             pass
-

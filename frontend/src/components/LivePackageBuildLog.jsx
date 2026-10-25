@@ -26,6 +26,19 @@ function parseRawLine(raw) {
   return { source: 'output', content: raw };
 }
 
+function getAttemptLines(logs, attempt) {
+  const fields = attempt === 'last'
+    ? [['build.log', logs.last_build_log], ['root.log', logs.last_build_root_log]]
+    : [['build.log', logs.current_build_log], ['root.log', logs.current_build_root_log]];
+  return fields.flatMap(([source, content]) => (
+    content ? content.split(/\r?\n/).filter(Boolean).map((line) => ({
+      source,
+      content: line,
+      kind: classifyLogLine(line),
+    })) : []
+  ));
+}
+
 function classifyLogLine(line) {
   const l = line.toLowerCase();
   // Error patterns
@@ -165,6 +178,13 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
   const [buildInfo, setBuildInfo] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [analyzedErrors, setAnalyzedErrors] = useState([]);
+  const [attemptLogs, setAttemptLogs] = useState({
+    current_build_log: '',
+    current_build_root_log: '',
+    last_build_log: '',
+    last_build_root_log: '',
+  });
+  const [selectedAttempt, setSelectedAttempt] = useState('current');
   const [isCompleted, setIsCompleted] = useState(false);
   const wsRef = useRef(null);
   const logContainerRef = useRef(null);
@@ -265,6 +285,35 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
           setAnalyzedErrors(data.errors || []);
           break;
 
+        case 'attempt_log_start':
+          if ([
+            'current_build_log',
+            'current_build_root_log',
+            'last_build_log',
+            'last_build_root_log',
+          ].includes(data.field)) {
+            setAttemptLogs((logs) => ({ ...logs, [data.field]: '' }));
+          }
+          break;
+
+        case 'attempt_log_chunk':
+          if ([
+            'current_build_log',
+            'current_build_root_log',
+            'last_build_log',
+            'last_build_root_log',
+          ].includes(data.field)) {
+            setAttemptLogs((logs) => ({
+              ...logs,
+              [data.field]: `${logs[data.field] || ''}${data.data || ''}`,
+            }));
+          }
+          if (data.field === 'current_build_root_log' || data.field === 'last_build_root_log') {
+            detectedSourcesRef.current.add('root.log');
+            setDetectedSources(new Set(detectedSourcesRef.current));
+          }
+          break;
+
         case 'error':
           console.error('WebSocket error:', data.message);
           setStatus('error');
@@ -294,10 +343,23 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
   }, [packageId, appendLogChunk]);
 
   // Filtered lines — recomputed only when flush fires or source filter changes
+  const lastAttemptAvailable = Boolean(
+    attemptLogs.last_build_log || attemptLogs.last_build_root_log
+  );
+  const showSavedAttempt = selectedAttempt === 'last' || (
+    status === 'fixing' && Boolean(
+      attemptLogs.current_build_log || attemptLogs.current_build_root_log
+    )
+  );
+  const attemptLines = useMemo(
+    () => getAttemptLines(attemptLogs, selectedAttempt),
+    [attemptLogs, selectedAttempt]
+  );
+  const sourceLines = showSavedAttempt ? attemptLines : allLinesRef.current;
   const filteredLines = useMemo(
-    () => allLinesRef.current.filter((l) => visibleSources.has(l.source)),
+    () => sourceLines.filter((l) => visibleSources.has(l.source)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [flushCount, visibleSources]
+    [flushCount, visibleSources, sourceLines]
   );
 
   // Virtual list — renders only ~50 rows regardless of total count
@@ -337,6 +399,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
       case 'failed':
         return 'text-red-400';
       case 'building':
+      case 'fixing':
         return 'text-blue-400';
       case 'pending':
         return 'text-yellow-400';
@@ -354,6 +417,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
       case 'failed':
         return <XCircle className="h-5 w-5 text-red-400" />;
       case 'building':
+      case 'fixing':
         return <Terminal className="h-5 w-5 text-blue-400 animate-pulse" />;
       case 'error':
         return <AlertTriangle className="h-5 w-5 text-red-400" />;
@@ -409,6 +473,33 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
             </div>
           )}
 
+          {/* Build attempt selector */}
+          <div className="mb-2 flex items-center gap-2 flex-shrink-0">
+            <span className="text-xs text-gray-400">Attempt:</span>
+            <button
+              onClick={() => setSelectedAttempt('current')}
+              className={`px-2 py-0.5 rounded text-xs font-medium ${
+                selectedAttempt === 'current'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+              }`}
+            >
+              Current
+            </button>
+            {lastAttemptAvailable && (
+              <button
+                onClick={() => setSelectedAttempt('last')}
+                className={`px-2 py-0.5 rounded text-xs font-medium ${
+                  selectedAttempt === 'last'
+                    ? 'bg-purple-700 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                Last attempt
+              </button>
+            )}
+          </div>
+
           {/* Log source filter toggles */}
           {detectedSources.size > 0 && (
             <div className="mb-2 flex items-center gap-2 flex-wrap flex-shrink-0">
@@ -427,7 +518,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
                 </button>
               ))}
               <span className="ml-auto text-xs text-gray-500">
-                {filteredLines.length.toLocaleString()} / {allLinesRef.current.length.toLocaleString()} lines
+                {filteredLines.length.toLocaleString()} / {sourceLines.length.toLocaleString()} lines
               </span>
             </div>
           )}

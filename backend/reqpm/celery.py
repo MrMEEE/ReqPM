@@ -28,8 +28,9 @@ def config_loggers(*args, **kwargs):
 @worker_ready.connect
 def reset_orphaned_builds(**kwargs):
     """
-    On worker startup, reset any packages stuck in pending/building.
-    These are orphans from a previous worker that crashed or was restarted.
+    On worker startup, reset packages that were actively building when the
+    worker died, plus any pending rows that already had a recorded start time.
+    Plain queued pending builds must survive restarts.
     Also clear the Redis concurrency semaphore so slots aren't permanently lost.
     """
     import logging
@@ -39,13 +40,25 @@ def reset_orphaned_builds(**kwargs):
         django.setup()
         from backend.apps.packages.models import Package
         # Only reset packages that were actively running when the worker died.
-        # 'waiting_for_deps' is an intentional queued state set by build_all_packages
-        # or the single-package build view — do NOT reset it on startup.
-        stuck = Package.objects.filter(build_status__in=['pending', 'building'])
+        # Plain queued 'pending' rows are legitimate backlog and should survive
+        # a worker restart. 'waiting_for_deps' is also intentional queued state.
+        stuck = Package.objects.filter(build_status__in=['building', 'fixing'])
+        stuck_pending_started = Package.objects.filter(
+            build_status='pending',
+            build_started_at__isnull=False,
+        )
         count = stuck.count()
+        count += stuck_pending_started.count()
         if count:
-            ids = list(stuck.values_list('id', flat=True))
+            ids = list(stuck.values_list('id', flat=True)) + list(stuck_pending_started.values_list('id', flat=True))
             stuck.update(
+                build_status='not_built',
+                build_started_at=None,
+                build_completed_at=None,
+                build_error_message='',
+                build_log='',
+            )
+            stuck_pending_started.update(
                 build_status='not_built',
                 build_started_at=None,
                 build_completed_at=None,
@@ -84,6 +97,11 @@ app.conf.beat_schedule = {
         'task': 'backend.apps.builds.tasks.cleanup_old_builds_task',
         'schedule': crontab(minute='0', hour='3'),  # Daily at 3 AM
         'args': (30,)  # Remove builds older than 30 days
+    },
+    'cleanup-stale-mock-roots': {
+        'task': 'backend.apps.builds.tasks.cleanup_mock_roots_task',
+        'schedule': crontab(minute='15', hour='*/1'),  # Hourly at :15
+        'args': (3,)  # Scrub unique mock roots older than 3 days
     },
     'sync-all-repositories': {
         'task': 'backend.apps.repositories.tasks.sync_all_repositories_task',

@@ -5,6 +5,9 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from django.conf import settings
+from django.core.cache import cache
+from django.utils import timezone
 from backend.apps.core.models import SystemSettings
 from backend.apps.core.serializers import SystemSettingsSerializer
 from backend.apps.builds.concurrency import limiter
@@ -68,6 +71,7 @@ class SystemSettingsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def build_status(self, request):
         """Get current build concurrency status"""
+        settings_row = SystemSettings.load()
         active_builds = limiter.get_active_jobs()
         active_count = limiter.get_active_count()
         max_concurrent = limiter.max_concurrent
@@ -75,9 +79,65 @@ class SystemSettingsViewSet(viewsets.ViewSet):
         return Response({
             'active_count': active_count,
             'max_concurrent': max_concurrent,
+            'worker_concurrency': settings_row.celery_worker_concurrency,
             'available_slots': max(0, max_concurrent - active_count),
             'active_build_ids': active_builds,
         })
+
+    @action(detail=False, methods=['post'])
+    def reload_workers(self, request):
+        """Reload Celery workers using the configured worker concurrency (admin only)."""
+        if not request.user.is_staff:
+            return Response(
+                {'detail': 'Only administrators can reload workers'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        import os
+        import subprocess
+        from pathlib import Path
+
+        script = Path(settings.BASE_DIR) / 'reqpm.sh'
+        if not script.exists():
+            return Response({'detail': 'reqpm.sh not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            result = subprocess.run(
+                [str(script), 'restart', 'celery'],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=str(settings.BASE_DIR),
+                env=os.environ.copy(),
+            )
+            projects = subprocess.run(
+                [str(script), 'restart', 'celery-projects'],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=str(settings.BASE_DIR),
+                env=os.environ.copy(),
+            )
+
+            if result.returncode != 0 or projects.returncode != 0:
+                return Response(
+                    {
+                        'detail': 'Failed to reload workers',
+                        'celery_stdout': result.stdout,
+                        'celery_stderr': result.stderr,
+                        'projects_stdout': projects.stdout,
+                        'projects_stderr': projects.stderr,
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            return Response({
+                'detail': 'Workers reloaded',
+                'celery_stdout': result.stdout,
+                'projects_stdout': projects.stdout,
+            })
+        except Exception as e:
+            return Response({'detail': f'Failed to reload workers: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'])
     def ai_status(self, request):
@@ -155,3 +215,328 @@ class SystemSettingsViewSet(viewsets.ViewSet):
                              'detail': f'Backend responded with valid JSON in {elapsed}s'})
         except Exception as e:
             return Response({'ok': False, 'detail': str(e)[:500]})
+
+    @action(detail=False, methods=['get'])
+    def ai_fixer_packages(self, request):
+        """
+        Show packages currently in AI fixer processing.
+
+        A package is considered "in process" when the latest AI-fixer start
+        marker is newer than the latest AI-fixer terminal marker in package logs.
+        """
+        from backend.apps.packages.models import Package
+        from backend.core import ai_fixer
+
+        def _extract_correction_description(commit_message):
+            msg = (commit_message or '').strip()
+            if not msg:
+                return ''
+            if msg.startswith('AI-fixed:'):
+                actions = [a.strip() for a in msg[len('AI-fixed:'):].split(';') if a.strip()]
+                return '; '.join(actions)
+            return msg
+
+        settings_row = SystemSettings.load()
+        cfg = ai_fixer.get_config()
+        slot_key = 'ai_fixer:active_count'
+        active_count = int(cache.get(slot_key) or 0)
+        max_concurrent = int(cfg.get('max_concurrent') or 1)
+
+        start_marker = 'Rule-based fixers exhausted, trying AI fixer'
+        waiting_marker = 'waiting for slot'
+        terminal_markers = (
+            'AI fixer proposed a spec fix',
+            'AI fixer could not propose a fix',
+            'Failing fast with current analyzed errors',
+            'AI fixer: could not acquire a slot',
+        )
+        active_markers = (
+            'AI fixer acquired a slot',
+            'AI fixer: querying',
+        )
+
+        in_process = []
+        candidates = Package.objects.filter(build_status__in=['building', 'fixing']).select_related('project').order_by('-updated_at')[:250]
+        for pkg in candidates:
+            logs = list(pkg.logs.order_by('-timestamp').values('timestamp', 'level', 'message')[:200])
+            if not logs:
+                continue
+
+            latest_start = None
+            latest_terminal = None
+            latest_ai_log = None
+            ai_attempt_count = 0
+            waiting_for_slot = False
+            latest_waiting = None
+            latest_active = None
+            latest_terminal_message = ''
+
+            for entry in logs:
+                msg = entry.get('message', '') or ''
+                ts = entry.get('timestamp')
+                if latest_ai_log is None and ('AI fixer' in msg or start_marker in msg):
+                    latest_ai_log = entry
+                if start_marker in msg:
+                    ai_attempt_count += 1
+                if latest_start is None and start_marker in msg:
+                    latest_start = ts
+                if latest_terminal is None and any(marker in msg for marker in terminal_markers):
+                    latest_terminal = ts
+                    latest_terminal_message = msg
+                if waiting_marker in msg:
+                    waiting_for_slot = True
+                    if latest_waiting is None:
+                        latest_waiting = ts
+                if any(marker in msg for marker in active_markers):
+                    if latest_active is None:
+                        latest_active = ts
+
+            if latest_start is None:
+                continue
+            if latest_terminal is not None and latest_terminal >= latest_start:
+                continue
+
+            elapsed_seconds = None
+            if latest_start is not None:
+                elapsed_seconds = max(0, int((timezone.now() - latest_start).total_seconds()))
+
+            latest_revision = (
+                pkg.spec_revisions
+                .order_by('-created_at')
+                .values('commit_message', 'ai_feedback_note', 'ai_taught_note')
+                .first()
+            ) or {}
+            correction_description = _extract_correction_description(latest_revision.get('commit_message', ''))
+            correction_note = (latest_revision.get('ai_feedback_note') or latest_revision.get('ai_taught_note') or '').strip()
+
+            in_process.append({
+                'id': pkg.id,
+                'name': pkg.name,
+                'version': pkg.version,
+                'project_id': pkg.project_id,
+                'project_name': getattr(pkg.project, 'name', ''),
+                'build_status': pkg.build_status,
+                'ai_attempt_count': ai_attempt_count,
+                'ai_started_at': latest_start,
+                'ai_elapsed_seconds': elapsed_seconds,
+                'state': (
+                    'fixing'
+                    if pkg.build_status == 'fixing' or (latest_active is not None and (latest_waiting is None or latest_active >= latest_waiting))
+                    else 'waiting_for_slot'
+                    if waiting_for_slot
+                    else 'running'
+                ),
+                'state_detail': 'waiting_for_slot' if waiting_for_slot and (latest_active is None or (latest_waiting is not None and latest_waiting > latest_active)) else '',
+                'latest_terminal_message': latest_terminal_message,
+                'last_ai_log': (latest_ai_log or {}).get('message', ''),
+                'last_ai_log_at': (latest_ai_log or {}).get('timestamp'),
+                'latest_correction_description': correction_description,
+                'latest_correction_note': correction_note,
+            })
+
+        return Response({
+            'enabled': bool(settings_row.ai_fixer_enabled),
+            'backend': cfg.get('backend'),
+            'active_count': active_count,
+            'max_concurrent': max_concurrent,
+            'packages': in_process,
+        })
+
+    @action(detail=False, methods=['get'])
+    def ai_learning_stats(self, request):
+        """Aggregate AI feedback/teaching metrics and recent example usage."""
+        from collections import Counter
+        from backend.apps.packages.models import SpecFileRevision
+
+        def _extract_correction_description(commit_message):
+            msg = (commit_message or '').strip()
+            if not msg:
+                return ''
+            if msg.startswith('AI-fixed:'):
+                actions = [a.strip() for a in msg[len('AI-fixed:'):].split(';') if a.strip()]
+                return '; '.join(actions)
+            return msg
+
+        ai_fixes_qs = SpecFileRevision.objects.filter(commit_message__startswith='AI-fixed:')
+        taught_qs = SpecFileRevision.objects.filter(ai_taught=True)
+
+        total_ai_fixes = ai_fixes_qs.count()
+        feedback_counts = {
+            'correct': ai_fixes_qs.filter(ai_feedback='correct').count(),
+            'wrong': ai_fixes_qs.filter(ai_feedback='wrong').count(),
+            'unknown': ai_fixes_qs.filter(ai_feedback='unknown').count(),
+        }
+
+        recent_ai_fixes = list(
+            ai_fixes_qs.order_by('-created_at')
+            .only('fix_context', 'created_at')[:100]
+        )
+
+        example_counter = Counter()
+        for rev in recent_ai_fixes:
+            ctx = rev.fix_context or {}
+            for ex in (ctx.get('examples_used') or []):
+                pkg = (ex or {}).get('package', '')
+                if not pkg:
+                    continue
+                key = (
+                    pkg,
+                    bool((ex or {}).get('taught')),
+                    (ex or {}).get('feedback', 'unknown'),
+                )
+                example_counter[key] += 1
+
+        top_examples = []
+        for (pkg, taught, feedback), used_count in example_counter.most_common(8):
+            top_examples.append({
+                'package': pkg,
+                'used_count': used_count,
+                'taught': taught,
+                'feedback': feedback,
+            })
+
+        taught_recent = list(
+            taught_qs.order_by('-ai_taught_at')
+            .values('id', 'package__id', 'package__name', 'ai_taught_note', 'ai_taught_at', 'commit_message')[:20]
+        )
+        taught_recent = [
+            {
+                'revision_id': r['id'],
+                'package_id': r['package__id'],
+                'package_name': r['package__name'],
+                'note': r['ai_taught_note'],
+                'taught_at': r['ai_taught_at'],
+                'correction_description': _extract_correction_description(r.get('commit_message', '')),
+            }
+            for r in taught_recent
+        ]
+
+        return Response({
+            'totals': {
+                'ai_fixes': total_ai_fixes,
+                'taught_revisions': taught_qs.count(),
+                'recent_ai_fixes_considered': len(recent_ai_fixes),
+            },
+            'feedback': feedback_counts,
+            'top_learned_examples_recent': top_examples,
+            'recent_taught_revisions': taught_recent,
+        })
+
+    @action(detail=False, methods=['post'])
+    def ai_unlearn_revision(self, request):
+        """Remove a taught revision from AI learning set (admin only)."""
+        if not request.user.is_staff:
+            return Response(
+                {'detail': 'Only administrators can unlearn revisions'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        from backend.apps.packages.models import SpecFileRevision
+
+        revision_id = request.data.get('revision_id')
+        if not revision_id:
+            return Response({'detail': 'revision_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            revision = SpecFileRevision.objects.get(id=revision_id)
+        except SpecFileRevision.DoesNotExist:
+            return Response({'detail': 'Revision not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Remove taught markers and strip manual_taught_fix from context actions.
+        ctx = dict(revision.fix_context or {})
+        actions = [a for a in (ctx.get('actions') or []) if a != 'manual_taught_fix']
+        if actions:
+            ctx['actions'] = actions
+        elif 'actions' in ctx:
+            ctx.pop('actions', None)
+        ctx.pop('taught', None)
+
+        revision.ai_taught = False
+        revision.ai_taught_note = ''
+        revision.ai_taught_by = None
+        revision.ai_taught_at = None
+        revision.fix_context = ctx or None
+        revision.save(update_fields=[
+            'ai_taught', 'ai_taught_note', 'ai_taught_by', 'ai_taught_at', 'fix_context'
+        ])
+
+        return Response({'detail': 'Revision unlearned', 'revision_id': revision.id})
+
+    @action(detail=False, methods=['get'])
+    def cleanup_status(self, request):
+        """
+        Get latest cleanup task metrics and current disk footprint snapshot.
+        """
+        import subprocess
+        from pathlib import Path
+        from backend.apps.builds.tasks import get_cleanup_status_snapshot
+
+        def _dir_size_bytes(path: Path):
+            if not path.exists():
+                return None
+            try:
+                result = subprocess.run(
+                    ['du', '-sb', str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    return None
+                token = (result.stdout or '').strip().split()[0]
+                return int(token)
+            except Exception:
+                return None
+
+        build_dir = Path(settings.REQPM['BUILD_DIR'])
+        package_builds_dir = build_dir / 'package_builds'
+        mock_root = Path('/var/lib/mock')
+
+        disk = None
+        try:
+            import shutil
+            usage = shutil.disk_usage('/')
+            disk = {
+                'total_bytes': usage.total,
+                'used_bytes': usage.used,
+                'free_bytes': usage.free,
+            }
+        except Exception:
+            pass
+
+        return Response({
+            'cleanup': get_cleanup_status_snapshot(),
+            'footprint': {
+                'build_dir_bytes': _dir_size_bytes(build_dir),
+                'package_builds_bytes': _dir_size_bytes(package_builds_dir),
+                'mock_root_bytes': _dir_size_bytes(mock_root),
+            },
+            'disk': disk,
+        })
+
+    @action(detail=False, methods=['post'])
+    def run_cleanup_now(self, request):
+        """Queue cleanup tasks immediately (admin only)."""
+        if not request.user.is_staff:
+            return Response(
+                {'detail': 'Only administrators can run cleanup tasks'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        from backend.apps.builds.tasks import cleanup_mock_roots_task, cleanup_old_builds_task
+
+        cfg = SystemSettings.load()
+        keep_days = int(cfg.cleanup_builds_after_days or 30)
+
+        mock_task = cleanup_mock_roots_task.delay(3)
+        full_task = cleanup_old_builds_task.delay(keep_days)
+
+        return Response({
+            'detail': 'Cleanup tasks queued',
+            'tasks': {
+                'cleanup_mock_roots_task': str(mock_task.id),
+                'cleanup_old_builds_task': str(full_task.id),
+            },
+            'retention_days': keep_days,
+        })
