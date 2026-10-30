@@ -14,6 +14,52 @@ ReqPM is a comprehensive build system for creating RPM packages from Python proj
 - **REST API**: Full API for automation and integration
 - **JWT Authentication**: Secure API access with token-based auth
 
+## Screenshots
+
+### Dashboard
+![Dashboard](screenshots/dashboard.png)
+
+### Projects
+![Projects](screenshots/projects.png)
+
+### Project Detail
+![Project detail](screenshots/project-detail.png)
+
+### Dependency Map
+Interactive graph of direct and transitive dependencies, colored by build state.
+
+![Dependency map](screenshots/dependency-map.png)
+
+### Packages
+![Packages](screenshots/packages.png)
+
+### Package Detail
+![Package detail](screenshots/package-detail.png)
+
+### Blocked Package
+Packages waiting on dependencies show exactly which packages (and version constraints) are blocking them.
+
+![Package blocked by dependencies](screenshots/package-blocked.png)
+
+### Package Dependencies
+Both the packages a package depends on and the packages that require it.
+
+![Package dependencies](screenshots/package-dependencies.png)
+
+### AI Conversations
+History of AI fix proposals, the actions applied to the spec file, and feedback.
+
+![AI conversations](screenshots/ai-conversations.png)
+
+### AI Fixer
+![AI fixer](screenshots/ai-fixer.png)
+
+### Tasks
+![Tasks](screenshots/tasks.png)
+
+### Settings
+![Settings](screenshots/settings.png)
+
 ## Architecture
 
 - **Backend**: Django 5.0 + Django REST Framework 3.14
@@ -120,7 +166,7 @@ See **[docs/GPG_KEY_MANAGEMENT.md](docs/GPG_KEY_MANAGEMENT.md)** for details.
 Use the provided control script to manage all services:
 
 ```bash
-# Start all services (Redis, Django, Celery worker, Celery beat, Frontend)
+# Start all services (Redis, Django, Celery workers, Celery beat, Frontend)
 ./reqpm.sh start-all
 
 # Check status
@@ -143,8 +189,30 @@ Or start services individually:
 # Backend services
 ./reqpm.sh start-redis
 ./reqpm.sh start-django
-./reqpm.sh start-celery
+./reqpm.sh start-celery          # Build worker (RPM builds only, `builds` queue)
+./reqpm.sh start celery-tasks    # Tasks worker (fetching, spec generation, etc.)
+./reqpm.sh start celery-ai       # Dedicated AI fixes and conversation replies
 ./reqpm.sh start-beat
+```
+
+Celery work is split across four workers so that long RPM builds never block
+other work:
+
+| Worker | Queue | Concurrency | Handles |
+|--------|-------|-------------|---------|
+| `celery` (builds) | `builds` | Settings → Celery Worker Concurrency | RPM builds |
+| `celery-tasks` | `celery` | `CELERY_TASKS_CONCURRENCY` (default 2) | Source fetching, spec generation, monitoring, everything else |
+| `celery-ai` | `ai` | Settings → AI Fix Worker Concurrency (default 2) | AI fixes and conversation replies |
+| `celery-projects` | `projects` | 1 | Project clone/resolve/sync |
+
+Fetching and spec generation use their own slot pool (`MAX_CONCURRENT_TASKS`,
+default 2), separate from build slots.
+AI model requests release their build slot and queue a rebuild after a successful
+fix. Build and AI process counts are independent; use **Reload Workers** after
+changing either concurrency setting. The separate AI maximum-concurrent-request
+setting still limits calls to the model.
+
+```bash
 
 # Frontend
 ./reqpm.sh start-frontend
@@ -162,8 +230,11 @@ python manage.py createsuperuser
 # Start development server
 python manage.py runserver
 
-# In another terminal, start Celery worker
-celery -A reqpm worker -l info
+# In other terminals, start the Celery workers
+celery -A backend.reqpm worker -l info -Q builds --hostname=builds@%h
+celery -A backend.reqpm worker -l info -Q celery --concurrency=2 --hostname=tasks@%h
+celery -A backend.reqpm worker -l info -Q ai --concurrency=2 --hostname=ai@%h
+celery -A backend.reqpm worker -l info -Q projects --concurrency=1 --hostname=projects@%h
 
 # In another terminal, start Celery beat (for scheduled tasks)
 celery -A reqpm beat -l info

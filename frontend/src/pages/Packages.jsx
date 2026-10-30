@@ -3,6 +3,7 @@ import { Package as PackageIcon, Search, AlertCircle, ChevronLeft, ChevronRight 
 import { Link, useNavigate } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import { packagesAPI } from '../lib/api';
+import DependencyBlockers from '../components/DependencyBlockers';
 
 export default function Packages() {
   const [searchTerm, setSearchTerm] = useState('');
@@ -154,8 +155,9 @@ export default function Packages() {
                         {pkg.package_type || 'dependency'}
                       </span>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">
-                      {pkg.status || 'pending'}
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300 cursor-help" title={pkg.status_detail}>
+                      {(pkg.build_status || pkg.status || 'pending').replaceAll('_', ' ')}
+                      <DependencyBlockers blockers={pkg.dependency_blockers} />
                     </td>
                   </tr>
                 ))}

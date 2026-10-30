@@ -26,6 +26,12 @@ class SystemSettings(models.Model):
         help_text="Number of Celery worker processes for the main task queue"
     )
 
+    celery_ai_concurrency = models.IntegerField(
+        default=2,
+        validators=[MinValueValidator(1), MaxValueValidator(20)],
+        help_text="Number of dedicated AI-fix worker processes (restart workers to apply)"
+    )
+
     mock_memory_limit = models.CharField(
         max_length=20,
         blank=True,
@@ -126,6 +132,16 @@ class SystemSettings(models.Model):
         default=1,
         validators=[MinValueValidator(1), MaxValueValidator(10)],
         help_text="Maximum number of packages the AI fixer may work on simultaneously"
+    )
+
+    ai_fixer_allow_insert_lines = models.BooleanField(
+        default=False,
+        help_text="Allow the AI fixer to insert arbitrary lines next to an exact spec line"
+    )
+
+    ai_fixer_allow_spec_rewrite = models.BooleanField(
+        default=False,
+        help_text="Allow the AI fixer to replace the complete spec file"
     )
     
     # Timestamps

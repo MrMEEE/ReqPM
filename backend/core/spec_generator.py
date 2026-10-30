@@ -16,6 +16,30 @@ from pathlib import Path, PurePosixPath
 logger = logging.getLogger(__name__)
 
 
+def ensure_enabled_extras(spec_content: str, extras: list[str]) -> str:
+    """Declare RPM extras subpackages without replacing an existing spec."""
+    for extra in extras:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', extra):
+            raise ValueError(f'Invalid Python extra name: {extra!r}')
+    declared = set()
+    for line in spec_content.splitlines():
+        if re.match(r'^%(?:pyproject|python)_extras_subpkg\b', line):
+            declared.update(line.split()[1:])
+    missing = sorted(set(extras) - declared)
+    if not missing:
+        return spec_content
+    name = re.search(r'^Name:\s*(\S+)', spec_content, re.MULTILINE)
+    if not name:
+        raise ValueError('Cannot generate extras subpackages: spec has no Name')
+    if '%pyproject_save_files' not in spec_content:
+        raise ValueError('Extras subpackages require %pyproject_save_files metadata')
+    declaration = f"%pyproject_extras_subpkg -n {name.group(1)} {' '.join(missing)}\n\n"
+    parts = spec_content.split('%changelog', 1)
+    return parts[0].rstrip() + '\n\n' + declaration + (
+        '%changelog' + parts[1] if len(parts) == 2 else ''
+    )
+
+
 def get_source_archive_root(archive_path: str | Path) -> str | None:
     """Return the unique top-level directory in an sdist archive, if present."""
     path = Path(archive_path)

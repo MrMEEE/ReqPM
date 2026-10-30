@@ -4,7 +4,8 @@ AI-assisted build failure fixer.
 Fallback tier that runs AFTER the rule-based auto-fixers in
 backend.apps.packages.tasks. Sends a trimmed error context from the build
 log plus the relevant spec sections to a local (Ollama) or OpenAI-compatible
-LLM and asks for a *structured JSON list of fix actions* — never a full spec.
+LLM and asks for a *structured JSON list of fix actions*. Full spec rewrites
+and arbitrary line insertions are separate opt-in actions in Settings.
 
 The LLM acts only as a classifier/parameterizer; all spec mutations are
 performed deterministically by this module from an allowlisted set of
@@ -26,6 +27,7 @@ Backends:
               Truncated output and reasoning-only text are never used as fixes.
 """
 
+import difflib
 import json
 import logging
 import os
@@ -122,6 +124,8 @@ def get_config() -> dict:
             'slot_wait_timeout': s.ai_fixer_slot_wait_timeout,
             'max_attempts': s.ai_fixer_max_attempts,
             'max_concurrent': s.ai_fixer_max_concurrent,
+            'allow_insert_lines': s.ai_fixer_allow_insert_lines,
+            'allow_spec_rewrite': s.ai_fixer_allow_spec_rewrite,
             'max_log_lines': env.get('MAX_LOG_LINES', 120),
         }
     except Exception:
@@ -136,6 +140,8 @@ def get_config() -> dict:
             'slot_wait_timeout': int(env.get('SLOT_WAIT_TIMEOUT', 45)),
             'max_attempts': int(env.get('MAX_ATTEMPTS', 3)),
             'max_concurrent': int(env.get('MAX_CONCURRENT', 1)),
+            'allow_insert_lines': bool(env.get('ALLOW_INSERT_LINES', False)),
+            'allow_spec_rewrite': bool(env.get('ALLOW_SPEC_REWRITE', False)),
             'max_log_lines': env.get('MAX_LOG_LINES', 120),
         }
 
@@ -166,8 +172,22 @@ ALLOWED_OPS = {
     'add_requires',             # add a Requires: line
     'set_license',              # replace the License: tag value
     'add_pyproject_save_module',  # append a module name to %pyproject_save_files
+    'disable_shebang_check',
+    'insert_lines',             # general: insert lines next to an exact anchor line
+    'rewrite_spec',             # general: replace the complete spec
     'no_fix',                   # model determined no spec-level fix applies
 }
+
+# General actions are powerful and individually enabled in Settings.
+GENERAL_OP_SETTINGS = {
+    'insert_lines': 'allow_insert_lines',
+    'rewrite_spec': 'allow_spec_rewrite',
+}
+MAX_INSERT_LINES = 40
+MAX_INSERT_LINE_LENGTH = 500
+MAX_REWRITE_SPEC_BYTES = 200_000
+_IDENTITY_TAGS = ('Name', 'Version', 'Release', 'Epoch')
+_IDENTITY_TAG_RE = re.compile(r'^\s*(Name|Version|Release|Epoch)\s*:', re.IGNORECASE)
 
 # Values must be a single safe token/path — no shell metacharacters, no newlines.
 _SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9_.+%{}/()\[\]<>=~:, -]+$')
@@ -184,6 +204,7 @@ Allowed ops:
 - add_requires: add a runtime Requires. Value like above.
 - set_license: replace the License: tag. Value is a valid SPDX expression, e.g. "MIT".
 - add_pyproject_save_module: append a top-level module name to the %pyproject_save_files line. Value is the bare module name.
+- disable_shebang_check: disable only brp-mangle-shebangs for this package by adding "%undefine __brp_mangle_shebangs". Value must be exactly "brp-mangle-shebangs". This bypasses shebang validation; it does not repair scripts or their interpreters. Use only for an actual brp-mangle-shebangs failure when targeted shebang repair is not applicable or has failed.
 - no_fix: use alone when no spec-level fix can resolve the error.
 
 Common patterns to recognize:
@@ -199,7 +220,53 @@ Dependency naming rules:
 - Use RPM-style dependency names: "python3-<name>" (preferred) or "python3dist(<name>)".
 - Keep non-Python system dependencies as their native RPM names (e.g. openssl-devel, gcc, cmake).
 
+Do not propose pip to fix a missing *.dist-info/INSTALLER file: a missing installed
+file does not establish that pip is missing. python3-pip (including python3dist(pip))
+is rejected by the action executor.
+Only use the allowed operations. If the fix requires modifying build/install
+commands or RPM macros beyond disable_shebang_check, respond with no_fix and explain the required change.
+Never repeat a rejected or already-present action.
 Only propose actions you are confident about. Keep actions minimal."""
+
+_INSERT_LINES_PROMPT = """
+Additional enabled op:
+- insert_lines: insert lines before or after one existing spec line. Value must be an object:
+  {"anchor": "<one complete existing line, copied exactly>", "position": "before" or "after", "lines": ["<line>", ...]}
+  The anchor must match exactly one line in the full spec. Insert at most 40 lines. Do not change Name, Version, Release or Epoch.
+  Use it for build/install command or RPM macro changes that the specific ops cannot express. Prefer specific ops when they suffice."""
+
+_REWRITE_SPEC_PROMPT = """
+Additional enabled op:
+- rewrite_spec: replace the complete spec. Value must be the complete new spec file as one JSON string, with newlines escaped as \\n.
+  Use it only as a last resort when targeted ops cannot express the fix. It must be the only action, keep Name, Version, Release and Epoch unchanged, and include %description and %files."""
+
+
+def enabled_ops(cfg: dict | None = None) -> set[str]:
+    """Return ops the model may currently use."""
+    cfg = cfg if cfg is not None else get_config()
+    return {
+        op for op in ALLOWED_OPS
+        if op not in GENERAL_OP_SETTINGS or cfg.get(GENERAL_OP_SETTINGS[op])
+    }
+
+
+def general_actions_enabled(cfg: dict | None = None) -> bool:
+    return bool(enabled_ops(cfg) & set(GENERAL_OP_SETTINGS))
+
+
+def get_system_prompt(cfg: dict | None = None) -> str:
+    ops = enabled_ops(cfg)
+    prompt = SYSTEM_PROMPT
+    if 'insert_lines' in ops:
+        prompt += _INSERT_LINES_PROMPT
+    if 'rewrite_spec' in ops:
+        prompt += _REWRITE_SPEC_PROMPT
+    if ops & set(GENERAL_OP_SETTINGS):
+        prompt += (
+            '\nThe enabled general op(s) above override the earlier rule about build/install '
+            'commands and RPM macros. Use no_fix only if no allowed op can fix the cause.'
+        )
+    return prompt
 
 
 # ─── Log/spec context extraction ────────────────────────────────────────────
@@ -250,17 +317,22 @@ def extract_error_context(build_log: str, root_log: str = '', max_lines: int = 1
 
 
 def extract_spec_context(spec_content: str) -> str:
-    """Return the header tags, BuildRequires and %files section of a spec."""
+    """Return headers and build/install/file-list sections for diagnosis."""
     lines = spec_content.splitlines()
     keep = []
     in_files = False
+    in_build = False
     for line in lines:
         s = line.strip()
+        if re.match(r'^%(?:generate_buildrequires|build|install)(?:\s|$)', s):
+            in_build = True
+        elif re.match(r'^%(?:prep|check|files|description|changelog|package|pre|post|preun|postun)(?:\s|$)', s):
+            in_build = False
         if s.startswith('%files'):
             in_files = True
         elif in_files and s.startswith('%') and not s.startswith(('%{', '%doc', '%license', '%dir', '%attr', '%exclude')):
             in_files = False
-        if in_files:
+        if in_files or in_build:
             keep.append(line)
         elif re.match(r'^(Name|Version|Release|License|BuildArch|BuildRequires|Requires|Summary):', s):
             keep.append(line)
@@ -298,7 +370,7 @@ def _query_builtin(messages: list[dict], cfg: dict) -> str:
     out = _LLAMA['llm'].create_chat_completion(
         messages=messages,
         temperature=0.1,
-        max_tokens=800,
+        max_tokens=4096 if cfg.get('allow_spec_rewrite') else 800,
         response_format={'type': 'json_object'},
     )
     return out['choices'][0]['message']['content']
@@ -349,7 +421,7 @@ def _extract_openai_chat_content(response_data: dict) -> str:
 def _query_llm_messages(messages: list[dict]) -> str:
     """Send a chat conversation (without system prompt) to the configured backend."""
     cfg = get_config()
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, *messages]
+    messages = [{'role': 'system', 'content': get_system_prompt(cfg)}, *messages]
 
     if cfg['backend'] == 'builtin':
         return _query_builtin(messages, cfg)
@@ -391,7 +463,10 @@ def _query_llm_messages(messages: list[dict]) -> str:
         'messages': messages,
         'stream': False,
         'format': 'json',            # constrain Ollama to valid JSON output
-        'options': {'temperature': 0.1, 'num_predict': 800},
+        'options': {
+            'temperature': 0.1,
+            'num_predict': 8192 if cfg.get('allow_spec_rewrite') else 800,
+        },
     }
     resp = requests.post(url, json=payload, timeout=cfg['timeout'])
     resp.raise_for_status()
@@ -405,7 +480,59 @@ def _query_llm(prompt: str) -> str:
 
 # ─── Response parsing/validation ────────────────────────────────────────────
 
-def parse_response(raw: str) -> dict:
+def _spec_tag_values(content: str) -> dict[str, str]:
+    """Return the first main-package values of identity tags."""
+    values = {}
+    for line in content.splitlines():
+        if re.match(r'^%package(?:\s|$)', line.strip()):
+            break
+        m = re.match(r'^\s*(Name|Version|Release|Epoch)\s*:\s*(.*?)\s*$', line, re.IGNORECASE)
+        if m:
+            values.setdefault(m.group(1).capitalize(), m.group(2))
+    return values
+
+
+def _validate_insert_lines_value(raw_value) -> dict:
+    if not isinstance(raw_value, dict):
+        raise ValueError('insert_lines value must be an object')
+    anchor = raw_value.get('anchor')
+    position = raw_value.get('position')
+    lines = raw_value.get('lines')
+    if not isinstance(anchor, str) or not anchor.strip():
+        raise ValueError('insert_lines requires a non-empty anchor line')
+    if position not in ('before', 'after'):
+        raise ValueError('insert_lines position must be "before" or "after"')
+    if not isinstance(lines, list) or not lines or len(lines) > MAX_INSERT_LINES:
+        raise ValueError(f'insert_lines requires 1-{MAX_INSERT_LINES} lines')
+    for line in [anchor, *lines]:
+        if not isinstance(line, str):
+            raise ValueError('insert_lines anchor and lines must be strings')
+        if len(line) > MAX_INSERT_LINE_LENGTH or any(ch in line for ch in '\r\n\0'):
+            raise ValueError('insert_lines anchor and lines must be single lines under 500 characters')
+    if not any(line.strip() for line in lines):
+        raise ValueError('insert_lines requires at least one non-blank line')
+    if any(_IDENTITY_TAG_RE.match(line) for line in lines):
+        raise ValueError('insert_lines must not add Name, Version, Release or Epoch tags')
+    return {'anchor': anchor, 'position': position, 'lines': lines}
+
+
+def _validate_rewrite_spec_value(raw_value) -> str:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError('rewrite_spec value must be the complete spec text')
+    if '\0' in raw_value or len(raw_value.encode('utf-8')) > MAX_REWRITE_SPEC_BYTES:
+        raise ValueError(f'rewrite_spec content must be text under {MAX_REWRITE_SPEC_BYTES} bytes')
+    content = raw_value.replace('\r\n', '\n').strip('\n') + '\n'
+    tags = _spec_tag_values(content)
+    missing = [tag for tag in ('Name', 'Version', 'Release') if not tags.get(tag)]
+    if missing:
+        raise ValueError(f'rewrite_spec content is missing {", ".join(missing)}')
+    for section in ('%description', '%files'):
+        if not re.search(rf'^{re.escape(section)}(?:\s|$)', content, re.MULTILINE):
+            raise ValueError(f'rewrite_spec content is missing {section}')
+    return content
+
+
+def parse_response(raw: str, allowed_ops: set[str] | None = None) -> dict:
     """
     Parse and validate the model response.
 
@@ -413,6 +540,7 @@ def parse_response(raw: str) -> dict:
     is the validated list of {'op', 'value'} dicts (may be empty).
     Raises ValueError on malformed/unsafe output.
     """
+    allowed_ops = enabled_ops() if allowed_ops is None else allowed_ops
     # Strip markdown fences if the model added them anyway
     raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or '').strip())
     m = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -435,15 +563,28 @@ def parse_response(raw: str) -> dict:
         if not isinstance(a, dict):
             raise ValueError(f'Action is not an object: {a!r}')
         op = a.get('op', '')
-        value = str(a.get('value', '') or '').strip()
         if op not in ALLOWED_OPS:
             raise ValueError(f'Disallowed op: {op!r}')
+        if op not in allowed_ops:
+            raise ValueError(f'{op} is disabled in AI fixer settings')
         if op == 'no_fix':
             no_fix = True
             continue
+        if op == 'insert_lines':
+            validated.append({'op': op, 'value': _validate_insert_lines_value(a.get('value'))})
+            continue
+        if op == 'rewrite_spec':
+            validated.append({'op': op, 'value': _validate_rewrite_spec_value(a.get('value'))})
+            continue
+        value = str(a.get('value', '') or '').strip()
         if not value or '\n' in value or not _SAFE_VALUE_RE.match(value):
             raise ValueError(f'Unsafe or empty value for {op}: {value!r}')
+        if op == 'disable_shebang_check' and value != 'brp-mangle-shebangs':
+            raise ValueError('disable_shebang_check only accepts brp-mangle-shebangs')
         validated.append({'op': op, 'value': value})
+
+    if any(a['op'] == 'rewrite_spec' for a in validated) and len(validated) > 1:
+        raise ValueError('rewrite_spec must be the only action')
 
     result = {
         'error_category': str(data.get('error_category', '') or '').strip(),
@@ -452,8 +593,20 @@ def parse_response(raw: str) -> dict:
         'no_fix': no_fix or not validated,
     }
     logger.info(f"AI fixer: category={result['error_category']!r} "
-                f"reasoning={result['reasoning']!r} actions={validated}")
+                f"reasoning={result['reasoning']!r} actions={_summarize_actions(validated)}")
     return result
+
+
+def _summarize_actions(actions: list) -> list[str]:
+    summaries = []
+    for action in actions:
+        value = action.get('value')
+        if action.get('op') == 'rewrite_spec':
+            value = f'<complete spec, {len(str(value).splitlines())} lines>'
+        elif action.get('op') == 'insert_lines' and isinstance(value, dict):
+            value = f"{len(value.get('lines', []))} line(s) {value.get('position')} {value.get('anchor')!r}"
+        summaries.append(f"{action.get('op')}: {value}")
+    return summaries
 
 
 def parse_actions(raw: str) -> list:
@@ -612,6 +765,7 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
     """
     content = spec_content
     descriptions = []
+    rejected = []
 
     for a in actions:
         op, value = a['op'], a['value']
@@ -635,6 +789,10 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
                 if package_name and _is_self_dependency(dep_value, package_name):
                     logger.info(
                         f'AI fixer: skipping self-dependency {dep_value!r} for {package_name}'
+                    )
+                    rejected.append(
+                        f'{dep_value!r} refers to the package being built ({package_name}); '
+                        'a package cannot be its own build/runtime dependency'
                     )
                     continue
 
@@ -666,6 +824,7 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
                 }
                 if dep_value in _INVALID_BR:
                     logger.info(f'AI fixer: skipping known-invalid BuildRequires: {dep_value!r}')
+                    rejected.append(f'{value!r} is rejected by the dependency policy ({dep_value})')
                     continue
 
                 # Reject version-specific Python dev libraries (e.g. libpython3.8-devel)
@@ -685,10 +844,12 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
 
                 if dep_value in _INVALID_BR:
                     logger.info(f'AI fixer: skipping known-invalid normalized BuildRequires: {dep_value!r}')
+                    rejected.append(f'{value!r} normalizes to {dep_value!r}, which is rejected by the dependency policy')
                     continue
 
                 tag = 'BuildRequires' if op == 'add_buildrequires' else 'Requires'
                 if re.search(rf'^{tag}:\s*{re.escape(dep_value)}\s*$', content, re.MULTILINE):
+                    rejected.append(f'{tag}: {dep_value} is already present')
                     continue
                 anchor = re.search(rf'^({tag}:[^\n]*)', content, re.MULTILINE)
                 if anchor:
@@ -700,6 +861,62 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
                         raise ValueError(f'No anchor for {tag} insertion')
                     content = content.replace(lic.group(1), f'{lic.group(1)}\n{tag}: {dep_value}', 1)
                 descriptions.append(f'added {tag}: {dep_value}')
+
+        elif op == 'disable_shebang_check':
+            if value != 'brp-mangle-shebangs':
+                raise ValueError('disable_shebang_check only accepts brp-mangle-shebangs')
+            declaration = '%undefine __brp_mangle_shebangs'
+            if re.search(r'^\s*%undefine\s+__brp_mangle_shebangs\s*$', content, re.MULTILINE):
+                rejected.append('brp-mangle-shebangs is already disabled')
+                continue
+            content = declaration + '\n' + content
+            descriptions.append('disabled brp-mangle-shebangs for this package (shebang validation bypassed)')
+
+        elif op == 'insert_lines':
+            insertion = _validate_insert_lines_value(value)
+            lines = content.split('\n')
+            anchor = insertion['anchor'].strip()
+            matches = [i for i, line in enumerate(lines) if line.strip() == anchor]
+            if not matches:
+                rejected.append(f'insert_lines anchor {insertion["anchor"]!r} was not found')
+                continue
+            if len(matches) > 1:
+                rejected.append(
+                    f'insert_lines anchor {insertion["anchor"]!r} is ambiguous ({len(matches)} matches)')
+                continue
+            new_lines = insertion['lines']
+            index = matches[0] + (1 if insertion['position'] == 'after' else 0)
+            existing = (
+                lines[index:index + len(new_lines)] if insertion['position'] == 'after'
+                else lines[max(0, index - len(new_lines)):index]
+            )
+            if existing == new_lines:
+                rejected.append('insert_lines content is already present at that position')
+                continue
+            lines[index:index] = new_lines
+            content = '\n'.join(lines)
+            descriptions.append(
+                f'inserted {len(new_lines)} line(s) {insertion["position"]} "{insertion["anchor"].strip()}"')
+
+        elif op == 'rewrite_spec':
+            new_content = _validate_rewrite_spec_value(value)
+            current_tags = _spec_tag_values(content)
+            new_tags = _spec_tag_values(new_content)
+            changed = [
+                tag for tag in _IDENTITY_TAGS
+                if current_tags.get(tag, '') != new_tags.get(tag, '')
+            ]
+            if changed:
+                rejected.append(f'rewrite_spec must not change {", ".join(changed)}')
+                continue
+            if new_content.strip() == content.strip():
+                rejected.append('rewrite_spec content is identical to the current spec')
+                continue
+            diff = list(difflib.ndiff(content.splitlines(), new_content.splitlines()))
+            added = sum(1 for line in diff if line.startswith('+ '))
+            removed = sum(1 for line in diff if line.startswith('- '))
+            content = new_content
+            descriptions.append(f'rewrote complete spec (+{added}/-{removed} lines)')
 
         elif op == 'set_license':
             new_content, n = re.subn(r'^License:[^\n]*', f'License: {value}', content, count=1, flags=re.MULTILINE)
@@ -718,7 +935,8 @@ def apply_actions(spec_content: str, actions: list, package_name: str = '') -> t
             descriptions.append(f'added module "{value}" to %pyproject_save_files')
 
     if not descriptions:
-        raise ValueError('No actions resulted in changes')
+        detail = f': {"; ".join(rejected)}' if rejected else ''
+        raise ValueError(f'No actions resulted in changes{detail}')
     return content, descriptions
 
 
@@ -893,7 +1111,7 @@ def _format_examples(examples: list[dict]) -> str:
         elif ex.get('feedback') == 'wrong':
             lines.append('User feedback: this fix did not work; do not repeat it for similar errors')
         else:
-            lines.append('User feedback: none recorded')
+            lines.append('User feedback: none recorded; this is an unverified proposal, not a proven fix')
         if ex.get('feedback_note'):
             note_lines = ex['feedback_note'][:500].splitlines() or ['']
             lines.append('User feedback note:')
@@ -911,6 +1129,50 @@ _SLOT_TTL = 7200   # 2 h safety TTL — prevents a crashed worker leaking a slot
 _POLL_INTERVAL = 10  # seconds between slot-availability checks
 
 
+def get_ai_activity(logs: list[dict], build_started_at=None) -> dict | None:
+    """Infer activity from the latest AI cycle within the current build."""
+    entries = sorted(
+        (entry for entry in logs
+         if build_started_at is None or entry['timestamp'] >= build_started_at),
+        key=lambda entry: entry['timestamp'],
+        reverse=True,
+    )
+    starts = [
+        entry for entry in entries
+        if 'Rule-based fixers exhausted, trying AI fixer' in (entry.get('message') or '')
+    ]
+    if not starts:
+        return None
+    started_at = starts[0]['timestamp']
+    state = None
+    latest_ai_log = None
+    for entry in entries:
+        if entry['timestamp'] < started_at:
+            break
+        message = entry.get('message') or ''
+        if any(marker in message for marker in (
+            'AI fixer proposed a spec fix',
+            'AI fixer could not propose a fix',
+            'AI fixer finished with status',
+            'Failing fast with current analyzed errors',
+            'AI fixer: could not acquire a slot',
+        )):
+            return None
+        if latest_ai_log is None and 'AI fixer' in message:
+            latest_ai_log = entry
+        if state is None:
+            if 'AI fixer acquired a slot' in message or 'AI fixer: querying' in message:
+                state = 'running'
+            elif 'waiting for slot' in message:
+                state = 'waiting_for_slot'
+    return {
+        'state': state or 'running',
+        'started_at': started_at,
+        'attempt_count': len(starts),
+        'latest_log': latest_ai_log or starts[0],
+    }
+
+
 def _estimate_active_ai_running_count() -> int:
     """
     Best-effort count of packages currently running inside AI fixer.
@@ -920,44 +1182,13 @@ def _estimate_active_ai_running_count() -> int:
     try:
         from backend.apps.packages.models import Package
 
-        start_marker = 'Rule-based fixers exhausted, trying AI fixer'
-        waiting_marker = 'waiting for slot'
-        terminal_markers = (
-            'AI fixer proposed a spec fix',
-            'AI fixer could not propose a fix',
-            'Failing fast with current analyzed errors',
-            'AI fixer: could not acquire a slot',
-        )
-
         running_count = 0
         candidates = Package.objects.filter(build_status__in=['building', 'fixing']).order_by('-updated_at')[:250]
         for pkg in candidates:
             logs = list(pkg.logs.order_by('-timestamp').values('timestamp', 'message')[:200])
-            if not logs:
-                continue
-
-            latest_start = None
-            latest_terminal = None
-            waiting_for_slot = False
-
-            for entry in logs:
-                msg = entry.get('message', '') or ''
-                ts = entry.get('timestamp')
-                if latest_start is None and start_marker in msg:
-                    latest_start = ts
-                if latest_terminal is None and any(marker in msg for marker in terminal_markers):
-                    latest_terminal = ts
-                if waiting_marker in msg:
-                    waiting_for_slot = True
-
-            if latest_start is None:
-                continue
-            if latest_terminal is not None and latest_terminal >= latest_start:
-                continue
-            if waiting_for_slot:
-                continue
-
-            running_count += 1
+            activity = get_ai_activity(logs, pkg.build_started_at)
+            if activity and activity['state'] == 'running':
+                running_count += 1
 
         return running_count
     except Exception as e:
@@ -1092,15 +1323,49 @@ def _finish_attempt(attempt, status: str, **fields) -> None:
     attempt.save()
 
 
+def expire_abandoned_attempts(package_id: int) -> int:
+    """Close old running exchanges once their package is no longer being fixed."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from backend.apps.packages.models import AIFixAttempt
+
+    cfg = get_config()
+    # Allow both HTTP completion requests plus ample time for local processing.
+    grace_seconds = max(1800, 2 * cfg['timeout'] + 600)
+    now = timezone.now()
+    expired = AIFixAttempt.objects.filter(
+        package_id=package_id,
+        status='running',
+        completed_at__isnull=True,
+        created_at__lt=now - timedelta(seconds=grace_seconds),
+    ).exclude(package__build_status='fixing').update(
+        status='error',
+        completed_at=now,
+        error_message=(
+            'AI attempt interrupted or abandoned: no result was recorded within '
+            'the expected response window. The worker may have been restarted. '
+            'The displayed model is the model recorded when this attempt started.'
+        ),
+    )
+    if expired:
+        logger.warning('AI fixer: closed %s abandoned attempt(s) for package %s', expired, package_id)
+    return expired
+
+
 def _run_exchange(attempt, messages: list[dict], current_spec, error_ctx: str = '', examples=None) -> bool:
     """
     Query the model with ``messages``, record the outcome on ``attempt`` and,
     when the proposal is valid, create a new SpecFileRevision.
     Returns True when a new revision was created.
     """
-    from backend.apps.packages.models import SpecFileRevision
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from django.db import transaction
 
     package = attempt.package
+    autofix_token = (
+        package.autofix_context.get('token')
+        if attempt.source == 'autofix' else None
+    )
     cfg = get_config()
     attempt.model_name = f"{cfg['backend']}/{cfg['model']}"
     attempt.status = 'running'
@@ -1118,7 +1383,7 @@ def _run_exchange(attempt, messages: list[dict], current_spec, error_ctx: str = 
 
     attempt.raw_response = raw or ''
     try:
-        parsed = parse_response(raw)
+        parsed = parse_response(raw, allowed_ops=enabled_ops(cfg))
     except ValueError as e:
         _finish_attempt(attempt, 'invalid_response', error_message=str(e)[:2000])
         return False
@@ -1173,23 +1438,48 @@ def _run_exchange(attempt, messages: list[dict], current_spec, error_ctx: str = 
     if attempt.user_message:
         fix_context['user_message'] = attempt.user_message[:1000]
 
-    revision = SpecFileRevision.objects.create(
-        package=package,
-        content=new_content,
-        commit_message=f'AI-fixed: {"; ".join(descriptions)}',
-        fix_context=fix_context,
-        created_by=attempt.created_by,
-    )
-    _finish_attempt(attempt, 'applied', revision=revision)
+    with transaction.atomic():
+        if autofix_token:
+            package = Package.objects.select_for_update().get(pk=package.pk)
+            latest = SpecFileRevision.objects.filter(package=package).order_by('-created_at', '-id').first()
+            if (
+                package.build_status != 'fixing'
+                or not package.autofix_enabled
+                or package.autofix_context.get('token') != autofix_token
+                or not latest
+                or latest.pk != current_spec.pk
+            ):
+                _finish_attempt(attempt, 'error', error_message='AI fix cancelled or superseded; spec was not changed')
+                return False
+
+        revision = SpecFileRevision.objects.create(
+            package=package,
+            content=new_content,
+            commit_message=f'AI-fixed: {"; ".join(descriptions)}',
+            fix_context=fix_context,
+            created_by=attempt.created_by,
+        )
+        _finish_attempt(attempt, 'applied', revision=revision)
     logger.info(f'AI fixer: applied fix for {package.name}: {descriptions}')
     return True
 
 
+def _spec_prompt_section(spec_content: str, cfg: dict | None = None, current: bool = False) -> str:
+    prefix = 'Current ' if current else ''
+    if general_actions_enabled(cfg):
+        title = 'full spec file' if current else 'Full spec file'
+        return f'## {prefix}{title}\n{spec_content}'
+    title = 'relevant spec sections' if current else 'Relevant spec sections'
+    return f'## {prefix}{title}\n{extract_spec_context(spec_content)}'
+
+
 def _build_initial_prompt(package, error_ctx: str, spec_ctx: str, examples_section: str) -> str:
+    if not spec_ctx.startswith('## '):
+        spec_ctx = f'## Relevant spec sections\n{spec_ctx}'
     return (
         f"Package: {package.name} {package.version}\n\n"
         f"## Build error excerpt\n{error_ctx}\n\n"
-        f"## Relevant spec sections\n{spec_ctx}\n"
+        f"{spec_ctx}\n"
         f"\nRules: never add {package.name} itself as BuildRequires/Requires, and never invent a dependency that already comes from the package being built.\n"
         + (f"\n{examples_section}\n" if examples_section else '')
     )
@@ -1241,7 +1531,7 @@ def attempt_ai_fix_detailed(package_id: int, build_log: str, root_log: str = '',
             )
 
             error_ctx = extract_error_context(build_log, root_log, cfg['max_log_lines'])
-            spec_ctx = extract_spec_context(current_spec.content)
+            spec_ctx = _spec_prompt_section(current_spec.content, cfg)
 
             # Retrieve similar past fixes to help the model (few-shot RAG)
             examples = get_past_fix_examples(error_ctx)
@@ -1262,6 +1552,33 @@ def attempt_ai_fix_detailed(package_id: int, build_log: str, root_log: str = '',
                 error_ctx=error_ctx,
                 examples=examples,
             )
+            if attempt.status == 'unchanged':
+                correction = (
+                    'The proposed actions could not be applied:\n'
+                    f'{attempt.error_message}\n'
+                    'Reconsider the diagnosis using the original build/spec context. '
+                    'Do not repeat these actions or equivalent dependency aliases. '
+                    'Only propose a different applicable allowed action. If none can fix '
+                    'the cause, use no_fix and explain what change is actually required.'
+                )
+                followup = AIFixAttempt.objects.create(
+                    package=package,
+                    parent=attempt,
+                    source=AIFixAttempt.Source.AUTOFIX,
+                    prompt=correction,
+                )
+                _run_exchange(
+                    followup,
+                    [
+                        {'role': 'user', 'content': prompt},
+                        {'role': 'assistant', 'content': attempt.raw_response},
+                        {'role': 'user', 'content': correction},
+                    ],
+                    current_spec,
+                    error_ctx=error_ctx,
+                    examples=examples,
+                )
+                attempt = followup
             return attempt
         finally:
             _release_slot()
@@ -1339,8 +1656,7 @@ def _build_reply_prompt(attempt, package, current_spec) -> str:
 
     sections += [
         '',
-        '## Current relevant spec sections',
-        extract_spec_context(current_spec.content),
+        _spec_prompt_section(current_spec.content, cfg, current=True),
         '',
         'Respond again with ONLY the JSON object in the required format. '
         'Use no_fix (and explain why in "reasoning") if no allowed op can fix the build.',

@@ -3,6 +3,7 @@ ViewSets for Packages app
 """
 import logging
 import os
+from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import viewsets, status, filters
@@ -18,7 +19,7 @@ from backend.apps.packages.models import (
 from backend.apps.packages.serializers import (
     PackageListSerializer, PackageDetailSerializer,
     PackageCreateSerializer, PackageUpdateSerializer,
-    PackageDependencySerializer, PackageBuildSerializer,
+    PackageDependencySerializer, PackageDependentSerializer, PackageBuildSerializer,
     SpecFileRevisionSerializer, SpecFileCreateSerializer,
     PackageLogSerializer, PackageExtraSerializer, AIFixAttemptSerializer,
 )
@@ -69,9 +70,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         
         # Users see packages from their projects
         return Package.objects.filter(
-            project__owner=user
-        ) | Package.objects.filter(
-            project__collaborators__user=user
+            Q(project__owner=user) | Q(project__collaborators__user=user)
         ).distinct()
     
     def get_serializer_class(self):
@@ -167,15 +166,19 @@ class PackageViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def dependencies(self, request, pk=None):
         """
-        Get package dependencies
+        Get package dependencies in both directions
         
         GET /api/packages/{id}/dependencies/
+        Returns {"depends_on": [...], "required_by": [...]}
         """
         package = self.get_object()
-        dependencies = package.dependencies.all()
-        serializer = PackageDependencySerializer(dependencies, many=True)
-        
-        return Response(serializer.data)
+        depends_on = package.dependencies.select_related('depends_on').order_by('depends_on__name')
+        required_by = package.dependents.select_related('package').order_by('package__name')
+
+        return Response({
+            'depends_on': PackageDependencySerializer(depends_on, many=True).data,
+            'required_by': PackageDependentSerializer(required_by, many=True).data,
+        })
     
     @action(detail=True, methods=['get'])
     def builds(self, request, pk=None):
@@ -240,7 +243,10 @@ class PackageViewSet(viewsets.ModelViewSet):
 
         GET /api/packages/{id}/ai_attempts/?limit=50
         """
+        from backend.core.ai_fixer import expire_abandoned_attempts
+
         package = self.get_object()
+        expire_abandoned_attempts(package.id)
         try:
             limit = max(1, min(200, int(request.query_params.get('limit', 50))))
         except (TypeError, ValueError):
@@ -263,6 +269,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         from backend.core import ai_fixer
 
         package = self.get_object()
+        ai_fixer.expire_abandoned_attempts(package.id)
         try:
             parent = package.ai_attempts.get(id=attempt_id)
         except AIFixAttempt.DoesNotExist:
@@ -519,7 +526,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         """
         package = self.get_object()
         
-        if package.build_status not in ['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building']:
+        if package.build_status not in ['waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'building', 'fixing']:
             return Response(
                 {'detail': f'Cannot cancel build in state: {package.build_status}'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -545,7 +552,11 @@ class PackageViewSet(viewsets.ModelViewSet):
                             if args and len(args) > 0 and args[0] == package.id:
                                 # Revoke the task
                                 current_app.control.revoke(task['id'], terminate=True, signal='SIGKILL')
-            
+
+            # A SIGKILLed task never reaches its ``finally`` block, so free its slot here.
+            from backend.apps.builds.concurrency import limiter
+            limiter.force_release(f"build_package_{package.id}")
+
             package.build_status = 'failed'
             package.build_completed_at = timezone.now()
             package.build_error_message = 'Build cancelled by user'
@@ -562,6 +573,7 @@ class PackageViewSet(viewsets.ModelViewSet):
             package.build_error_message = ''
             package.build_log = ''
         
+        package.autofix_context = {}
         package.save()
         
         from backend.apps.packages.tasks import send_package_update
@@ -622,6 +634,79 @@ class PackageViewSet(viewsets.ModelViewSet):
             'cleanup': cleanup,
             'dependents_waiting': moved_waiting,
         })
+
+    @action(detail=True, methods=['post', 'delete'], url_path='ignore-version-requirement')
+    def ignore_version_requirement(self, request, pk=None):
+        """
+        Patch the spec so upstream version requirements on one dependency are ignored
+        (POST) or restored (DELETE), then rebuild.
+
+        POST|DELETE /api/packages/{id}/ignore-version-requirement/
+        Body: {"dependency": "setuptools-scm", "rebuild": true}
+        """
+        from backend.apps.packages.tasks import (
+            build_single_package_task, log_package, mark_dependents_waiting_for_rebuild, send_package_update,
+        )
+        from backend.apps.packages.version_relax import (
+            add_ignore_version_requirement, remove_ignore_version_requirement,
+        )
+
+        package = self.get_object()
+        latest = package.spec_revisions.order_by('-created_at').first()
+        if not latest:
+            return Response({'detail': 'Package must have a spec file first'}, status=status.HTTP_400_BAD_REQUEST)
+
+        removing = request.method == 'DELETE'
+        dependency = request.data.get('dependency', '')
+        try:
+            if removing:
+                new_content, changed = remove_ignore_version_requirement(latest.content, dependency)
+            else:
+                new_content, changed = add_ignore_version_requirement(latest.content, dependency)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if changed:
+            verb = 'Restore' if removing else 'Ignore'
+            SpecFileRevision.objects.create(
+                package=package,
+                content=new_content,
+                commit_message=f'{verb} upstream version requirements on {dependency}',
+                created_by=request.user if request.user.is_authenticated else None,
+            )
+            log_package(
+                package.id, 'info',
+                f'Spec patched to {"restore" if removing else "ignore"} version requirements on {dependency}',
+            )
+
+        rebuild = request.data.get('rebuild', True) not in (False, 'false', '0', 0)
+        if (
+            changed and rebuild and package.source_fetched
+            and package.build_status not in ('building', 'pending')
+        ):
+            wipe_package_build_artifacts_for_rebuild(package, reason='ignore-version-requirement')
+            reset_package_build_state(package)
+            mark_dependents_waiting_for_rebuild(package.id, reason='dependency rebuild in progress')
+            package.build_status = 'pending'
+            package.save(update_fields=['build_status'])
+            send_package_update(package.id)
+            build_single_package_task.delay(package.id)
+            rebuilding = True
+        else:
+            send_package_update(package.id)
+            rebuilding = False
+
+        if removing:
+            detail = (
+                f'Restored version requirements on {dependency}' if changed
+                else f'Version requirements on {dependency} were not being ignored'
+            )
+        else:
+            detail = (
+                f'Ignoring version requirements on {dependency}' if changed
+                else f'Version requirements on {dependency} were already ignored'
+            )
+        return Response({'detail': detail, 'changed': changed, 'rebuilding': rebuilding})
 
     @action(detail=True, methods=['post'])
     def fix_and_rebuild(self, request, pk=None):
@@ -843,6 +928,36 @@ class PackageViewSet(viewsets.ModelViewSet):
             'message': f'Version changed from {old_version} to {new_version}',
             'cleanup': cleanup,
             'package': PackageListSerializer(package).data
+        })
+
+    @action(detail=True, methods=['patch'], url_path='set-autofix')
+    def set_autofix(self, request, pk=None):
+        """
+        Activate or deactivate automatic fixing for a package.
+
+        PATCH /api/packages/{id}/set-autofix/
+        Body: { "enabled": true|false }
+        """
+        package = self.get_object()
+        enabled = request.data.get('enabled')
+        if not isinstance(enabled, bool):
+            return Response(
+                {'error': '"enabled" must be a boolean'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        package.autofix_enabled = enabled
+        package.save(update_fields=['autofix_enabled'])
+
+        from backend.apps.packages.tasks import log_package
+        log_package(
+            package.id, 'info',
+            'Autofixing activated' if enabled else 'Autofixing deactivated (manual fixing)',
+        )
+
+        return Response({
+            'message': 'Autofixing activated' if enabled else 'Autofixing deactivated',
+            'autofix_enabled': package.autofix_enabled,
         })
     
     @action(detail=True, methods=['patch'], url_path='change-build-system')

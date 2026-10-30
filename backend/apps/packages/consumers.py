@@ -70,6 +70,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                 'build_root_log': pkg.build_root_log or '',
                 'last_build_log': pkg.last_build_log or '',
                 'last_build_root_log': pkg.last_build_root_log or '',
+                'build_state_log': pkg.build_state_log or '',
+                'last_build_state_log': pkg.last_build_state_log or '',
                 'build_error_message': pkg.build_error_message or '',
                 'analyzed_errors': pkg.analyzed_errors or [],
                 'build_started_at': pkg.build_started_at.isoformat() if pkg.build_started_at else None,
@@ -197,6 +199,18 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
         build_dir = await self.get_build_dir()
         disk_log_files = await asyncio.to_thread(self._find_log_files, build_dir)
         already_in_db_sources = {'build.log'}  # sent via build_log field above
+        # Mock removes its resultdir logs after each run, so fall back to the
+        # copies stored in the DB for the current attempt.
+        disk_names = {f.name for f in disk_log_files}
+        for name, content in (('root.log', pkg['build_root_log']), ('state.log', pkg['build_state_log'])):
+            if name in disk_names or not content:
+                continue
+            prefixed = '\n'.join(f"{name} - {line}" for line in content.splitlines()) + '\n'
+            for i in range(0, len(prefixed), 64 * 1024):
+                await self.send(text_data=json.dumps({
+                    'type': 'log',
+                    'data': prefixed[i:i + 64 * 1024]
+                }))
         for log_file in disk_log_files:
             if log_file.name in already_in_db_sources:
                 continue
@@ -232,6 +246,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
             'current_build_root_log': pkg['build_root_log'],
             'last_build_log': pkg['last_build_log'],
             'last_build_root_log': pkg['last_build_root_log'],
+            'current_build_state_log': pkg['build_state_log'],
+            'last_build_state_log': pkg['last_build_state_log'],
         }
         selected_fields = fields if fields is not None else logs
         for field in selected_fields:
@@ -271,6 +287,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
             pkg['build_root_log'],
             pkg['last_build_log'],
             pkg['last_build_root_log'],
+            pkg['build_state_log'],
+            pkg['last_build_state_log'],
         )
         
         while self._streaming:
@@ -324,6 +342,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                 pkg['build_root_log'],
                 pkg['last_build_log'],
                 pkg['last_build_root_log'],
+                pkg['build_state_log'],
+                pkg['last_build_state_log'],
             )
             if attempt_logs != previous_attempt_logs:
                 retry_started = (
@@ -338,6 +358,8 @@ class PackageBuildLogConsumer(AsyncWebsocketConsumer):
                             'current_build_root_log',
                             'last_build_log',
                             'last_build_root_log',
+                            'current_build_state_log',
+                            'last_build_state_log',
                         ),
                         previous_attempt_logs,
                         attempt_logs,

@@ -117,10 +117,20 @@ def send_package_update(package_id: int):
         from asgiref.sync import async_to_sync
         from backend.apps.packages.models import Package
         
+        from backend.apps.packages.serializers import PackageStatusSerializer
+
         package = Package.objects.get(id=package_id)
         channel_layer = get_channel_layer()
         
         if channel_layer:
+            status_serializer = PackageStatusSerializer(context={})
+            try:
+                dependency_blockers = status_serializer.get_dependency_blockers(package)
+                status_detail = status_serializer.get_status_detail(package)
+            except Exception as blocker_err:
+                logger.warning(f"Failed to compute dependency blockers for package {package_id}: {blocker_err}")
+                dependency_blockers = []
+                status_detail = package.get_build_status_display()
             async_to_sync(channel_layer.group_send)(
                 f'project_{package.project_id}',
                 {
@@ -149,6 +159,8 @@ def send_package_update(package_id: int):
                             if dep.depends_on
                             and dep.depends_on.build_status not in ('completed', 'not_required')
                         ] if package.build_status == 'waiting_for_deps' else [],
+                        'dependency_blockers': dependency_blockers,
+                        'status_detail': status_detail,
                     }
                 }
             )
@@ -188,11 +200,11 @@ def generate_spec_file_task(self, package_id: int, force: bool = False, auto_bui
         auto_build: If True, queue a build task after successful spec generation (or after fetch if auto_fetch is also True)
         auto_fetch: If True (default), automatically fetch sources after spec generation
     """
-    from backend.apps.builds.concurrency import limiter
+    from backend.apps.builds.concurrency import task_limiter
     
     try:
         # Acquire job slot with concurrency limiting
-        with limiter.try_acquire(f"spec_{package_id}"):
+        with task_limiter.try_acquire(f"spec_{package_id}"):
             from backend.apps.packages.models import Package, SpecFileRevision
             from backend.apps.projects.tasks import log_project
             
@@ -275,6 +287,10 @@ def generate_spec_file_task(self, package_id: int, force: bool = False, auto_bui
                 return
             
             # Create spec file revision
+            from backend.core.spec_generator import ensure_enabled_extras
+            spec_content = ensure_enabled_extras(
+                spec_content, list(package.extras.filter(enabled=True).values_list('name', flat=True)),
+            )
             SpecFileRevision.objects.create(
                 package=package,
                 content=spec_content,
@@ -567,17 +583,21 @@ def scan_packages_for_missing_extras_task(self, project_id: int | None = None):
 
 
 @shared_task
-def generate_all_spec_files_task(project_id: int):
+def generate_all_spec_files_task(project_id: int, only_missing: bool = False):
     """
     Generate spec files for all packages in a project
     
     Args:
         project_id: ID of the project
+        only_missing: Only generate specs for packages that have none yet,
+            preserving existing (possibly hand- or AI-fixed) spec revisions.
     """
     from backend.apps.packages.models import Package
     from backend.apps.projects.models import ProjectLog
     
     packages = Package.objects.filter(project_id=project_id)
+    if only_missing:
+        packages = packages.filter(spec_revisions__isnull=True).distinct()
     
     ProjectLog.objects.create(
         project_id=project_id,
@@ -629,7 +649,7 @@ def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
         package_id: ID of the package
         auto_build: If True, queue a build task after successful source fetch
     """
-    from backend.apps.builds.concurrency import limiter
+    from backend.apps.builds.concurrency import task_limiter
     from backend.apps.packages.models import Package, SpecFileRevision
     from backend.apps.projects.tasks import log_project
     from django.conf import settings
@@ -638,7 +658,7 @@ def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
     
     try:
         # Acquire job slot with concurrency limiting
-        with limiter.try_acquire(f"fetch_{package_id}"):
+        with task_limiter.try_acquire(f"fetch_{package_id}"):
             package = Package.objects.get(id=package_id)
             
             # Check if spec file exists
@@ -725,13 +745,33 @@ def fetch_package_source_task(self, package_id: int, auto_build: bool = False):
         log_package(package_id, 'error', f"Error fetching sources: {str(e)}")
 
 
+_SLOT_WAIT_STATUSES = ('pending', 'waiting_for_deps', 'dep_build_pending', 'missing_packages')
+
+
+def _still_waiting_for_build_slot(package_id: int) -> bool:
+    """A re-queued slot wait continues only while the package is still queued.
+
+    Cancelling a waiting build resets it to ``not_built``; that must end the
+    wait instead of being overwritten back to ``pending``.
+    """
+    from backend.apps.packages.models import Package
+
+    status = Package.objects.filter(id=package_id).values_list('build_status', flat=True).first()
+    if status not in _SLOT_WAIT_STATUSES:
+        logger.info(f"Build {package_id}: stopped waiting for build slot (status={status})")
+        return False
+    return True
+
+
 @shared_task(bind=True, max_retries=3)
-def build_single_package_task(self, package_id: int):
+def build_single_package_task(self, package_id: int, slot_wait: bool = False, autofix_token: str = ''):
     """
     Build a single package and update its build status
     
     Args:
         package_id: ID of the package to build
+        slot_wait: True when re-queued while waiting for a free build slot
+        autofix_token: Identifies a queued AI rebuild; stale requests are ignored.
     """
     from backend.apps.builds.concurrency import limiter
     from backend.plugins.builders import get_builder
@@ -740,6 +780,18 @@ def build_single_package_task(self, package_id: int):
     import shutil
     from django.utils import timezone
     
+    if autofix_token:
+        from .models import Package
+        if not Package.objects.filter(
+            pk=package_id, build_status='pending',
+            autofix_context__token=autofix_token, autofix_context__phase='rebuild',
+        ).exists():
+            logger.info("Ignoring obsolete AI rebuild for package %s", package_id)
+            return
+
+    if slot_wait and not _still_waiting_for_build_slot(package_id):
+        return
+
     try:
         # Non-blocking slot acquisition — don't tie up the Celery worker waiting
         with limiter.try_acquire(f"build_package_{package_id}"):
@@ -747,8 +799,22 @@ def build_single_package_task(self, package_id: int):
             from backend.apps.projects.tasks import log_project
             
             package = Package.objects.get(id=package_id)
+            continuation = package.autofix_context
+            if autofix_token and (
+                continuation.get('token') != autofix_token
+                or continuation.get('phase') != 'rebuild'
+                or package.build_status != 'pending'
+            ):
+                logger.info("Ignoring obsolete AI rebuild for package %s", package_id)
+                return
+            if continuation.get('phase') != 'rebuild':
+                continuation = {}
+            package.autofix_context = {}
             project = package.project
             rhel_version = project.rhel_version
+
+            if _defer_known_dependency_blockers(package):
+                return
             
             # Preserve the previous attempt while preparing a clean build log.
             package.archive_build_logs()
@@ -756,8 +822,6 @@ def build_single_package_task(self, package_id: int):
             package.build_status = 'pending'
             package.build_started_at = None
             package.build_completed_at = None
-            package.build_log = ''
-            package.build_root_log = ''
             package.build_error_message = ''
             package.build_dependency_repo_url = ''
             package.srpm_path = ''
@@ -994,7 +1058,7 @@ def build_single_package_task(self, package_id: int):
             if not srpm_result.success:
                 # Check if this is a spec-stage issue that can be auto-fixed
                 srpm_log = srpm_result.log_output or ''
-                fixed_srpm_spec_issue = not _has_unavailable_build_dependencies(
+                fixed_srpm_spec_issue = package.autofix_enabled and not _has_unavailable_build_dependencies(
                     package, srpm_log, srpm_result.root_log_output or '',
                 ) and (
                     _detect_and_fix_directory_mismatch(package_id, srpm_log)
@@ -1008,6 +1072,7 @@ def build_single_package_task(self, package_id: int):
                     # Preserve the failed attempt before starting a clean retry.
                     package.build_log = srpm_result.log_output or ''
                     package.build_root_log = srpm_result.root_log_output or ''
+                    package.build_state_log = srpm_result.state_log_output or ''
                     package.archive_build_logs()
                     package.save()
                     _delete_build_log_files(build_dir)
@@ -1046,6 +1111,7 @@ def build_single_package_task(self, package_id: int):
                     package.build_error_message = f"SRPM build failed: {srpm_result.error_message}"
                     package.build_log = srpm_result.log_output
                     package.build_root_log = srpm_result.root_log_output
+                    package.build_state_log = srpm_result.state_log_output or ''
                     # Analyze build log for structured errors (combine build.log + root.log)
                     try:
                         analyzer = BuildErrorAnalyzer()
@@ -1112,12 +1178,21 @@ def build_single_package_task(self, package_id: int):
             # succeeds, no fixer applies, or SRPM reconstruction fails.
             # _ai_fix_count tracks AI attempts this rebuild; AI's own max_attempts
             # setting caps how many AI revisions are created per build run.
-            _ai_fix_count = 0
-            _fix_attempt = 0
+            _ai_fix_count = continuation.get('ai_attempt', 0)
+            _fix_attempt = continuation.get('fix_attempt', 0)
             _MAX_FIX_ATTEMPTS = 10  # safety cap
-            ai_fix_revision_ids: list[int] = []
-            _autofix_state = _new_autofix_state(package)
-            while not rpm_result.success and _fix_attempt < _MAX_FIX_ATTEMPTS:
+            ai_fix_revision_ids: list[int] = continuation.get('revision_ids', [])
+            _autofix_state = _restore_autofix_state(continuation['state']) if continuation else _new_autofix_state(package)
+            if not rpm_result.success and not package.autofix_enabled:
+                log_package(
+                    package_id, 'info',
+                    'Autofixing is deactivated for this package; skipping automatic fixes',
+                )
+            while (
+                not rpm_result.success
+                and package.autofix_enabled
+                and _fix_attempt < _MAX_FIX_ATTEMPTS
+            ):
                 if _has_unavailable_build_dependencies(
                     package, rpm_result.log_output or '', rpm_result.root_log_output or '',
                 ):
@@ -1134,7 +1209,8 @@ def build_single_package_task(self, package_id: int):
 
                 package.build_log = rpm_result.log_output or ''
                 package.build_root_log = rpm_result.root_log_output or ''
-                package.save(update_fields=['build_log', 'build_root_log'])
+                package.build_state_log = rpm_result.state_log_output or ''
+                package.save(update_fields=['build_log', 'build_root_log', 'build_state_log'])
 
                 if not _has_fixable_build_signals(rpm_result.log_output or '', rpm_result.root_log_output or ''):
                     logger.warning(
@@ -1173,21 +1249,22 @@ def build_single_package_task(self, package_id: int):
                     ('rustc_version_mismatch', lambda: _detect_and_fix_rustc_version_mismatch(package_id, _both)),
                     ('missing_cc_linker', lambda: _detect_and_fix_missing_cc_linker(package_id, _log)),
                     ('missing_c_compiler', lambda: _detect_and_fix_missing_c_compiler(package_id, _both)),
-                    # Last resort: AI-assisted fix (only if enabled in settings)
-                    (_AI_FIXER_NAME, lambda: _detect_and_fix_with_ai(package_id, _log, _root, _ai_fix_count)),
+                    ('system_build_tools', lambda: _detect_and_fix_system_build_tools(package_id, _log, _root)),
                 ]
                 applied_fixer = _run_autofix_round(package, fixers, _autofix_state)
                 fixed = applied_fixer is not None
-                if applied_fixer == _AI_FIXER_NAME:
-                    _ai_fix_count += 1
-                    ai_revision = SpecFileRevision.objects.filter(
-                        package=package,
-                        commit_message__startswith='AI-fixed:',
-                    ).order_by('-created_at', '-id').first()
-                    if ai_revision and ai_revision.id not in ai_fix_revision_ids:
-                        ai_fix_revision_ids.append(ai_revision.id)
-
                 if not fixed:
+                    from backend.core.ai_fixer import get_config, is_enabled
+                    if (
+                        is_enabled()
+                        and _AI_FIXER_NAME not in _autofix_state['exhausted']
+                        and _ai_fix_count < get_config()['max_attempts']
+                    ):
+                        _queue_ai_fix(
+                            package, _autofix_state, _ai_fix_count,
+                            _fix_attempt, ai_fix_revision_ids,
+                        )
+                        return
                     break
 
                 _fix_attempt += 1
@@ -1261,6 +1338,7 @@ def build_single_package_task(self, package_id: int):
                 package.build_error_message = f"RPM build failed: {rpm_result.error_message}"
                 package.build_log = rpm_result.log_output
                 package.build_root_log = rpm_result.root_log_output
+                package.build_state_log = rpm_result.state_log_output or ''
                 # Analyze build log for structured errors (combine build.log + root.log)
                 try:
                     analyzer = BuildErrorAnalyzer()
@@ -1307,6 +1385,8 @@ def build_single_package_task(self, package_id: int):
             package.build_status = 'completed'
             package.build_completed_at = timezone.now()
             package.build_log = rpm_result.log_output
+            package.build_root_log = rpm_result.root_log_output or ''
+            package.build_state_log = rpm_result.state_log_output or ''
             package.srpm_path = srpm_result.srpm_path
             package.rpm_path = rpm_file
             # Analyze build log for warnings/issues even on success
@@ -1350,15 +1430,25 @@ def build_single_package_task(self, package_id: int):
         try:
             from backend.apps.packages.models import Package
             pkg = Package.objects.get(id=package_id)
-            if pkg.build_status not in ['pending', 'waiting_for_deps']:
+            if pkg.build_status not in _SLOT_WAIT_STATUSES:
                 pkg.build_status = 'pending'
                 pkg.save()
                 send_package_update(package_id)
         except Exception:
             pass
-        log_package(package_id, 'info', f"Waiting for available build slot...")
+        if not slot_wait:
+            log_package(package_id, 'info', "Waiting for available build slot...")
         logger.info(f"Build {package_id}: no slot available, retrying in 15s")
-        raise self.retry(exc=e, countdown=15, max_retries=None)
+        # Re-queue instead of self.retry(): waiting for a slot is not a failure
+        # and must not consume the task's max_retries budget (max_retries=None
+        # in retry() falls back to the decorator's limit, not "unlimited").
+        retry_kwargs = {'slot_wait': True}
+        if autofix_token:
+            retry_kwargs['autofix_token'] = autofix_token
+        build_single_package_task.apply_async(
+            args=[package_id], kwargs=retry_kwargs, countdown=15,
+        )
+        return
     
     except Package.DoesNotExist:
         logger.error(f"Package {package_id} not found")
@@ -1422,6 +1512,126 @@ def _new_autofix_state(package) -> dict:
         'fixer_counts': {},
         'exhausted': set(),
     }
+
+
+def _restore_autofix_state(state: dict) -> dict:
+    return {
+        'tried_specs': set(state['tried_specs']),
+        'fixer_counts': dict(state['fixer_counts']),
+        'exhausted': set(state['exhausted']),
+    }
+
+
+def _queue_ai_fix(package, state, ai_attempt, fix_attempt, revision_ids):
+    from uuid import uuid4
+    from .models import SpecFileRevision
+
+    revision = SpecFileRevision.objects.filter(package=package).order_by('-created_at', '-id').first()
+    context = {
+        'token': str(uuid4()),
+        'phase': 'ai',
+        'spec_revision_id': revision.id if revision else None,
+        'state': {
+            'tried_specs': sorted(state['tried_specs']),
+            'fixer_counts': state['fixer_counts'],
+            'exhausted': sorted(state['exhausted']),
+        },
+        'ai_attempt': ai_attempt,
+        'fix_attempt': fix_attempt,
+        'revision_ids': revision_ids,
+    }
+    package.autofix_context = context
+    package.build_status = 'fixing'
+    from backend.core.error_analyzer import BuildErrorAnalyzer
+    package.analyzed_errors = [
+        {'category': e.category, 'message': e.message, 'suggestion': e.suggestion, 'items': e.items}
+        for e in BuildErrorAnalyzer().analyze(package.build_log + '\n' + package.build_root_log)
+    ]
+    package.save(update_fields=['autofix_context', 'build_status', 'analyzed_errors'])
+    log_package(package.id, 'info', 'Queued AI fix on dedicated worker; releasing build slot')
+    send_package_update(package.id)
+    ai_fix_package_task.delay(package.id, context['token'])
+
+
+@shared_task
+def ai_fix_package_task(package_id: int, token: str):
+    """Run model requests without acquiring an RPM build slot."""
+    from django.core.cache import cache
+    from .models import Package, SpecFileRevision
+
+    package = Package.objects.get(pk=package_id)
+    context = package.autofix_context
+    if package.build_status != 'fixing' or context.get('token') != token or context.get('phase') != 'ai':
+        logger.info("Ignoring obsolete AI fix for package %s", package_id)
+        return
+    lock_key = f'package-ai-fix:{token}'
+    if not cache.add(lock_key, True, timeout=7200):
+        logger.info("AI fix already executing for package %s", package_id)
+        return
+    try:
+        latest = SpecFileRevision.objects.filter(package=package).order_by('-created_at', '-id').first()
+        if not package.autofix_enabled or not latest or latest.id != context['spec_revision_id']:
+            _finish_queued_ai_fix(package, token, 'AI fix skipped: autofixing disabled or spec changed')
+            return
+        state = _restore_autofix_state(context['state'])
+        applied = _run_autofix_round(package, [
+            (_AI_FIXER_NAME, lambda: _detect_and_fix_with_ai(
+                package_id, package.build_log, package.build_root_log, context['ai_attempt'],
+            )),
+        ], state)
+        package.refresh_from_db()
+        if package.build_status != 'fixing' or package.autofix_context.get('token') != token:
+            log_package(package_id, 'info', 'AI request finished after cancellation or replacement; not rebuilding')
+            return
+        if not applied:
+            _finish_queued_ai_fix(package, token, 'AI fixer did not produce a new, untried spec; build failed')
+            return
+        revision = SpecFileRevision.objects.filter(package=package).order_by('-created_at', '-id').first()
+        context.update(
+            phase='rebuild',
+            ai_attempt=context['ai_attempt'] + 1,
+            fix_attempt=context['fix_attempt'] + 1,
+            revision_ids=context['revision_ids'] + [revision.id],
+            state={
+                'tried_specs': sorted(state['tried_specs']),
+                'fixer_counts': state['fixer_counts'],
+                'exhausted': sorted(state['exhausted']),
+            },
+        )
+        updated = Package.objects.filter(
+            pk=package_id, build_status='fixing', autofix_context__token=token,
+        ).update(autofix_context=context, build_status='pending', build_completed_at=None)
+        if not updated:
+            log_package(package_id, 'info', 'AI fix superseded before rebuild dispatch; not rebuilding')
+            return
+        log_package(package_id, 'info', 'AI fix applied; queueing rebuild on build worker')
+        send_package_update(package_id)
+        build_single_package_task.apply_async(args=[package_id], kwargs={'autofix_token': token})
+    except Exception as exc:
+        logger.exception("Dedicated AI fix failed for package %s", package_id)
+        _finish_queued_ai_fix(package, token, f'AI fix failed: {exc}')
+        raise
+    finally:
+        cache.delete(lock_key)
+
+
+def _finish_queued_ai_fix(package, token, message):
+    from django.utils import timezone
+    from .models import Package
+
+    package.refresh_from_db()
+    if package.build_status != 'fixing' or package.autofix_context.get('token') != token:
+        return
+    updated = Package.objects.filter(
+        pk=package.pk, build_status='fixing', autofix_context__token=token,
+    ).update(
+        build_status='failed', build_completed_at=timezone.now(), build_error_message=message,
+        autofix_context={},
+    )
+    if not updated:
+        return
+    log_package(package.id, 'error', message)
+    send_package_update(package.id)
 
 
 def _run_autofix_round(package, fixers, state) -> str | None:
@@ -4084,7 +4294,8 @@ def _has_unavailable_build_dependencies(package, build_log: str, root_log: str) 
     """Route repository/depsolver failures to dependency handling before fixers.
 
     Missing imports, compilers and headers can require spec corrections and
-    remain eligible for fixers. Self-dependencies also need a spec correction.
+    remain eligible for fixers. Self-dependencies also need a spec correction,
+    as do PyPI wrappers of distro build tools (see ``_system_tool_for_dep_item``).
     """
     from backend.core.error_analyzer import BuildErrorAnalyzer
 
@@ -4097,9 +4308,82 @@ def _has_unavailable_build_dependencies(package, build_log: str, root_log: str) 
         return False
 
     items = [item for error in dependency_errors for item in error.items]
-    if items and all(_is_self_dependency_item(package, item) for item in items):
+    if items and all(
+        _is_self_dependency_item(package, item) or _system_tool_for_dep_item(package, item)
+        for item in items
+    ):
         return False
     return True
+
+
+# PyPI distributions that only wrap a build tool the distro already packages.
+# scikit-build-core & co. request them only when the system tool is absent, so
+# the fix is a distro BuildRequires rather than building the PyPI wrapper.
+_SYSTEM_TOOL_DISTS = {'cmake': 'cmake', 'ninja': 'ninja-build'}
+
+
+def _system_tool_for_dep_item(package, item: str):
+    """Return the distro package for a python3dist(<tool>) item the project does not provide."""
+    import re
+
+    match = re.fullmatch(
+        r'\(?\s*python3dist\(\s*([A-Za-z0-9_.-]+)\s*\)(?:\s*(?:<=|>=|==|!=|<|>|=)\s*\S+)?\s*\)?',
+        (item or '').strip(),
+    )
+    if not match:
+        return None
+    tool = match.group(1).lower()
+    distro_package = _SYSTEM_TOOL_DISTS.get(tool)
+    if not distro_package:
+        return None
+    from backend.apps.packages.models import Package
+    if Package.objects.filter(project_id=package.project_id, name__iexact=tool).exists():
+        return None
+    return distro_package
+
+
+def _detect_and_fix_system_build_tools(package_id: int, build_log: str, root_log: str = '') -> bool:
+    """Add distro cmake/ninja-build when the build asks for their PyPI wrappers."""
+    import re
+    from backend.apps.packages.models import Package, SpecFileRevision
+    from backend.core.spec_fixer import SpecFixer
+
+    combined = f'{build_log or ""}\n{root_log or ""}'
+    tools = {
+        m.lower() for m in re.findall(
+            r'(?:Requirement not satisfied:\s*|python3dist\()\s*(cmake|ninja)\b', combined, re.IGNORECASE,
+        )
+    }
+    if not tools:
+        return False
+
+    try:
+        package = Package.objects.get(id=package_id)
+        current_spec = SpecFileRevision.objects.filter(package=package).order_by('-created_at').first()
+        if not current_spec:
+            return False
+        wanted = sorted({
+            distro for tool in tools
+            if (distro := _system_tool_for_dep_item(package, f'python3dist({tool})'))
+        })
+        if not wanted:
+            return False
+
+        new_content, fixes = SpecFixer()._add_buildrequires_items(current_spec.content, wanted)
+        if new_content == current_spec.content:
+            return False
+
+        SpecFileRevision.objects.create(
+            package=package,
+            content=new_content,
+            commit_message=f'Auto-fix: use system build tools ({", ".join(wanted)}) instead of PyPI wrappers',
+        )
+        fix_msg = '; '.join(fixes) if fixes else f'added {", ".join(wanted)} BuildRequires'
+        log_package(package_id, 'info', f'Auto-fixed missing build tools: {fix_msg}')
+        return True
+    except Exception as e:
+        logger.error(f'Error in _detect_and_fix_system_build_tools for {package_id}: {e}')
+        return False
 
 
 def _has_fixable_build_signals(build_log: str, root_log: str) -> bool:
@@ -4518,6 +4802,46 @@ def _find_project_packages_for_items(project, missing_items):
     return list(Package.objects.filter(project=project).filter(q))
 
 
+def _defer_known_dependency_blockers(package) -> bool:
+    """Keep unchanged failed specs blocked until their known build deps resolve."""
+    latest_spec = package.spec_revisions.order_by('-created_at').first()
+    if (
+        not package.build_started_at
+        or not latest_spec
+        or latest_spec.created_at > package.build_started_at
+    ):
+        return False
+
+    items = [
+        item
+        for error in (package.analyzed_errors or [])
+        if error.get('category') in {'Missing Packages', 'Missing Dependencies'}
+        for item in error.get('items', [])
+        if not _is_self_dependency_item(package, item)
+        and not _system_tool_for_dep_item(package, item)
+        and _normalize_dep_names(item)
+    ]
+    if not items:
+        return False
+    resolution = _analyze_missing_item_resolution(package, package.project, items)
+    unresolved = (
+        resolution['unresolved_with_project_match']
+        + resolution['unresolved_without_project_match']
+    )
+    if not unresolved:
+        return False
+
+    package.build_status = _resolve_missing_dep_status(package, package.project)
+    package.save(update_fields=['build_status'])
+    log_package(
+        package.id, 'info',
+        f'Build deferred: unresolved build dependencies: {", ".join(unresolved)}',
+    )
+    auto_add_missing_dependencies(package.id)
+    send_package_update(package.id)
+    return True
+
+
 def _satisfies_dep_version_constraint(item: str, package_version: str) -> bool:
     """
     Return True if package_version satisfies version constraints embedded in a
@@ -4526,11 +4850,11 @@ def _satisfies_dep_version_constraint(item: str, package_version: str) -> bool:
     import re
 
     # No explicit comparator means no version constraint.
-    spec_parts = re.findall(r'(<=|>=|==|!=|<|>)\s*([A-Za-z0-9][A-Za-z0-9_.+-]*)', item or '')
+    spec_parts = re.findall(r'(<=|>=|==|!=|=|<|>)\s*([A-Za-z0-9][A-Za-z0-9_.+-]*)', item or '')
     if not spec_parts:
         return True
 
-    spec = ','.join(f'{op}{ver}' for op, ver in spec_parts)
+    spec = ','.join(f'{"==" if op == "=" else op}{ver}' for op, ver in spec_parts)
     try:
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version, InvalidVersion
@@ -4592,7 +4916,13 @@ def _has_required_extras_enabled(pkg, required_extras: set[str], cache: dict[int
         if cache is not None:
             cache[pkg.id] = enabled
 
-    return required_extras.issubset(enabled)
+    if not required_extras.issubset(enabled):
+        return False
+    from backend.core.spec_generator import ensure_enabled_extras
+    revision = pkg.spec_revisions.order_by('-created_at').first()
+    return bool(revision and ensure_enabled_extras(
+        revision.content, sorted(required_extras),
+    ) == revision.content)
 
 
 def _enable_required_dependency_extras_and_rebuild(blocked_package, unresolved_items, matched_packages) -> int:
@@ -4683,7 +5013,12 @@ def _enable_required_dependency_extras_and_rebuild(blocked_package, unresolved_i
             if name
         }
         missing = sorted(req_extras - enabled)
-        if not missing:
+        from backend.core.spec_generator import ensure_enabled_extras
+        revision = dep.spec_revisions.order_by('-created_at').first()
+        missing_declaration = bool(revision and ensure_enabled_extras(
+            revision.content, sorted(req_extras),
+        ) != revision.content)
+        if not missing and not missing_declaration:
             continue
 
         toggled = []
@@ -4707,22 +5042,34 @@ def _enable_required_dependency_extras_and_rebuild(blocked_package, unresolved_i
                 f"Dependency {dep.name} is missing extras metadata for: {', '.join(unresolved_extra_defs)}; queued extras sync",
             )
 
-        if toggled:
+        if toggled or missing_declaration:
             cleanup = wipe_package_artifacts_for_rebuild(dep, reason='auto-enable-required-extras')
             reset_package_build_state(dep)
+            if missing_declaration:
+                from backend.apps.packages.models import SpecFileRevision
+                SpecFileRevision.objects.create(
+                    package=dep,
+                    content=ensure_enabled_extras(revision.content, sorted(enabled | set(toggled))),
+                    commit_message='Add RPM subpackages for enabled Python extras',
+                )
             send_package_update(dep.id)
-            generate_spec_file_task.delay(dep.id, force=True, auto_build=True)
+            if missing_declaration:
+                dep.build_status = 'pending'
+                dep.save(update_fields=['build_status'])
+                build_single_package_task.delay(dep.id)
+            else:
+                generate_spec_file_task.delay(dep.id, force=True, auto_build=True)
             queued += 1
 
             log_package(
                 blocked_package.id,
                 'info',
-                f"Enabled extras on dependency {dep.name}: {', '.join(sorted({t.lower() for t in toggled}))}; queued rebuild",
+                f"Ensured RPM extras on dependency {dep.name}: {', '.join(sorted(req_extras))}; queued rebuild",
             )
             log_package(
                 dep.id,
                 'info',
-                f"Auto-enabled extras due to dependent {blocked_package.name}: {', '.join(sorted({t.lower() for t in toggled}))}; cleanup={cleanup}",
+                f"Ensured RPM extras for dependent {blocked_package.name}: {', '.join(sorted(req_extras))}; cleanup={cleanup}",
             )
 
     return queued
@@ -4789,6 +5136,94 @@ def _built_for_rhel(pkg, rhel_version) -> bool:
     return int(m.group(1)) == int(rhel_version)
 
 
+def _reconcile_dependency_versions(blocked_package, unresolved_items, matched_packages):
+    """Select a shared transitive version against all recorded project constraints."""
+    from django.core.cache import cache
+    from backend.core.pypi_client import PyPIClient
+    from packaging.requirements import Requirement, InvalidRequirement
+    from packaging.version import Version, InvalidVersion
+    from backend.apps.packages.models import Package
+    from backend.apps.packages.artifact_cleanup import (
+        wipe_package_artifacts_for_rebuild, reset_package_build_state,
+    )
+
+    for dep in matched_packages:
+        relevant = [
+            item for item in unresolved_items
+            if dep.name.lower() in {n.lower() for n in _normalize_dep_names(item)}
+            and not _satisfies_dep_version_constraint(item, dep.version)
+        ]
+        if not relevant or dep.pk == blocked_package.pk:
+            continue
+        if dep.is_direct_dependency or dep.build_status in ('building', 'fixing', 'pending'):
+            continue
+        key = f'dependency-version-reconciliation:{dep.pk}'
+        if not cache.add(key, True, timeout=300):
+            continue
+        try:
+            constraints = list(relevant)
+            for consumer in Package.objects.filter(project=dep.project):
+                for error in consumer.analyzed_errors or []:
+                    if error.get('category') not in ('Missing Packages', 'Missing Dependencies'):
+                        continue
+                    for item in error.get('items') or []:
+                        names = {n.lower() for n in _normalize_dep_names(item)}
+                        if dep.name.lower() in names:
+                            constraints.append(item)
+            pep_constraints = []
+            for relation in dep.dependents.select_related('package'):
+                text = relation.version_constraint
+                if not text:
+                    continue
+                try:
+                    req = Requirement(text)
+                except InvalidRequirement:
+                    constraints.append(text)
+                else:
+                    # Including conditional requirements is conservative: never
+                    # choose a shared version that violates a recorded consumer.
+                    pep_constraints.append(req.specifier)
+            versions = []
+            for text in PyPIClient().get_all_versions(dep.python_name or dep.name):
+                try:
+                    version = Version(text)
+                except InvalidVersion:
+                    continue
+                if version.is_prerelease or version.is_devrelease:
+                    continue
+                if (
+                    all(_satisfies_dep_version_constraint(item, text) for item in constraints)
+                    and all(version in spec for spec in pep_constraints)
+                ):
+                    versions.append((version, text))
+            if not versions:
+                log_package(
+                    blocked_package.pk, 'warning',
+                    f'No compatible release of {dep.name} satisfies all recorded project constraints: '
+                    + '; '.join(dict.fromkeys(constraints)),
+                )
+                continue
+            selected = max(versions)[1]
+            old_version = dep.version
+            wipe_package_artifacts_for_rebuild(dep, reason='dependency-version-resolution')
+            dep.version = selected
+            dep.status = 'pending'
+            dep.save(update_fields=['version', 'status'])
+            reset_package_build_state(dep)
+            dep.build_status = 'pending'
+            dep.save(update_fields=['build_status'])
+            mark_dependents_waiting_for_rebuild(dep.pk, reason='dependency version resolution')
+            log_package(
+                dep.pk, 'info',
+                f'Dependency resolver selected {selected} (was {old_version}) to satisfy '
+                + '; '.join(dict.fromkeys(constraints)),
+            )
+            generate_spec_file_task.delay(dep.pk, force=True, auto_build=True)
+            send_package_update(dep.pk)
+        finally:
+            cache.delete(key)
+
+
 def _resolve_missing_dep_status(package, project):
     """
     Decide between 'dep_build_pending' and 'missing_packages' based on whether
@@ -4828,6 +5263,9 @@ def _resolve_missing_dep_status(package, project):
 
     resolution = _analyze_missing_item_resolution(package, project, filtered_items)
     matched = resolution['matched']
+    _reconcile_dependency_versions(
+        package, resolution['unresolved_with_project_match'], matched,
+    )
     # If any of the missing deps exist in the project as unbuilt packages → dep_build_pending
     unbuilt_matches = [p for p in matched if p.build_status not in ('completed', 'not_required') and p.id != package.id]
 
@@ -5151,6 +5589,9 @@ def trigger_waiting_builds(completed_package_id: int):
                 # All deps ready — trigger the build
                 logger.info(f"All deps satisfied for {pkg.name} (id={pkg.id}), triggering build")
                 log_package(pkg.id, 'info', f"All dependencies are now built, starting build...")
+                pkg.build_status = 'pending'
+                pkg.save(update_fields=['build_status'])
+                send_package_update(pkg.id)
                 build_single_package_task.delay(pkg.id)
             else:
                 logger.debug(f"{pkg.name} still waiting for: {unbuilt}")
@@ -5263,12 +5704,25 @@ def mark_dependents_waiting_for_rebuild(package_id: int, reason: str = '') -> in
 
 
 @shared_task
+def discover_blocked_project_dependencies_task():
+    """Retry discovery for blocked projects even when no package was added."""
+    from backend.apps.packages.models import Package
+
+    project_ids = list(Package.objects.filter(
+        build_status__in=['missing_packages', 'dep_build_pending'],
+    ).order_by().values_list('project_id', flat=True).distinct())
+    for project_id in project_ids:
+        refresh_missing_packages_state_task.delay(project_id)
+    return len(project_ids)
+
+
+@shared_task
 def refresh_missing_packages_state_task(project_id: int):
     """
     Re-evaluate packages currently in missing_packages when project packages change.
 
-    This is invoked when new packages are added so blocked packages can transition
-    promptly instead of waiting for periodic monitors.
+    Invoked when packages change and periodically, so discovery does not depend
+    on a successful build or on another package being added first.
     """
     from backend.apps.projects.models import Project
     from backend.apps.projects.tasks import log_project
@@ -5298,7 +5752,7 @@ def refresh_missing_packages_state_task(project_id: int):
 
         blocked_qs = Package.objects.filter(
             project=project,
-            build_status__in=['missing_packages', 'failed'],
+            build_status__in=['missing_packages', 'dep_build_pending', 'failed'],
         )
 
         moved_to_dep_pending = 0

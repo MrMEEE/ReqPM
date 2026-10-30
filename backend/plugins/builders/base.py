@@ -17,6 +17,7 @@ class BuildResult:
     rpm_paths: List[str] = None
     log_output: str = ""
     root_log_output: str = ""
+    state_log_output: str = ""
     error_message: str = ""
     build_duration: int = 0  # seconds
     

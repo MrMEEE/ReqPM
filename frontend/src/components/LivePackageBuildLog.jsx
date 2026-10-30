@@ -28,8 +28,16 @@ function parseRawLine(raw) {
 
 function getAttemptLines(logs, attempt) {
   const fields = attempt === 'last'
-    ? [['build.log', logs.last_build_log], ['root.log', logs.last_build_root_log]]
-    : [['build.log', logs.current_build_log], ['root.log', logs.current_build_root_log]];
+    ? [
+      ['build.log', logs.last_build_log],
+      ['root.log', logs.last_build_root_log],
+      ['state.log', logs.last_build_state_log],
+    ]
+    : [
+      ['build.log', logs.current_build_log],
+      ['root.log', logs.current_build_root_log],
+      ['state.log', logs.current_build_state_log],
+    ];
   return fields.flatMap(([source, content]) => (
     content ? content.split(/\r?\n/).filter(Boolean).map((line) => ({
       source,
@@ -183,6 +191,8 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
     current_build_root_log: '',
     last_build_log: '',
     last_build_root_log: '',
+    current_build_state_log: '',
+    last_build_state_log: '',
   });
   const [selectedAttempt, setSelectedAttempt] = useState('current');
   const [isCompleted, setIsCompleted] = useState(false);
@@ -291,6 +301,8 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
             'current_build_root_log',
             'last_build_log',
             'last_build_root_log',
+            'current_build_state_log',
+            'last_build_state_log',
           ].includes(data.field)) {
             setAttemptLogs((logs) => ({ ...logs, [data.field]: '' }));
           }
@@ -302,14 +314,20 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
             'current_build_root_log',
             'last_build_log',
             'last_build_root_log',
+            'current_build_state_log',
+            'last_build_state_log',
           ].includes(data.field)) {
             setAttemptLogs((logs) => ({
               ...logs,
               [data.field]: `${logs[data.field] || ''}${data.data || ''}`,
             }));
           }
-          if (data.field === 'current_build_root_log' || data.field === 'last_build_root_log') {
+          if (data.data && (data.field === 'current_build_root_log' || data.field === 'last_build_root_log')) {
             detectedSourcesRef.current.add('root.log');
+            setDetectedSources(new Set(detectedSourcesRef.current));
+          }
+          if (data.data && (data.field === 'current_build_state_log' || data.field === 'last_build_state_log')) {
+            detectedSourcesRef.current.add('state.log');
             setDetectedSources(new Set(detectedSourcesRef.current));
           }
           break;
@@ -344,7 +362,7 @@ export default function LivePackageBuildLog({ packageId, packageName, onClose })
 
   // Filtered lines — recomputed only when flush fires or source filter changes
   const lastAttemptAvailable = Boolean(
-    attemptLogs.last_build_log || attemptLogs.last_build_root_log
+    attemptLogs.last_build_log || attemptLogs.last_build_root_log || attemptLogs.last_build_state_log
   );
   const showSavedAttempt = selectedAttempt === 'last' || (
     status === 'fixing' && Boolean(

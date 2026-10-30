@@ -68,15 +68,18 @@ def send_project_update(project_id: int):
 
 
 @shared_task(bind=True, max_retries=3)
-def clone_project_task(self, project_id: int):
+def clone_project_task(self, project_id: int, sync: bool = False):
     """
     Clone or update a Git repository for a project
     
     Args:
         project_id: ID of the project to clone
+        sync: Periodic auto-sync. Skips re-analysis when the commit is unchanged
+            and never regenerates existing spec files.
     """
     try:
         project = Project.objects.get(id=project_id)
+        previous_commit = project.git_commit
         project.status = 'cloning'
         project.save()
         
@@ -134,6 +137,11 @@ def clone_project_task(self, project_id: int):
         log_project(project_id, 'info', f"Found {len(branches)} branches and {len(tags)} tags")
         
         project.status = 'ready'
+        if sync and commit_hash and commit_hash == previous_commit:
+            project.save()
+            log_project(project_id, 'info', f"Auto-sync: no new commits ({commit_hash[:8]}), nothing to update")
+            return
+
         project.last_build_at = timezone.now()
         project.save()
         
@@ -142,7 +150,7 @@ def clone_project_task(self, project_id: int):
         
         # Trigger requirements analysis
         log_project(project_id, 'info', "Triggering requirements analysis...")
-        analyze_requirements_task.delay(project_id)
+        analyze_requirements_task.delay(project_id, sync=sync)
     
     except Project.DoesNotExist:
         logger.error(f"Project {project_id} not found")
@@ -157,12 +165,13 @@ def clone_project_task(self, project_id: int):
 
 
 @shared_task(bind=True, max_retries=3)
-def analyze_requirements_task(self, project_id: int):
+def analyze_requirements_task(self, project_id: int, sync: bool = False):
     """
     Analyze requirements.txt and create package records
     
     Args:
         project_id: ID of the project to analyze
+        sync: Called from periodic auto-sync; keep existing spec files.
     """
     try:
         project = Project.objects.get(id=project_id)
@@ -271,7 +280,7 @@ def analyze_requirements_task(self, project_id: int):
         # Trigger spec file generation for all packages
         log_project(project_id, 'info', "Triggering spec file generation...")
         from backend.apps.packages.tasks import generate_all_spec_files_task
-        generate_all_spec_files_task.delay(project_id)
+        generate_all_spec_files_task.delay(project_id, only_missing=sync)
         
         # Trigger dependency resolution
         log_project(project_id, 'info', "Triggering dependency resolution...")
@@ -464,14 +473,33 @@ def resolve_dependencies_task(self, project_id: int):
 @shared_task
 def sync_all_projects_task():
     """
-    Sync all active projects with their Git repositories
+    Periodically sync idle projects with their Git repositories.
+
+    Honours the "Auto-sync projects" system setting and its sync interval.
     """
-    projects = Project.objects.filter(is_active=True, auto_sync=True)
-    
+    from django.core.cache import cache
+    from backend.apps.core.models import SystemSettings
+
+    system_settings = SystemSettings.load()
+    if not system_settings.auto_sync_projects:
+        return 0
+
+    interval_seconds = max(1, int(system_settings.sync_interval_hours or 6)) * 3600
+    projects = Project.objects.filter(
+        status__in=['ready', 'completed', 'failed'],
+    ).exclude(git_url='')
+
+    triggered = 0
     for project in projects:
-        clone_project_task.delay(project.id)
-    
-    logger.info(f"Triggered sync for {projects.count()} projects")
+        # Small slack so an hourly beat does not drift a full hour past the interval.
+        if not cache.add(f'project-auto-sync:{project.id}', True, timeout=interval_seconds - 60):
+            continue
+        clone_project_task.delay(project.id, sync=True)
+        triggered += 1
+
+    if triggered:
+        logger.info(f"Triggered auto-sync for {triggered} project(s)")
+    return triggered
 
 
 @shared_task

@@ -36,22 +36,36 @@ class JobConcurrencyLimiter:
     Also prevents duplicate acquisition of the same job_id.
     """
     
-    def __init__(self, max_concurrent=None):
+    def __init__(
+        self,
+        max_concurrent=None,
+        semaphore_key='reqpm:job:semaphore',
+        use_db_setting=True,
+        slot_label='build',
+    ):
         """
         Initialize the concurrency limiter
         
         Args:
             max_concurrent: Maximum number of concurrent jobs (default from settings)
+            semaphore_key: Redis key holding the active job ids
+            use_db_setting: Read the limit from SystemSettings.max_concurrent_builds
+            slot_label: Name used in "no slot available" messages
         """
         self._default_max_concurrent = max_concurrent or settings.REQPM.get('MAX_CONCURRENT_BUILDS', 4)
         self.redis_client = redis.from_url(settings.CELERY_BROKER_URL)
-        self.semaphore_key = 'reqpm:job:semaphore'
+        self.semaphore_key = semaphore_key
+        self.orphan_suspect_key = f'{semaphore_key}:orphan_suspects'
+        self.use_db_setting = use_db_setting
+        self.slot_label = slot_label
         self.lock_timeout = 7200  # 2 hours max per job
         self._acquire_script = self.redis_client.register_script(_ACQUIRE_LUA)
 
     @property
     def max_concurrent(self):
         """Return the current concurrency limit from DB-backed settings."""
+        if not self.use_db_setting:
+            return int(self._default_max_concurrent)
         try:
             from backend.apps.core.models import SystemSettings
 
@@ -135,7 +149,7 @@ class JobConcurrencyLimiter:
                 yield True
             else:
                 raise TimeoutError(
-                    f"No build slot available (0/{self.max_concurrent} free). "
+                    f"No {self.slot_label} slot available (0/{self.max_concurrent} free). "
                     f"Will retry when a slot opens up."
                 )
         finally:
@@ -149,6 +163,61 @@ class JobConcurrencyLimiter:
         """Get number of currently active jobs"""
         return self.redis_client.scard(self.semaphore_key)
     
+    # Slot job-id prefix -> Celery task whose first argument is the id suffix.
+    SLOT_OWNER_TASKS = (
+        ('build_package_', 'backend.apps.packages.tasks.build_single_package_task'),
+        ('fetch_', 'backend.apps.packages.tasks.fetch_package_source_task'),
+        ('spec_', 'backend.apps.packages.tasks.generate_spec_file_task'),
+        ('build_', 'backend.apps.builds.tasks.build_package_task'),
+    )
+
+    @classmethod
+    def slot_owner(cls, job_id):
+        """Return (task_name, object_id) for a slot job id, or None if unknown."""
+        for prefix, task_name in cls.SLOT_OWNER_TASKS:
+            suffix = job_id[len(prefix):]
+            if job_id.startswith(prefix) and suffix.isdigit():
+                return task_name, int(suffix)
+        return None
+
+    def reclaim_orphaned_slots(self, active_task_args):
+        """
+        Release slots whose owning task is no longer executing (e.g. the worker
+        child was SIGKILLed by a cancel or the OOM killer before ``finally`` ran).
+
+        ``active_task_args`` maps task name -> set of first args for tasks that
+        are currently *executing*. A slot is only released after it has looked
+        orphaned on two consecutive calls, so a task that acquired its slot
+        between the inspect call and this check is never released.
+        """
+        suspects = {
+            m.decode('utf-8') if isinstance(m, bytes) else m
+            for m in self.redis_client.smembers(self.orphan_suspect_key)
+        }
+        orphaned = set()
+        for job_id in self.get_active_jobs():
+            owner = self.slot_owner(job_id)
+            if owner is None:
+                continue
+            task_name, object_id = owner
+            if object_id not in active_task_args.get(task_name, set()):
+                orphaned.add(job_id)
+
+        released = []
+        for job_id in orphaned & suspects:
+            if self.force_release(job_id):
+                released.append(job_id)
+                logger.warning(f"Released orphaned job slot {job_id} (owning task is no longer running)")
+
+        pipe = self.redis_client.pipeline()
+        pipe.delete(self.orphan_suspect_key)
+        new_suspects = orphaned - set(released)
+        if new_suspects:
+            pipe.sadd(self.orphan_suspect_key, *new_suspects)
+            pipe.expire(self.orphan_suspect_key, 600)
+        pipe.execute()
+        return released
+
     def force_release(self, job_id):
         """Force release a specific job slot"""
         return self.redis_client.srem(self.semaphore_key, job_id)
@@ -158,5 +227,12 @@ class JobConcurrencyLimiter:
         return self.redis_client.delete(self.semaphore_key)
 
 
-# Global instance
+# Global instances: RPM builds, and lighter non-build jobs (fetch/spec) which
+# get their own slots so a full build pool never blocks them.
 limiter = JobConcurrencyLimiter()
+task_limiter = JobConcurrencyLimiter(
+    max_concurrent=settings.REQPM.get('MAX_CONCURRENT_TASKS', 2),
+    semaphore_key='reqpm:task:semaphore',
+    use_db_setting=False,
+    slot_label='task',
+)

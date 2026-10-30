@@ -513,8 +513,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 if dep.depends_on and dep.depends_on.build_status not in ('completed', 'not_required')
             ]
 
+            package.archive_build_logs()
             package.build_error_message = ''
-            package.build_log = ''
             all_names.append(package.name)
 
             if unbuilt_deps:

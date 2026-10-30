@@ -13,6 +13,8 @@ REDIS_PID="$SCRIPT_DIR/.redis.pid"
 CELERY_PID="$SCRIPT_DIR/.celery.pid"
 CELERY_BEAT_PID="$SCRIPT_DIR/.celery-beat.pid"
 CELERY_PROJECTS_PID="$SCRIPT_DIR/.celery-projects.pid"
+CELERY_TASKS_PID="$SCRIPT_DIR/.celery-tasks.pid"
+CELERY_AI_PID="$SCRIPT_DIR/.celery-ai.pid"
 FRONTEND_PID="$SCRIPT_DIR/.frontend.pid"
 
 # Log files
@@ -23,6 +25,11 @@ REDIS_LOG="$LOG_DIR/redis.log"
 CELERY_LOG="$LOG_DIR/celery.log"
 CELERY_BEAT_LOG="$LOG_DIR/celery-beat.log"
 CELERY_PROJECTS_LOG="$LOG_DIR/celery-projects.log"
+CELERY_TASKS_LOG="$LOG_DIR/celery-tasks.log"
+CELERY_AI_LOG="$LOG_DIR/celery-ai.log"
+
+# Concurrency of the non-build tasks worker (fetch, spec generation, ...)
+CELERY_TASKS_CONCURRENCY="${CELERY_TASKS_CONCURRENCY:-2}"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
 
 # Virtual environment
@@ -139,27 +146,77 @@ start_celery() {
         return 0
     fi
     
-    print_status "Starting Celery worker..."
+    print_status "Starting Celery build worker..."
     
     source "$VENV/bin/activate"
 
     local celery_concurrency
     celery_concurrency=$(get_celery_worker_concurrency)
     
-    nohup celery -A backend.reqpm worker -l info --concurrency="$celery_concurrency" --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
+    # Only RPM builds; everything else runs on the tasks worker.
+    nohup celery -A backend.reqpm worker -l info -Q builds --concurrency="$celery_concurrency" \
+        --hostname=builds@%h --pidfile="$CELERY_PID" > "$CELERY_LOG" 2>&1 &
     
     sleep 2
     if is_running "$CELERY_PID"; then
-        print_success "Celery worker started (PID: $(cat $CELERY_PID)) with concurrency=$celery_concurrency"
+        print_success "Celery build worker started (PID: $(cat $CELERY_PID)) with concurrency=$celery_concurrency"
     else
-        print_error "Failed to start Celery worker"
+        print_error "Failed to start Celery build worker"
         return 1
     fi
 }
 
-# Function to start the serial projects worker (clone + resolve tasks).
-# concurrency=1 ensures project resolution tasks never run concurrently,
-# preventing SQLite write-lock contention between multiple projects.
+# Function to start the non-build tasks worker (source fetching, spec
+# generation, metadata, orchestration). Separate from builds so
+# these never wait behind long-running RPM builds.
+start_celery_tasks() {
+    if is_running "$CELERY_TASKS_PID"; then
+        print_warning "Celery tasks worker is already running (PID: $(cat $CELERY_TASKS_PID))"
+        return 0
+    fi
+
+    print_status "Starting Celery tasks worker..."
+
+    source "$VENV/bin/activate"
+
+    nohup celery -A backend.reqpm worker -l info -Q celery --concurrency="$CELERY_TASKS_CONCURRENCY" \
+        --hostname=tasks@%h --pidfile="$CELERY_TASKS_PID" \
+        > "$CELERY_TASKS_LOG" 2>&1 &
+
+    sleep 2
+    if is_running "$CELERY_TASKS_PID"; then
+        print_success "Celery tasks worker started (PID: $(cat $CELERY_TASKS_PID)) with concurrency=$CELERY_TASKS_CONCURRENCY"
+    else
+        print_error "Failed to start Celery tasks worker"
+        return 1
+    fi
+}
+
+start_celery_ai() {
+    if is_running "$CELERY_AI_PID"; then
+        print_warning "Celery AI worker is already running (PID: $(cat "$CELERY_AI_PID"))"
+        return 0
+    fi
+    source "$VENV/bin/activate"
+    local concurrency
+    concurrency=$(python manage.py shell -c "from backend.apps.core.models import SystemSettings; print(SystemSettings.load().celery_ai_concurrency)" | tail -n 1)
+    if ! [[ "$concurrency" =~ ^[0-9]+$ ]] || [ "$concurrency" -lt 1 ]; then
+        print_error "Invalid AI worker concurrency: $concurrency"
+        return 1
+    fi
+    print_status "Starting dedicated Celery AI worker..."
+    nohup celery -A backend.reqpm worker -l info -Q ai --concurrency="$concurrency" \
+        --hostname=ai@%h --pidfile="$CELERY_AI_PID" > "$CELERY_AI_LOG" 2>&1 &
+    sleep 2
+    if is_running "$CELERY_AI_PID"; then
+        print_success "Celery AI worker started with concurrency=$concurrency"
+    else
+        print_error "Failed to start Celery AI worker"
+        return 1
+    fi
+}
+
+# Project resolution stays serial to avoid SQLite write-lock contention.
 start_celery_projects() {
     if is_running "$CELERY_PROJECTS_PID"; then
         print_warning "Celery projects worker is already running (PID: $(cat $CELERY_PROJECTS_PID))"
@@ -295,13 +352,26 @@ stop_celery_projects() {
     stop_service "Celery projects worker" "$CELERY_PROJECTS_PID"
 }
 
+# Function to stop the non-build tasks worker
+stop_celery_tasks() {
+    stop_service "Celery tasks worker" "$CELERY_TASKS_PID"
+}
+
+stop_celery_ai() {
+    stop_service "Celery AI worker" "$CELERY_AI_PID"
+}
+
 reload_workers() {
     print_status "Reloading Celery workers..."
     stop_celery
+    stop_celery_tasks
     stop_celery_projects
+    stop_celery_ai
     sleep 1
     start_celery
+    start_celery_tasks
     start_celery_projects
+    start_celery_ai
 }
 
 # Function to stop Celery beat
@@ -333,15 +403,27 @@ status() {
     fi
     
     if is_running "$CELERY_PID"; then
-        print_success "Celery Worker:          Running (PID: $(cat $CELERY_PID))"
+        print_success "Celery Build Worker:    Running (PID: $(cat $CELERY_PID))"
     else
-        print_error "Celery Worker:          Stopped"
+        print_error "Celery Build Worker:    Stopped"
+    fi
+
+    if is_running "$CELERY_TASKS_PID"; then
+        print_success "Celery Tasks Worker:    Running (PID: $(cat $CELERY_TASKS_PID))"
+    else
+        print_error "Celery Tasks Worker:    Stopped"
     fi
 
     if is_running "$CELERY_PROJECTS_PID"; then
         print_success "Celery Projects Worker: Running (PID: $(cat $CELERY_PROJECTS_PID))"
     else
         print_error "Celery Projects Worker: Stopped"
+    fi
+
+    if is_running "$CELERY_AI_PID"; then
+        print_success "Celery AI Worker:       Running (PID: $(cat "$CELERY_AI_PID"))"
+    else
+        print_error "Celery AI Worker:       Stopped"
     fi
 
     if is_running "$CELERY_BEAT_PID"; then
@@ -368,7 +450,9 @@ start_all() {
     start_redis
     start_django
     start_celery
+    start_celery_tasks
     start_celery_projects
+    start_celery_ai
     start_celery_beat
     start_frontend
     
@@ -385,6 +469,8 @@ stop_all() {
     stop_frontend
     stop_beat
     stop_celery_projects
+    stop_celery_ai
+    stop_celery_tasks
     stop_celery
     stop_django
     stop_redis
@@ -434,6 +520,16 @@ restart_service() {
             sleep 1
             start_celery_projects
             ;;
+        celery-tasks)
+            stop_celery_tasks
+            sleep 1
+            start_celery_tasks
+            ;;
+        celery-ai)
+            stop_celery_ai
+            sleep 1
+            start_celery_ai
+            ;;
         workers)
             reload_workers
             ;;
@@ -452,7 +548,7 @@ restart_service() {
             ;;
         *)
             print_error "Unknown service: $service"
-            echo "Available: django, redis, celery, celery-projects, workers, beat, frontend, all"
+            echo "Available: django, redis, celery, celery-tasks, celery-projects, celery-ai, workers, beat, frontend, all"
             exit 1
             ;;
     esac
@@ -475,6 +571,12 @@ logs() {
         celery-projects)
             tail -f "$CELERY_PROJECTS_LOG"
             ;;
+        celery-tasks)
+            tail -f "$CELERY_TASKS_LOG"
+            ;;
+        celery-ai)
+            tail -f "$CELERY_AI_LOG"
+            ;;
         beat)
             tail -f "$CELERY_BEAT_LOG"
             ;;
@@ -482,11 +584,11 @@ logs() {
             tail -f "$FRONTEND_LOG"
             ;;
         all)
-            tail -f "$DJANGO_LOG" "$REDIS_LOG" "$CELERY_LOG" "$CELERY_BEAT_LOG" "$FRONTEND_LOG"
+            tail -f "$DJANGO_LOG" "$REDIS_LOG" "$CELERY_LOG" "$CELERY_TASKS_LOG" "$CELERY_AI_LOG" "$CELERY_PROJECTS_LOG" "$CELERY_BEAT_LOG" "$FRONTEND_LOG"
             ;;
         *)
             print_error "Unknown service: $service"
-            echo "Available: django, redis, celery, beat, frontend, all"
+            echo "Available: django, redis, celery, celery-tasks, celery-projects, celery-ai, beat, frontend, all"
             exit 1
             ;;
     esac
@@ -501,12 +603,14 @@ case "${1:-}" in
                 redis) start_redis ;;
                 celery) start_celery ;;
                 celery-projects) start_celery_projects ;;
+                celery-tasks) start_celery_tasks ;;
+                celery-ai) start_celery_ai ;;
                 beat) start_celery_beat ;;
                 frontend) start_frontend ;;
                 all) start_all ;;
                 *)
                     print_error "Unknown service: $2"
-                    echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
+                    echo "Available: django, redis, celery, celery-tasks, celery-projects, celery-ai, beat, frontend, all"
                     exit 1
                     ;;
             esac
@@ -521,12 +625,14 @@ case "${1:-}" in
                 redis) stop_redis ;;
                 celery) stop_celery ;;
                 celery-projects) stop_celery_projects ;;
+                celery-tasks) stop_celery_tasks ;;
+                celery-ai) stop_celery_ai ;;
                 beat) stop_beat ;;
                 frontend) stop_frontend ;;
                 all) stop_all ;;
                 *)
                     print_error "Unknown service: $2"
-                    echo "Available: django, redis, celery, celery-projects, beat, frontend, all"
+                    echo "Available: django, redis, celery, celery-tasks, celery-projects, celery-ai, beat, frontend, all"
                     exit 1
                     ;;
             esac
@@ -594,9 +700,9 @@ case "${1:-}" in
         echo "  stop [service]    - Stop all services or specific service"
         echo "  restart [service] - Restart all services or specific service"
         echo "  status            - Show status of all services"
-        echo "  logs <service>    - Tail logs (django|redis|celery|beat|frontend|all)"
+        echo "  logs <service>    - Tail logs (django|redis|celery|celery-tasks|celery-projects|celery-ai|beat|frontend|all)"
         echo ""
-        echo "Services: django, redis, celery, beat, frontend, all"
+        echo "Services: django, redis, celery (builds), celery-tasks, celery-projects, celery-ai, workers, beat, frontend, all"
         echo ""
         echo "Individual service control (legacy):"
         echo "  start-redis, stop-redis"

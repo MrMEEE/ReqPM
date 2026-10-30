@@ -100,6 +100,10 @@ class Package(models.Model):
     spec_file_content = models.TextField(blank=True)
     spec_file_path = models.CharField(max_length=500, blank=True)
     spec_file_modified = models.BooleanField(default=False)
+    autofix_enabled = models.BooleanField(
+        default=True,
+        help_text=_('Automatically apply rule-based and AI fixes when a build fails'),
+    )
     
     # Build information (stored directly on package)
     build_status = models.CharField(
@@ -122,9 +126,12 @@ class Package(models.Model):
     build_completed_at = models.DateTimeField(null=True, blank=True)
     build_log = models.TextField(blank=True)
     build_root_log = models.TextField(blank=True)
+    build_state_log = models.TextField(blank=True)
     last_build_log = models.TextField(blank=True)
     last_build_root_log = models.TextField(blank=True)
+    last_build_state_log = models.TextField(blank=True)
     build_error_message = models.TextField(blank=True)
+    autofix_context = models.JSONField(default=dict, blank=True)
     build_dependency_repo_url = models.CharField(
         max_length=500,
         blank=True,
@@ -153,11 +160,13 @@ class Package(models.Model):
 
     def archive_build_logs(self) -> None:
         """Move the current attempt logs to the last-attempt fields and clear them."""
-        if self.build_log or self.build_root_log:
+        if self.build_log or self.build_root_log or self.build_state_log:
             self.last_build_log = self.build_log
             self.last_build_root_log = self.build_root_log
+            self.last_build_state_log = self.build_state_log
         self.build_log = ''
         self.build_root_log = ''
+        self.build_state_log = ''
     
     class Meta:
         db_table = 'packages'

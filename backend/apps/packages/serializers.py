@@ -9,19 +9,148 @@ from backend.apps.packages.models import (
 from backend.apps.users.serializers import UserSerializer
 
 
+def _collect_dependency_blockers(package, node_cache):
+    """Include blockers of waiting dependencies, visiting each package once."""
+    from backend.apps.packages.tasks import (
+        _analyze_missing_item_resolution, _normalize_dep_names,
+        _is_self_dependency_item, _satisfies_dep_version_constraint, _built_for_rhel,
+    )
+
+    missing_categories = {
+        'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+        'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC',
+    }
+    queue = [package]
+    visited = set()
+    blockers = []
+    while queue:
+        current = queue.pop()
+        if current.pk in visited:
+            continue
+        visited.add(current.pk)
+        if current.build_status not in (
+            'waiting_for_deps', 'dep_build_pending', 'missing_packages', 'pending', 'failed',
+        ):
+            continue
+        if current.pk in node_cache:
+            cached_blockers, cached_dependencies = node_cache[current.pk]
+            blockers.extend(cached_blockers)
+            queue.extend(cached_dependencies)
+            continue
+        blocker_start = len(blockers)
+        queue_start = len(queue)
+        items = [
+            item for error in (current.analyzed_errors or [])
+            if error.get('category') in missing_categories
+            for item in (error.get('items') or [])
+            if _normalize_dep_names(item) and not _is_self_dependency_item(current, item)
+        ]
+        resolution = _analyze_missing_item_resolution(current, current.project, items)
+        for item in (
+            resolution['unresolved_with_project_match']
+            + resolution['unresolved_without_project_match']
+        ):
+            names = {name.lower() for name in _normalize_dep_names(item)}
+            candidates = []
+            for dep in resolution['matched']:
+                if dep.pk == current.pk or dep.name.lower() not in names:
+                    continue
+                if not _satisfies_dep_version_constraint(item, dep.version):
+                    reason = 'Version conflict'
+                elif not _built_for_rhel(dep, current.project.rhel_version):
+                    reason = 'Built for a different RHEL version'
+                elif dep.build_status not in ('completed', 'not_required'):
+                    reason = 'Dependency is not built'
+                else:
+                    reason = 'Required RPM extras are missing or not enabled'
+                candidates.append({
+                    'id': dep.pk, 'name': dep.name, 'version': dep.version,
+                    'build_status': dep.build_status, 'reason': reason,
+                })
+                queue.append(dep)
+            blockers.append({
+                'package_id': current.pk, 'package_name': current.name,
+                'requirement': item, 'candidates': candidates,
+            })
+        if current.build_status == 'waiting_for_deps':
+            for relation in current.dependencies.select_related('depends_on'):
+                dep = relation.depends_on
+                if dep.build_status in ('completed', 'not_required'):
+                    continue
+                blockers.append({
+                    'package_id': current.pk, 'package_name': current.name,
+                    'requirement': relation.version_constraint or dep.name,
+                    'candidates': [{
+                        'id': dep.pk, 'name': dep.name, 'version': dep.version,
+                        'build_status': dep.build_status, 'reason': 'Dependency is not built',
+                    }],
+                })
+                queue.append(dep)
+        node_cache[current.pk] = (blockers[blocker_start:], queue[queue_start:])
+    return blockers
+
+
+def get_dependency_blockers(package):
+    return _collect_dependency_blockers(package, {})
+
+
+class PackageStatusSerializer(serializers.ModelSerializer):
+    def get_dependency_blockers(self, obj):
+        cache = self.context.setdefault('dependency_blockers', {})
+        if obj.pk not in cache:
+            nodes = self.context.setdefault('dependency_blocker_nodes', {})
+            cache[obj.pk] = _collect_dependency_blockers(obj, nodes)
+        return cache[obj.pk]
+
+    def get_status_detail(self, obj):
+        lines = [obj.get_build_status_display()]
+        blockers = self.get_dependency_blockers(obj)
+        for blocker in blockers:
+            lines.append(f"{blocker['package_name']} requires {blocker['requirement']}")
+            if not blocker['candidates']:
+                lines.append('No matching package in this project.')
+            for candidate in blocker['candidates']:
+                lines.append(
+                    f"{candidate['reason']}: {candidate['name']} {candidate['version']} "
+                    f"({candidate['build_status'].replace('_', ' ')})",
+                )
+        if obj.build_status == 'pending' and not blockers:
+            lines.append('Queued for build execution; waiting for a worker or available build slot.')
+        if obj.build_error_message and obj.build_status == 'failed':
+            lines.append(obj.build_error_message)
+        return '\n'.join(lines)
+
+
 class PackageDependencySerializer(serializers.ModelSerializer):
     """Serializer for PackageDependency model"""
     
     depends_on_name = serializers.CharField(source='depends_on.name', read_only=True)
     depends_on_version = serializers.CharField(source='depends_on.version', read_only=True)
+    depends_on_build_status = serializers.CharField(source='depends_on.build_status', read_only=True)
     
     class Meta:
         model = PackageDependency
         fields = [
             'id', 'depends_on', 'depends_on_name', 'depends_on_version',
-            'dependency_type', 'version_constraint'
+            'depends_on_build_status', 'dependency_type', 'version_constraint'
         ]
         read_only_fields = ['id']
+
+
+class PackageDependentSerializer(serializers.ModelSerializer):
+    """Serializer for the reverse side of PackageDependency (packages requiring this one)"""
+
+    package_name = serializers.CharField(source='package.name', read_only=True)
+    package_version = serializers.CharField(source='package.version', read_only=True)
+    package_build_status = serializers.CharField(source='package.build_status', read_only=True)
+
+    class Meta:
+        model = PackageDependency
+        fields = [
+            'id', 'package', 'package_name', 'package_version',
+            'package_build_status', 'dependency_type', 'version_constraint'
+        ]
+        read_only_fields = fields
 
 
 class PackageBuildSerializer(serializers.ModelSerializer):
@@ -88,7 +217,7 @@ class AIFixAttemptSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class PackageListSerializer(serializers.ModelSerializer):
+class PackageListSerializer(PackageStatusSerializer):
     """Lightweight serializer for package listings"""
     
     project_name = serializers.CharField(source='project.name', read_only=True)
@@ -102,6 +231,8 @@ class PackageListSerializer(serializers.ModelSerializer):
     waiting_for_dep_names = serializers.SerializerMethodField()
     failed_dep_names = serializers.SerializerMethodField()
     dep_blocking_items = serializers.SerializerMethodField()
+    status_detail = serializers.SerializerMethodField()
+    dependency_blockers = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
@@ -114,7 +245,7 @@ class PackageListSerializer(serializers.ModelSerializer):
             'build_system',
             'build_status', 'build_started_at', 'build_completed_at',
             'build_error_message', 'build_dependency_repo_url', 'analyzed_errors', 'srpm_path', 'rpm_path',
-            'has_build_log', 'waiting_for_dep_names', 'failed_dep_names', 'dep_blocking_items',
+            'has_build_log', 'waiting_for_dep_names', 'failed_dep_names', 'dep_blocking_items', 'status_detail', 'dependency_blockers',
             'created_at', 'updated_at', 'last_built_at'
         ]
         read_only_fields = [
@@ -161,66 +292,20 @@ class PackageListSerializer(serializers.ModelSerializer):
         """For dep_build_pending packages, return only the items still blocked (not yet completed)."""
         if obj.build_status != 'dep_build_pending':
             return []
-        import re
-        from django.db.models import Q
-        from backend.apps.packages.models import Package as Pkg
-
-        missing_cats = {
-            'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
-            'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC'
-        }
-        all_items = [
-            item
-            for e in (obj.analyzed_errors or [])
-            if e.get('category') in missing_cats
-            for item in (e.get('items') or [])
-            if item
+        from backend.apps.packages.tasks import _analyze_missing_item_resolution
+        items = [
+            item for error in (obj.analyzed_errors or [])
+            if error.get('category') in {
+                'Missing Packages', 'Missing Dependencies', 'Missing Python Modules',
+                'Missing Header Files', 'Missing Rust/Cargo', 'Missing Python Wheel', 'Missing GCC',
+            }
+            for item in (error.get('items') or []) if item
         ]
-        if not all_items:
-            return []
-
-        # Normalize: python3dist(foo) >= x  →  candidate names
-        def _normalize(item):
-            s = item.strip().strip('()')
-            s = re.split(r'\s+(with|[><=!])', s)[0].strip()
-            m = re.match(r'python3?dist\(([^)]+)\)', s, re.IGNORECASE)
-            if m:
-                pkg_name = m.group(1).replace('_', '-').lower()
-                return [f'python3-{pkg_name}', pkg_name]
-            m = re.match(r'python3?\(([^)]+)\)', s, re.IGNORECASE)
-            if m:
-                pkg_name = m.group(1).replace('_', '-').lower()
-                return [f'python3-{pkg_name}', pkg_name]
-            return [s, s.replace('_', '-')]
-
-        # Build a map: candidate_name → original item string
-        name_to_item = {}
-        for item in all_items:
-            for name in _normalize(item):
-                name_to_item[name.lower()] = item
-
-        if not name_to_item:
-            return all_items
-
-        # Find matching project packages that are NOT yet completed
-        q = Q()
-        for name in name_to_item:
-            q |= Q(name__iexact=name)
-        unresolved_names = set(
-            Pkg.objects.filter(project=obj.project)
-            .filter(q)
-            .exclude(build_status__in=('completed', 'not_required'))
-            .values_list('name', flat=True)
+        resolution = _analyze_missing_item_resolution(obj, obj.project, items)
+        return (
+            resolution['unresolved_with_project_match']
+            + resolution['unresolved_without_project_match']
         )
-
-        # Return original item strings whose project package is still unresolved
-        seen = set()
-        result = []
-        for name, item in name_to_item.items():
-            if name in {n.lower() for n in unresolved_names} and item not in seen:
-                seen.add(item)
-                result.append(item)
-        return result
 
     def get_dependent_packages(self, obj):
         """Get list of packages that depend on this package"""
@@ -249,7 +334,7 @@ class PackageExtraSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'dependencies', 'created_at', 'updated_at']
 
 
-class PackageDetailSerializer(serializers.ModelSerializer):
+class PackageDetailSerializer(PackageStatusSerializer):
     """Detailed serializer for package with all related data"""
     
     project_name = serializers.CharField(source='project.name', read_only=True)
@@ -260,15 +345,19 @@ class PackageDetailSerializer(serializers.ModelSerializer):
     latest_spec = serializers.SerializerMethodField()
     source_fetched = serializers.BooleanField(read_only=True)
     has_build_log = serializers.SerializerMethodField()
+    dependency_blockers = serializers.SerializerMethodField()
+    status_detail = serializers.SerializerMethodField()
+    ignored_version_requirements = serializers.SerializerMethodField()
     
     class Meta:
         model = Package
         fields = [
             'id', 'name', 'version', 'package_type',
-            'status', 'build_order', 'description', 'license', 'homepage',
-            'build_system',
+            'status', 'build_order', 'summary', 'description', 'license', 'homepage',
+            'build_system', 'autofix_enabled',
             'build_status', 'build_error_message', 'analyzed_errors',
-            'source_fetched', 'has_build_log',
+            'source_fetched', 'has_build_log', 'dependency_blockers', 'status_detail',
+            'ignored_version_requirements',
             'project', 'project_name', 'dependencies', 'builds',
             'spec_files', 'extras', 'latest_spec',
             'created_at', 'updated_at'
@@ -284,6 +373,11 @@ class PackageDetailSerializer(serializers.ModelSerializer):
         if hasattr(obj, '_has_build_log'):
             return obj._has_build_log
         return bool(obj.build_log)
+
+    def get_ignored_version_requirements(self, obj):
+        from backend.apps.packages.version_relax import ignored_version_requirements
+        latest = obj.spec_revisions.order_by('-created_at').only('content').first()
+        return ignored_version_requirements(latest.content) if latest else []
 
     def get_latest_spec(self, obj):
         """Get latest spec file revision"""

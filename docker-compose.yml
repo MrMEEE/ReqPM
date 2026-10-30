@@ -64,13 +64,55 @@ services:
       - reqpm_network
     restart: unless-stopped
 
-  # Celery worker
+  # Celery build worker (RPM builds only)
   celery_worker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: reqpm_celery
-    command: celery -A backend.reqpm worker -l info --concurrency=4
+    command: celery -A backend.reqpm worker -l info -Q builds --concurrency=4 --hostname=builds@%h
+    volumes:
+      - .:/app
+      - git_cache:/app/data/git_cache
+      - builds:/app/data/builds
+      - repositories:/app/data/repositories
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+  # Celery tasks worker (fetching, spec generation, everything except builds)
+  celery_tasks:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reqpm_celery_tasks
+    command: celery -A backend.reqpm worker -l info -Q celery,projects --concurrency=2 --hostname=tasks@%h
+    volumes:
+      - .:/app
+      - git_cache:/app/data/git_cache
+      - builds:/app/data/builds
+      - repositories:/app/data/repositories
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - reqpm_network
+    restart: unless-stopped
+
+  # Dedicated AI-fix processes; never consume build slots.
+  celery_ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reqpm_celery_ai
+    command: sh -c 'celery -A backend.reqpm worker -l info -Q ai --concurrency=$$(python manage.py shell -c "from backend.apps.core.models import SystemSettings; print(SystemSettings.load().celery_ai_concurrency)" | tail -n 1) --hostname=ai@%h'
     volumes:
       - .:/app
       - git_cache:/app/data/git_cache

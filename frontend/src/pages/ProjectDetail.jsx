@@ -5,7 +5,9 @@ import { useState, useEffect, useRef } from 'react';
 import { projectsAPI, buildsAPI, packagesAPI } from '../lib/api';
 import { MockStatus } from '../components/SystemHealthBanner';
 import ConfirmDialog from '../components/ConfirmDialog';
+import VersionDropdown from '../components/VersionDropdown';
 import LivePackageBuildLog from '../components/LivePackageBuildLog';
+import DependencyBlockers from '../components/DependencyBlockers';
 import { useToast } from '../contexts/ToastContext';
 
 const StatusBadge = ({ status }) => {
@@ -25,84 +27,6 @@ const StatusBadge = ({ status }) => {
       <Icon className="w-3.5 h-3.5" />
       {config.label}
     </span>
-  );
-};
-
-const VersionDropdown = ({ packageId, currentVersion, onVersionChange, toast }) => {
-  const [isOpen, setIsOpen] = useState(false);
-  const [versions, setVersions] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [dropdownStyle, setDropdownStyle] = useState({});
-  const buttonRef = useRef(null);
-
-  const handleClick = async () => {
-    if (!isOpen) {
-      if (buttonRef.current) {
-        const rect = buttonRef.current.getBoundingClientRect();
-        setDropdownStyle({ top: rect.bottom + 4, left: rect.left });
-      }
-      if (versions.length === 0) {
-        setLoading(true);
-        try {
-          const response = await packagesAPI.getVersions(packageId);
-          setVersions(response.data.versions || []);
-        } catch (error) {
-          console.error('Failed to fetch versions:', error);
-          toast.error('Failed to fetch versions');
-        } finally {
-          setLoading(false);
-        }
-      }
-    }
-    setIsOpen(!isOpen);
-  };
-
-  const handleVersionSelect = (version) => {
-    setIsOpen(false);
-    if (version !== currentVersion) {
-      onVersionChange(packageId, version);
-    }
-  };
-
-  return (
-    <div className="relative">
-      <button
-        ref={buttonRef}
-        onClick={handleClick}
-        className="text-blue-400 hover:text-blue-300 underline text-sm"
-        disabled={loading}
-      >
-        {loading ? 'Loading...' : currentVersion}
-      </button>
-      {isOpen && (
-        <>
-          <div
-            className="fixed inset-0 z-[999]"
-            onClick={() => setIsOpen(false)}
-          />
-          <div
-            className="fixed z-[1000] w-32 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-auto flex flex-col"
-            style={dropdownStyle}
-          >
-            {versions.length === 0 ? (
-              <div className="px-3 py-2 text-sm text-gray-400">No versions</div>
-            ) : (
-              versions.map((version) => (
-                <button
-                  key={version}
-                  onClick={() => handleVersionSelect(version)}
-                  className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-600 ${
-                    version === currentVersion ? 'bg-gray-600 text-white' : 'text-gray-200'
-                  }`}
-                >
-                  {version}
-                </button>
-              ))
-            )}
-          </div>
-        </>
-      )}
-    </div>
   );
 };
 
@@ -383,8 +307,24 @@ export default function ProjectDetail() {
           queryClient.setQueryData(['project-packages', id], (oldData) => {
             if (!oldData) return oldData;
             
-            const updatePackage = (pkg) => 
-              pkg.id === data.package.id ? { ...pkg, ...data.package } : pkg;
+            const updated = data.package;
+            const resolved = ['completed', 'not_required'].includes(updated.build_status);
+            const refreshBlockers = (blockers) => {
+              if (!blockers?.some(b => b.candidates?.some(c => c.id === updated.id))) return blockers;
+              return blockers
+                .map(b => {
+                  const candidates = b.candidates
+                    .map(c => (c.id === updated.id ? { ...c, build_status: updated.build_status } : c))
+                    .filter(c => !(c.id === updated.id && resolved && c.reason === 'Dependency is not built'));
+                  return candidates.length || !b.candidates.length ? { ...b, candidates } : null;
+                })
+                .filter(Boolean);
+            };
+            const updatePackage = (pkg) => {
+              if (pkg.id === updated.id) return { ...pkg, ...updated };
+              const dependency_blockers = refreshBlockers(pkg.dependency_blockers);
+              return dependency_blockers === pkg.dependency_blockers ? pkg : { ...pkg, dependency_blockers };
+            };
             
             return {
               ...oldData,
@@ -1311,7 +1251,7 @@ export default function ProjectDetail() {
                             className="px-4 py-3 whitespace-nowrap text-sm cursor-pointer"
                             onClick={() => navigate(`/packages/${pkg.id}`)}
                           >
-                            <StatusBadge status={pkg.status} />
+                            <span title={pkg.status_detail}><StatusBadge status={pkg.status} /></span>
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             {pkg.source_fetched ? (
@@ -1326,21 +1266,21 @@ export default function ProjectDetail() {
                               <span className="text-gray-500">Not fetched</span>
                             )}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-sm">
+                          <td className="px-4 py-3 whitespace-nowrap text-sm" title={pkg.status_detail}>
                             {pkg.build_status === 'completed' && (
                               <span className="px-2 py-1 bg-green-900/30 text-green-300 text-xs rounded">
                                 Built
                               </span>
                             )}
                             {pkg.build_status === 'failed' && (
-                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.build_error_message}>
+                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.status_detail || pkg.build_error_message}>
                                 Failed
                               </span>
                             )}
                             {pkg.build_status === 'missing_packages' && (
                               <span
                                 className="px-2 py-1 bg-amber-900/30 text-amber-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || pkg.build_error_message}
+                                title={pkg.status_detail || pkg.build_error_message}
                               >
                                 <AlertTriangle className="h-3 w-3" />
                                 Missing Deps
@@ -1361,7 +1301,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
                                 className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
-                                title={[
+                                title={pkg.status_detail || [
                                   pkg.failed_dep_names?.length ? `Blocked by failed dep(s):\n${pkg.failed_dep_names.join('\n')}` : '',
                                   pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : '',
                                 ].filter(Boolean).join('\n\n') || 'Waiting for dependencies to be built'}
@@ -1373,7 +1313,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'dep_build_pending' && (
                               <span
                                 className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.dep_blocking_items?.length ? `Still waiting for:\n${pkg.dep_blocking_items.join('\n')}` : 'Waiting for project packages to be built'}
+                                title={pkg.status_detail || 'Waiting for project packages to be built'}
                               >
                                 <Clock className="h-3 w-3" />
                                 Dep Build Pending
@@ -1389,6 +1329,7 @@ export default function ProjectDetail() {
                                 Not Built
                               </span>
                             )}
+                            <DependencyBlockers blockers={pkg.dependency_blockers} />
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             <div className="flex flex-col gap-1">
@@ -1710,7 +1651,7 @@ export default function ProjectDetail() {
                             className="px-4 py-3 whitespace-nowrap text-sm cursor-pointer"
                             onClick={() => navigate(`/packages/${pkg.id}`)}
                           >
-                            <StatusBadge status={pkg.status} />
+                            <span title={pkg.status_detail}><StatusBadge status={pkg.status} /></span>
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             {pkg.source_fetched ? (
@@ -1725,21 +1666,21 @@ export default function ProjectDetail() {
                               <span className="text-gray-500">Not fetched</span>
                             )}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-sm">
+                          <td className="px-4 py-3 whitespace-nowrap text-sm" title={pkg.status_detail}>
                             {pkg.build_status === 'completed' && (
                               <span className="px-2 py-1 bg-green-900/30 text-green-300 text-xs rounded">
                                 Built
                               </span>
                             )}
                             {pkg.build_status === 'failed' && (
-                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.build_error_message}>
+                              <span className="px-2 py-1 bg-red-900/30 text-red-300 text-xs rounded" title={pkg.status_detail || pkg.build_error_message}>
                                 Failed
                               </span>
                             )}
                             {pkg.build_status === 'missing_packages' && (
                               <span
                                 className="px-2 py-1 bg-amber-900/30 text-amber-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.analyzed_errors?.filter(e => ['Missing Packages','Missing Dependencies','Missing Python Modules','Missing Header Files','Missing Rust/Cargo','Missing Python Wheel','Missing GCC'].includes(e.category)).flatMap(e => e.items || []).join('\n') || pkg.build_error_message}
+                                title={pkg.status_detail || pkg.build_error_message}
                               >
                                 <AlertTriangle className="h-3 w-3" />
                                 Missing Deps
@@ -1760,7 +1701,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'waiting_for_deps' && (
                               <span
                                 className={`px-2 py-1 ${(pkg.failed_dep_names?.length && !pkg.waiting_for_dep_names?.length) ? 'bg-red-900/30 text-red-300' : 'bg-orange-900/30 text-orange-300'} text-xs rounded inline-flex items-center gap-1 cursor-help`}
-                                title={[
+                                title={pkg.status_detail || [
                                   pkg.failed_dep_names?.length ? `Blocked by failed dep(s):\n${pkg.failed_dep_names.join('\n')}` : '',
                                   pkg.waiting_for_dep_names?.length ? `Waiting for:\n${pkg.waiting_for_dep_names.join('\n')}` : '',
                                 ].filter(Boolean).join('\n\n') || 'Waiting for dependencies to be built'}
@@ -1772,7 +1713,7 @@ export default function ProjectDetail() {
                             {pkg.build_status === 'dep_build_pending' && (
                               <span
                                 className="px-2 py-1 bg-cyan-900/30 text-cyan-300 text-xs rounded inline-flex items-center gap-1 cursor-help"
-                                title={pkg.dep_blocking_items?.length ? `Still waiting for:\n${pkg.dep_blocking_items.join('\n')}` : 'Waiting for project packages to be built'}
+                                title={pkg.status_detail || 'Waiting for project packages to be built'}
                               >
                                 <Clock className="h-3 w-3" />
                                 Dep Build Pending
@@ -1788,6 +1729,7 @@ export default function ProjectDetail() {
                                 Not Built
                               </span>
                             )}
+                            <DependencyBlockers blockers={pkg.dependency_blockers} />
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-300">
                             <div className="flex flex-col gap-1">

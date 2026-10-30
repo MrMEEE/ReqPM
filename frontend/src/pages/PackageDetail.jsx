@@ -1,11 +1,14 @@
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Box, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download, Terminal, Wrench, ThumbsUp, ThumbsDown, Brain } from 'lucide-react';
+import { ArrowLeft, Package as PackageIcon, AlertCircle, GitBranch, FileCode, Edit2, Save, X, RefreshCw, Puzzle, Hammer, Download, Terminal, Wrench, ThumbsUp, ThumbsDown, Brain } from 'lucide-react';
 import { packagesAPI } from '../lib/api';
 import { useState, useEffect } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import LivePackageBuildLog from '../components/LivePackageBuildLog';
 import AIConversations from '../components/AIConversations';
+import DependencyBlockers, { IgnoredVersionRequirements } from '../components/DependencyBlockers';
+import PackageDependencies from '../components/PackageDependencies';
+import VersionDropdown from '../components/VersionDropdown';
 
 const StatusBadge = ({ status }) => {
   const statusConfig = {
@@ -293,6 +296,40 @@ export default function PackageDetail() {
     },
   });
 
+  const changeVersionMutation = useMutation({
+    mutationFn: async (version) => {
+      const response = await packagesAPI.changeVersion(id, version);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data?.message || 'Version changed');
+      queryClient.invalidateQueries(['package', id]);
+      queryClient.invalidateQueries(['package-specs', id]);
+      queryClient.invalidateQueries(['package-logs', id]);
+      queryClient.invalidateQueries(['package-builds', id]);
+      queryClient.invalidateQueries(['package-dependencies', id]);
+      queryClient.invalidateQueries(['project-packages']);
+    },
+    onError: (error) => {
+      toast.error(`Failed to change version: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
+  const setAutofixMutation = useMutation({
+    mutationFn: async (enabled) => {
+      const response = await packagesAPI.setAutofix(id, enabled);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data?.message || 'Autofixing updated');
+      queryClient.invalidateQueries(['package', id]);
+      queryClient.invalidateQueries(['package-logs', id]);
+    },
+    onError: (error) => {
+      toast.error(`Failed to update autofixing: ${error.response?.data?.error || error.message}`);
+    },
+  });
+
   const fixAndRebuildMutation = useMutation({
     mutationFn: async () => {
       const response = await packagesAPI.fixAndRebuild(id);
@@ -466,26 +503,43 @@ export default function PackageDetail() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-4 min-w-0 flex-1">
           <button
             onClick={() => navigate(-1)}
             className="p-2 hover:bg-gray-800 rounded-lg transition-colors"
           >
             <ArrowLeft className="h-5 w-5 text-gray-400" />
           </button>
-          <div>
+          <div className="min-w-0">
             <h1 className="text-2xl font-bold text-white flex items-center gap-3">
               <PackageIcon className="h-7 w-7" />
               {pkg.name}
             </h1>
-            {pkg.description && (
-              <p className="text-gray-400 mt-1">{pkg.description}</p>
+            {pkg.summary && (
+              <p className="text-gray-400 mt-1 break-words">{pkg.summary}</p>
             )}
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap justify-end">
-          <StatusBadge status={pkg.status} />
+          <span title={pkg.status_detail}><StatusBadge status={pkg.status} /></span>
+
+          {/* Autofixing toggle */}
+          <button
+            onClick={() => setAutofixMutation.mutate(!(pkg.autofix_enabled ?? true))}
+            disabled={setAutofixMutation.isPending}
+            className={`px-3 py-1.5 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 text-sm ${
+              (pkg.autofix_enabled ?? true)
+                ? 'bg-gray-700 hover:bg-gray-600'
+                : 'bg-amber-600 hover:bg-amber-700'
+            }`}
+            title={(pkg.autofix_enabled ?? true)
+              ? 'Autofixing is active: failed builds are fixed automatically. Click to switch to manual fixing.'
+              : 'Autofixing is deactivated: failed builds are left for manual fixing. Click to re-enable.'}
+          >
+            <Wrench className="h-3.5 w-3.5" />
+            {(pkg.autofix_enabled ?? true) ? 'Deactivate Autofixing' : 'Activate Autofixing'}
+          </button>
 
           {/* Live Log — only while building */}
           {['building', 'fixing'].includes(pkg.build_status) && (
@@ -585,6 +639,32 @@ export default function PackageDetail() {
         </div>
       </div>
 
+      <section className="bg-gray-800 rounded-lg p-4 border border-gray-700" aria-label="Build status">
+        <h2 className="font-semibold text-white mb-2">Build status</h2>
+        <p className="text-sm text-gray-300 whitespace-pre-wrap break-words">
+          {pkg.dependency_blockers?.length
+            ? pkg.build_status.replaceAll('_', ' ')
+            : pkg.status_detail || pkg.build_status.replaceAll('_', ' ')}
+        </p>
+        <DependencyBlockers blockers={pkg.dependency_blockers} />
+        <IgnoredVersionRequirements
+          packageId={pkg.id}
+          packageName={pkg.name}
+          dependencies={pkg.ignored_version_requirements}
+        />
+      </section>
+
+      {pkg.description && (
+        <details className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+          <summary className="text-sm text-indigo-400 cursor-pointer hover:text-indigo-300">
+            Package description
+          </summary>
+          <div className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap break-words text-sm text-gray-400">
+            {pkg.description}
+          </div>
+        </details>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Package Information */}
         <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
@@ -592,7 +672,15 @@ export default function PackageDetail() {
           <div className="space-y-3">
             <div>
               <label className="text-sm font-medium text-gray-400">Version</label>
-              <p className="text-gray-200">{pkg.version || 'Not specified'}</p>
+              <div className="text-gray-200">
+                <VersionDropdown
+                  packageId={pkg.id}
+                  currentVersion={changeVersionMutation.isPending ? 'Changing...' : (pkg.version || 'Not specified')}
+                  onVersionChange={(_pkgId, version) => changeVersionMutation.mutate(version)}
+                  toast={toast}
+                  disabled={changeVersionMutation.isPending}
+                />
+              </div>
             </div>
             <div>
               <label className="text-sm font-medium text-gray-400">Type</label>
@@ -702,7 +790,12 @@ export default function PackageDetail() {
               </div>
             </div>
           ) : specFiles?.length > 0 ? (
-            <div className="space-y-3">
+            <div
+              className="space-y-3 max-h-[32rem] overflow-y-auto pr-2"
+              role="region"
+              aria-label="Spec file revisions"
+              tabIndex={0}
+            >
               {specFiles.map((spec, idx) => {
                 const previousSpec = specFiles[idx + 1];
                 const contentLines = previousSpec
@@ -855,6 +948,8 @@ export default function PackageDetail() {
       />
 
       <AIConversations packageId={id} />
+
+      <PackageDependencies dependencies={dependencies} />
 
       {/* Package Extras */}
       <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
@@ -1083,50 +1178,6 @@ export default function PackageDetail() {
                 )}
               </div>
             ))}
-          </div>
-        </div>
-      )}
-
-      {/* Dependencies */}
-      {dependencies && (dependencies.runtime?.length > 0 || dependencies.build?.length > 0) && (
-        <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
-          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-            <Box className="h-5 w-5" />
-            Dependencies
-          </h2>
-          
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {dependencies.runtime?.length > 0 && (
-              <div>
-                <h3 className="text-sm font-medium text-gray-400 mb-3">Runtime Dependencies</h3>
-                <div className="space-y-1">
-                  {dependencies.runtime.map((dep) => (
-                    <div
-                      key={dep.id}
-                      className="text-sm text-gray-300 py-1 px-2 bg-gray-700/30 rounded"
-                    >
-                      {dep.depends_on_name}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            
-            {dependencies.build?.length > 0 && (
-              <div>
-                <h3 className="text-sm font-medium text-gray-400 mb-3">Build Dependencies</h3>
-                <div className="space-y-1">
-                  {dependencies.build.map((dep) => (
-                    <div
-                      key={dep.id}
-                      className="text-sm text-gray-300 py-1 px-2 bg-gray-700/30 rounded"
-                    >
-                      {dep.depends_on_name}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
         </div>
       )}

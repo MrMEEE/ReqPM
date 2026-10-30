@@ -750,7 +750,7 @@ class MockBuilder(BaseBuilder):
         root_log_path = Path(output_dir) / "root.log"
         state_log_path = Path(output_dir) / "state.log"
 
-        def _read_mock_logs(run_started_at: float) -> tuple[str, str]:
+        def _read_mock_logs(run_started_at: float) -> tuple[str, str, str]:
             logger.info(f"Checking for Mock logs in: {output_dir}")
             logger.info(f"build.log exists: {build_log_path.exists()}")
             logger.info(f"root.log exists: {root_log_path.exists()}")
@@ -785,23 +785,31 @@ class MockBuilder(BaseBuilder):
             elif root_log_path.exists():
                 logger.warning("Ignoring stale root.log from previous run")
 
-            for log_path in [build_log_path, state_log_path]:
-                if _is_fresh(log_path):
-                    try:
-                        size = log_path.stat().st_size
-                        logger.info(f"Read {log_path.name}: {size} bytes")
-                    except Exception as e:
-                        logger.warning(f"Could not stat {log_path.name}: {e}")
-                elif log_path.exists():
-                    logger.warning(f"Ignoring stale {log_path.name} from previous run")
+            state_log_content = ""
+            if _is_fresh(state_log_path):
+                try:
+                    with open(state_log_path, 'r', errors='replace') as f:
+                        state_log_content = f.read(256 * 1024)
+                except Exception as e:
+                    logger.warning(f"Could not read state.log: {e}")
+            elif state_log_path.exists():
+                logger.warning("Ignoring stale state.log from previous run")
 
-            return detailed_log, root_log_content
+            if _is_fresh(build_log_path):
+                try:
+                    logger.info(f"Read build.log: {build_log_path.stat().st_size} bytes")
+                except Exception as e:
+                    logger.warning(f"Could not stat build.log: {e}")
+            elif build_log_path.exists():
+                logger.warning("Ignoring stale build.log from previous run")
+
+            return detailed_log, root_log_content, state_log_content
 
         run_started_at = time.time()
         returncode, stdout, stderr = self._run_mock_command(
             args, timeout=7200, memory_limit=self.memory_limit
         )
-        log_output, root_log_output = _read_mock_logs(run_started_at)
+        log_output, root_log_output, state_log_output = _read_mock_logs(run_started_at)
 
         # Some mock failures (notably early infra/depsolver exits) may return
         # little or no persisted build/root logs. Preserve command stdout/stderr
@@ -832,7 +840,7 @@ class MockBuilder(BaseBuilder):
                 returncode, stdout, stderr = self._run_mock_command(
                     args, timeout=7200, memory_limit=self.memory_limit
                 )
-                log_output, root_log_output = _read_mock_logs(run_started_at)
+                log_output, root_log_output, state_log_output = _read_mock_logs(run_started_at)
             else:
                 logger.warning("Rust toolchain provision failed; returning original build failure")
 
@@ -903,6 +911,7 @@ class MockBuilder(BaseBuilder):
                 rpm_paths=rpm_files,
                 log_output=log_output,
                 root_log_output=root_log_output,
+                state_log_output=state_log_output,
                 build_duration=build_duration
             )
         else:
@@ -911,6 +920,7 @@ class MockBuilder(BaseBuilder):
                 error_message=f"Mock build failed with code {returncode}",
                 log_output=log_output,
                 root_log_output=root_log_output,
+                state_log_output=state_log_output,
                 build_duration=build_duration
             )
     

@@ -383,7 +383,27 @@ export default function Settings() {
               className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
             />
             <p className="text-sm text-gray-400 mt-2">
-              Number of Celery worker processes for the main task queue. Use Reload Workers after changing this value.
+              Number of Celery build worker processes (RPM builds only). Fetching and spec generation run separately. Use Reload Workers after changing this value.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">
+              AI Fix Worker Concurrency
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={settings.celery_ai_concurrency}
+              onChange={(e) => handleChange('celery_ai_concurrency', parseInt(e.target.value))}
+              disabled={!isAdmin}
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white disabled:opacity-50"
+            />
+            <p className="text-sm text-gray-400 mt-2">
+              Dedicated processes for AI fixes and conversation replies (default 2).
+              AI requests do not occupy build slots. The AI Max Concurrent setting still limits model requests.
+              Use Reload Workers after changing this value.
             </p>
           </div>
 
@@ -810,6 +830,43 @@ export default function Settings() {
               How long AI fixer should wait for a free concurrency slot before giving up (5-3600).
             </p>
           </div>
+
+          {[
+            {
+              key: 'ai_fixer_allow_insert_lines',
+              label: 'Allow Line Insertion',
+              description: 'Lets the AI insert up to 40 arbitrary lines before or after one exact spec line, including build/install commands and RPM macros. Name, Version, Release and Epoch cannot be added.',
+            },
+            {
+              key: 'ai_fixer_allow_spec_rewrite',
+              label: 'Allow Complete Spec Rewrite',
+              description: 'Lets the AI replace the whole spec as a last resort. Name, Version, Release and Epoch must stay unchanged, and rpmspec must parse the result.',
+            },
+          ].map(({ key, label, description }) => (
+            <div key={key} className="flex items-center justify-between">
+              <div className="flex-1 pr-4">
+                <label className="block text-sm font-medium text-gray-300 mb-1">{label}</label>
+                <p className="text-sm text-gray-400">
+                  {description} The full spec is sent to the AI while either option is enabled; generated commands run in Mock builds.
+                </p>
+              </div>
+              <button
+                onClick={() => handleChange(key, !settings[key])}
+                disabled={!isAdmin}
+                aria-pressed={Boolean(settings[key])}
+                aria-label={label}
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed ${
+                  settings[key] ? 'bg-purple-500' : 'bg-gray-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    settings[key] ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          ))}
 
           {/* Test button */}
           {isAdmin && (

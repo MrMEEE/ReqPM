@@ -674,6 +674,8 @@ def monitor_pending_work():
         _analyze_missing_item_resolution,
         _is_self_dependency_item,
         build_single_package_task,
+        ai_fix_package_task,
+        _defer_known_dependency_blockers,
         log_package,
         send_package_update,
     )
@@ -682,8 +684,23 @@ def monitor_pending_work():
     
     # Get all active/reserved tasks
     inspector = current_app.control.inspect()
-    active_tasks = inspector.active() or {}
+    active_reply = inspector.active()
+    active_tasks = active_reply or {}
     reserved_tasks = inspector.reserved() or {}
+    scheduled_tasks = inspector.scheduled() or {}
+
+    if active_reply is not None:
+        executing = {}
+        for worker_tasks in active_tasks.values():
+            for task in worker_tasks:
+                if task.get('args'):
+                    executing.setdefault(task['name'], set()).add(task['args'][0])
+        try:
+            from backend.apps.builds.concurrency import limiter, task_limiter
+            limiter.reclaim_orphaned_slots(executing)
+            task_limiter.reclaim_orphaned_slots(executing)
+        except Exception:
+            logger.exception("Failed to reclaim orphaned job slots")
     
     # Extract active task arguments for all task types
     active_task_map = {}  # task_name -> set of first arg (id)
@@ -703,8 +720,40 @@ def monitor_pending_work():
                 active_task_map[task_name] = set()
             if task.get('args'):
                 active_task_map[task_name].add(task['args'][0])
+
+    for worker_tasks in scheduled_tasks.values():
+        for scheduled in worker_tasks:
+            task = scheduled['request']
+            if task.get('args'):
+                active_task_map.setdefault(task['name'], set()).add(task['args'][0])
     
     triggered_count = 0
+
+    active_ai_ids = active_task_map.get('backend.apps.packages.tasks.ai_fix_package_task', set())
+    if active_reply is not None:
+        from django.core.cache import cache
+        for pkg in Package.objects.filter(build_status='fixing').exclude(autofix_context={}):
+            context = pkg.autofix_context
+            if context.get('phase') != 'ai':
+                continue
+            lock_key = f"package-ai-fix:{context['token']}"
+            suspect_key = f'{lock_key}:orphan'
+            if pkg.id in active_ai_ids:
+                cache.delete(suspect_key)
+                continue
+            if cache.get(lock_key):
+                # Require two observations and a responding AI worker before
+                # discarding a lock left behind by a killed worker child.
+                if not any(worker.startswith('ai@') for worker in active_reply):
+                    continue
+                if cache.add(suspect_key, True, timeout=600):
+                    continue
+                cache.delete(lock_key)
+                cache.delete(suspect_key)
+                logger.warning("Recovering abandoned AI fix for package %s", pkg.id)
+            if pkg.id not in active_ai_ids:
+                ai_fix_package_task.delay(pkg.id, context['token'])
+                triggered_count += 1
     
     # 1. Monitor pending builds
     threshold_time = timezone.now() - timedelta(seconds=30)
@@ -739,15 +788,44 @@ def monitor_pending_work():
     # 3. Recover ordinary package builds stuck in build_status='pending'.
     active_single_build_ids = active_task_map.get('backend.apps.packages.tasks.build_single_package_task', set())
 
+    waiting_packages = Package.objects.filter(
+        build_status='waiting_for_deps',
+        status='ready',
+        spec_revisions__isnull=False,
+    ).distinct().prefetch_related('dependencies__depends_on')
+
+    for pkg in waiting_packages:
+        if pkg.id in active_single_build_ids or not pkg.source_fetched:
+            continue
+        if any(
+            dep.depends_on.build_status not in ('completed', 'not_required')
+            for dep in pkg.dependencies.all()
+        ):
+            continue
+        updated = Package.objects.filter(
+            pk=pkg.pk, build_status='waiting_for_deps',
+        ).update(build_status='pending')
+        if not updated:
+            continue
+        log_package(pkg.id, 'info', 'All dependencies are now built — monitor is queueing build...')
+        send_package_update(pkg.id)
+        build_single_package_task.delay(pkg.id)
+        active_single_build_ids.add(pkg.id)
+        triggered_count += 1
+
     pending_package_builds = Package.objects.filter(
         build_status='pending',
-        status='ready',
+        status__in=['ready', 'pending'],
         spec_revisions__isnull=False,
         updated_at__lt=threshold_time,
     ).distinct()[:100]
 
     for pkg in pending_package_builds:
         if pkg.id in active_single_build_ids:
+            continue
+        if pkg.id in active_spec_ids or (pkg.status == 'pending' and not pkg.source_fetched):
+            continue
+        if _defer_known_dependency_blockers(pkg):
             continue
 
         logger.info(f"Monitor triggering stuck pending package build for {pkg.id} ({pkg.name})")
@@ -797,5 +875,3 @@ def monitor_pending_work():
     
     if triggered_count > 0:
         logger.info(f"Monitor triggered {triggered_count} stuck pending tasks")
-
-

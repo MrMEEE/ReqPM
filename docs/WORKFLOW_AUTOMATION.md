@@ -23,18 +23,123 @@ The system now automatically processes projects from requirements analysis throu
 
 ### Build-failure routing
 
+AI fixes run on the dedicated `ai` Celery queue, not inside RPM build tasks.
+After rule-based fixes are exhausted, the build saves its logs and retry state,
+queues an AI fix, and releases its build slot. The AI worker queues a new build
+only when it creates a new, untried spec revision. Retry limits, repeated-spec
+guards, and automatic confirmation on successful rebuilds span this handoff.
+Unsuccessful AI fixes leave the package failed with its original build logs.
+Queued fixes are recovered by the pending-work monitor; cancelled or superseded
+requests cannot queue another build.
+
+The existing build worker concurrency and maximum simultaneous builds settings
+are unchanged. **AI Fix Worker Concurrency** defaults to **2** and is independently
+configurable in Settings (1-20 processes); reload workers to apply changes.
+The AI maximum-concurrent-model-requests setting remains a separate limit.
+General fetch/spec work and project orchestration keep their existing workers.
+`./reqpm.sh start|stop|restart|logs celery-ai` manages the AI worker; normal
+startup, shutdown, status, and Reload Workers include it. Compose deployments
+also have a separate `celery_ai` service reading this setting on startup.
+
 SRPM and RPM failures caused by unavailable repository dependencies are handled
 before automatic spec fixes or AI fixes. ReqPM records the latest build and root
 logs, resolves missing dependencies, and queues known unbuilt project dependencies.
 The blocked package is marked `dep_build_pending` when its dependencies are known
 in the project, or `missing_packages` when they cannot yet be resolved. Dependency
 completion triggers a readiness check and rebuild of waiting packages.
+Readiness honors RPM equality (`=`) as an exact version constraint: a completed
+newer dependency does not satisfy an older exact pin. Before starting another
+build, ReqPM rechecks known repository-dependency blockers for an unchanged spec
+and defers the build if any remain unresolved, preserving its previous logs.
+A newer spec revision may retry so corrected requirements can be discovered.
+Every five minutes, dependency discovery revisits projects with missing or
+dependency-pending packages. This also recovers older failures that never ran
+automatic discovery: missing PyPI build backends are added as transitive packages,
+linked to their consumers, and queued for spec generation/build. System packages
+and incompatible versions of existing project packages still require separate
+resolution; a completed package is not considered sufficient merely by name.
+
+The pending-work monitor also revisits `waiting_for_deps` packages with specs
+and fetched sources. Once all linked dependencies are completed or not required,
+it moves the package to `pending` and queues its build. This recovers missed
+dependency-completion wake-ups. Active, reserved, and scheduled retry tasks are
+excluded to avoid duplicate dispatch while a build is waiting for a slot.
+Pending builds with an existing spec are also recovered when their metadata
+status remains pending. Before dispatch, known unresolved build requirements
+restore the dependency-blocked state without starting Mock. Slot retries do not
+overwrite a dependency-blocked state recorded by another task.
+
+Package details show a dependency-blockers panel with required constraints,
+current project versions and build states, and links to blocking packages.
+The panel follows waiting dependencies to expose transitive version conflicts.
+Project-list dependency tooltips retain version-conflicting requirements even
+when the matching dependency is already marked completed.
+
+When a discovered transitive dependency has an incompatible version, ReqPM
+selects the highest stable PyPI release satisfying all recorded project build
+requirements and linked consumer constraints. Direct dependencies and active
+builds are not changed automatically. If there is no shared compatible release,
+the blocker remains and a warning is recorded. A selected version invalidates
+old artifacts and queues spec generation, source fetching, and a rebuild.
+
+Enabled Python extras generate RPM extras subpackages. Dependency resolution
+checks the spec declaration as well as the enabled setting; an older spec that
+omits a required extras subpackage is repaired in a new revision and rebuilt
+without replacing the rest of the spec.
+Both package list status tooltips and the package detail Build status section
+use the same current blocker summary, including transitive missing dependencies,
+version conflicts, RHEL mismatches, missing RPM extras, and failed-build errors.
+Current missing dependencies are also displayed inline beneath Build Status in
+project package tables and package listings. Package details include the linked
+requirements and current blocker versions inside the Build status section,
+rather than a separate duplicate panel. Resolved dependencies are omitted.
+
+The AI fixer can explicitly request `disable_shebang_check` with the fixed value
+`brp-mangle-shebangs` when targeted shebang repair cannot address the failure.
+This adds `%undefine __brp_mangle_shebangs` to that package's spec only and records
+the bypass in the AI fix revision. It disables validation rather than repairing
+script interpreters.
+
+Two general AI actions are available as separate opt-in settings under Settings →
+AI Build Fixer; both are disabled by default:
+
+- `insert_lines` inserts up to 40 lines before or after one existing spec line.
+  The anchor must match exactly one line, inserted lines cannot add Name, Version,
+  Release or Epoch, and repeated insertions at the same position are rejected.
+- `rewrite_spec` replaces the complete spec as a last resort. It must be the only
+  action, include Name, Version, Release, `%description` and `%files`, keep the
+  main package's Name, Version, Release and Epoch unchanged, and stay below 200 KB.
+
+While either is enabled, the AI receives the complete spec instead of selected
+sections. These actions can add arbitrary build/install commands and RPM macros,
+which run in Mock. Every result must pass `rpmspec --parse` and is stored as an
+auditable, revertible spec revision. With both disabled, arbitrary macro edits and
+build/install commands remain unsupported.
 
 This routing is checked again after each RPM retry. If an SRPM rebuild fails, its
 logs replace the previous RPM failure for dependency analysis. Missing imports,
 compilers, headers, and self-referential requirements remain eligible for targeted
 spec corrections; packaging errors such as missing `%files` paths also continue
 through the spec/AI fixer loop.
+
+AI proposals that make no changes receive one automatic reconsideration with the
+executor's rejection details. Both exchanges are saved in the AI conversation.
+The follow-up is labeled as an automatic reconsideration of the original
+exchange, not a separate simultaneous autofix. Self-dependency proposals include
+an explicit rejection reason in the feedback sent to the model.
+The model must propose a different supported action or explain why no supported
+spec action can fix the cause; it cannot execute arbitrary build commands or edit
+the build environment. Past proposals without outcome feedback are explicitly
+identified as unverified in the prompt.
+
+AI Conversations show the model saved for each exchange, not the model currently
+selected in Settings. They refresh even when no exchange is active. Old running
+exchanges on packages no longer in the fixing state are marked as interrupted
+after a conservative response-time grace period (at least 30 minutes), so worker
+interruptions do not leave historical conversations displaying "Thinking" forever.
+The AI activity list and slot-counter recovery only use AI logs from the current
+build. A slot-acquired message supersedes an earlier waiting message; packages
+that are no longer building or fixing do not appear as waiting for AI.
 
 ## Changes Implemented
 

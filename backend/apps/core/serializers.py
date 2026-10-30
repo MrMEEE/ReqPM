@@ -14,6 +14,7 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             'id',
             'max_concurrent_builds',
             'celery_worker_concurrency',
+            'celery_ai_concurrency',
             'mock_memory_limit',
             'cleanup_builds_after_days',
             'cleanup_repos_after_days',
@@ -29,6 +30,8 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
             'ai_fixer_slot_wait_timeout',
             'ai_fixer_max_attempts',
             'ai_fixer_max_concurrent',
+            'ai_fixer_allow_insert_lines',
+            'ai_fixer_allow_spec_rewrite',
             'created_at',
             'updated_at',
         ]

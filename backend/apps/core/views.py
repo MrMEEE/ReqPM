@@ -80,6 +80,7 @@ class SystemSettingsViewSet(viewsets.ViewSet):
             'active_count': active_count,
             'max_concurrent': max_concurrent,
             'worker_concurrency': settings_row.celery_worker_concurrency,
+            'ai_worker_concurrency': settings_row.celery_ai_concurrency,
             'available_slots': max(0, max_concurrent - active_count),
             'active_build_ids': active_builds,
         })
@@ -102,40 +103,30 @@ class SystemSettingsViewSet(viewsets.ViewSet):
             return Response({'detail': 'reqpm.sh not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         try:
-            result = subprocess.run(
-                [str(script), 'restart', 'celery'],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                cwd=str(settings.BASE_DIR),
-                env=os.environ.copy(),
-            )
-            projects = subprocess.run(
-                [str(script), 'restart', 'celery-projects'],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                cwd=str(settings.BASE_DIR),
-                env=os.environ.copy(),
-            )
+            outputs = {}
+            failed = False
+            for service in ('celery', 'celery-tasks', 'celery-projects', 'celery-ai'):
+                result = subprocess.run(
+                    [str(script), 'restart', service],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=str(settings.BASE_DIR),
+                    env=os.environ.copy(),
+                )
+                key = service.replace('celery-', '') if service != 'celery' else 'celery'
+                outputs[f'{key}_stdout'] = result.stdout
+                if result.returncode != 0:
+                    failed = True
+                    outputs[f'{key}_stderr'] = result.stderr
 
-            if result.returncode != 0 or projects.returncode != 0:
+            if failed:
                 return Response(
-                    {
-                        'detail': 'Failed to reload workers',
-                        'celery_stdout': result.stdout,
-                        'celery_stderr': result.stderr,
-                        'projects_stdout': projects.stdout,
-                        'projects_stderr': projects.stderr,
-                    },
+                    {'detail': 'Failed to reload workers', **outputs},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-            return Response({
-                'detail': 'Workers reloaded',
-                'celery_stdout': result.stdout,
-                'projects_stdout': projects.stdout,
-            })
+            return Response({'detail': 'Workers reloaded', **outputs})
         except Exception as e:
             return Response({'detail': f'Failed to reload workers: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -242,59 +233,15 @@ class SystemSettingsViewSet(viewsets.ViewSet):
         active_count = int(cache.get(slot_key) or 0)
         max_concurrent = int(cfg.get('max_concurrent') or 1)
 
-        start_marker = 'Rule-based fixers exhausted, trying AI fixer'
-        waiting_marker = 'waiting for slot'
-        terminal_markers = (
-            'AI fixer proposed a spec fix',
-            'AI fixer could not propose a fix',
-            'Failing fast with current analyzed errors',
-            'AI fixer: could not acquire a slot',
-        )
-        active_markers = (
-            'AI fixer acquired a slot',
-            'AI fixer: querying',
-        )
-
         in_process = []
         candidates = Package.objects.filter(build_status__in=['building', 'fixing']).select_related('project').order_by('-updated_at')[:250]
         for pkg in candidates:
             logs = list(pkg.logs.order_by('-timestamp').values('timestamp', 'level', 'message')[:200])
-            if not logs:
+            activity = ai_fixer.get_ai_activity(logs, pkg.build_started_at)
+            if activity is None:
                 continue
-
-            latest_start = None
-            latest_terminal = None
-            latest_ai_log = None
-            ai_attempt_count = 0
-            waiting_for_slot = False
-            latest_waiting = None
-            latest_active = None
-            latest_terminal_message = ''
-
-            for entry in logs:
-                msg = entry.get('message', '') or ''
-                ts = entry.get('timestamp')
-                if latest_ai_log is None and ('AI fixer' in msg or start_marker in msg):
-                    latest_ai_log = entry
-                if start_marker in msg:
-                    ai_attempt_count += 1
-                if latest_start is None and start_marker in msg:
-                    latest_start = ts
-                if latest_terminal is None and any(marker in msg for marker in terminal_markers):
-                    latest_terminal = ts
-                    latest_terminal_message = msg
-                if waiting_marker in msg:
-                    waiting_for_slot = True
-                    if latest_waiting is None:
-                        latest_waiting = ts
-                if any(marker in msg for marker in active_markers):
-                    if latest_active is None:
-                        latest_active = ts
-
-            if latest_start is None:
-                continue
-            if latest_terminal is not None and latest_terminal >= latest_start:
-                continue
+            latest_start = activity['started_at']
+            latest_ai_log = activity['latest_log']
 
             elapsed_seconds = None
             if latest_start is not None:
@@ -316,18 +263,12 @@ class SystemSettingsViewSet(viewsets.ViewSet):
                 'project_id': pkg.project_id,
                 'project_name': getattr(pkg.project, 'name', ''),
                 'build_status': pkg.build_status,
-                'ai_attempt_count': ai_attempt_count,
+                'ai_attempt_count': activity['attempt_count'],
                 'ai_started_at': latest_start,
                 'ai_elapsed_seconds': elapsed_seconds,
-                'state': (
-                    'fixing'
-                    if pkg.build_status == 'fixing' or (latest_active is not None and (latest_waiting is None or latest_active >= latest_waiting))
-                    else 'waiting_for_slot'
-                    if waiting_for_slot
-                    else 'running'
-                ),
-                'state_detail': 'waiting_for_slot' if waiting_for_slot and (latest_active is None or (latest_waiting is not None and latest_waiting > latest_active)) else '',
-                'latest_terminal_message': latest_terminal_message,
+                'state': activity['state'],
+                'state_detail': 'waiting_for_slot' if activity['state'] == 'waiting_for_slot' else '',
+                'latest_terminal_message': '',
                 'last_ai_log': (latest_ai_log or {}).get('message', ''),
                 'last_ai_log_at': (latest_ai_log or {}).get('timestamp'),
                 'latest_correction_description': correction_description,

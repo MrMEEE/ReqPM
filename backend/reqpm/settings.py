@@ -237,6 +237,14 @@ CELERY_TASK_ROUTES = {
     'backend.apps.projects.tasks.clone_project_task': {'queue': 'projects'},
     'backend.apps.projects.tasks.resolve_dependencies_task': {'queue': 'projects'},
     'backend.apps.projects.tasks.sync_all_projects_task': {'queue': 'projects'},
+    # RPM builds run on the dedicated build worker; everything else (fetching,
+    # spec generation, metadata, orchestration) stays on the
+    # default queue served by the "tasks" worker so it never waits on builds.
+    'backend.apps.packages.tasks.build_single_package_task': {'queue': 'builds'},
+    'backend.apps.builds.tasks.build_package_task': {'queue': 'builds'},
+    # Model requests have their own processes and never consume RPM build slots.
+    'backend.apps.packages.tasks.ai_fix_package_task': {'queue': 'ai'},
+    'packages.ai_fixer_reply': {'queue': 'ai'},
 }
 
 # Django Guardian settings
@@ -257,6 +265,9 @@ REQPM = {
     
     # Build concurrency
     'MAX_CONCURRENT_BUILDS': int(os.getenv('MAX_CONCURRENT_BUILDS', '4')),
+    # Concurrent non-build jobs (source fetch, spec generation); these use their
+    # own slots so they are never blocked by running builds.
+    'MAX_CONCURRENT_TASKS': int(os.getenv('MAX_CONCURRENT_TASKS', '2')),
 
     # Per-build memory limit enforced via systemd-run cgroup (e.g. '8G', '4096M').
     # Set to None / leave unset to apply no limit.

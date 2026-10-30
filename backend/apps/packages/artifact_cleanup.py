@@ -232,10 +232,9 @@ def reset_package_build_state(package) -> None:
     """Reset package build-related fields after cleanup."""
     package.archive_build_logs()
     package.build_status = "not_built"
+    package.autofix_context = {}
     package.build_started_at = None
     package.build_completed_at = None
-    package.build_log = ""
-    package.build_root_log = ""
     package.build_error_message = ""
     package.analyzed_errors = []
     package.srpm_path = ""
@@ -244,12 +243,15 @@ def reset_package_build_state(package) -> None:
     package.save(
         update_fields=[
             "build_status",
+            "autofix_context",
             "build_started_at",
             "build_completed_at",
             "build_log",
             "build_root_log",
+            "build_state_log",
             "last_build_log",
             "last_build_root_log",
+            "last_build_state_log",
             "build_error_message",
             "analyzed_errors",
             "srpm_path",
